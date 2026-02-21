@@ -10,13 +10,26 @@ Supports both local (stdio) and remote (streamable-http) transport.
 
 import json
 import os
+import urllib.parse
 from typing import Annotated
 
-from mcp.types import ToolAnnotations
+from mcp.types import (
+    EmbeddedResource,
+    TextContent,
+    TextResourceContents,
+    ToolAnnotations,
+)
 from pydantic import Field
 from mcp_use import MCPServer
 
 from sablier_mcp.client import SablierClient, SablierAPIError
+from sablier_mcp.widgets import (
+    betas_heatmap,
+    grain_score_card,
+    portfolio_overview,
+    risk_dashboard,
+    training_progress,
+)
 
 server = MCPServer(name="Sablier", version="0.1.0")
 
@@ -33,6 +46,21 @@ def get_client() -> SablierClient:
 def _fmt(data) -> str:
     """Format API response as readable JSON."""
     return json.dumps(data, indent=2, default=str)
+
+
+def _with_widget(text: str, html: str) -> list:
+    """Return both a text summary (for the LLM) and an HTML widget (for visual clients)."""
+    return [
+        TextContent(type="text", text=text),
+        EmbeddedResource(
+            type="resource",
+            resource=TextResourceContents(
+                uri=f"data:text/html,{urllib.parse.quote(html)}",
+                mimeType="text/html",
+                text=text,
+            ),
+        ),
+    ]
 
 
 # ══════════════════════════════════════════════════
@@ -79,7 +107,7 @@ async def search_features(
 )
 async def list_portfolios(
     limit: Annotated[int, Field(description="Max portfolios to return", default=50)] = 50,
-) -> str:
+) -> list:
     client = get_client()
     result = await client.list_portfolios(limit=limit)
     portfolios = result.get("portfolios", [])
@@ -92,7 +120,8 @@ async def list_portfolios(
             "status": p.get("status"),
             "created_at": p.get("created_at"),
         })
-    return _fmt({"total": result.get("total", len(summary)), "portfolios": summary})
+    data = {"total": result.get("total", len(summary)), "portfolios": summary}
+    return _with_widget(_fmt(data), portfolio_overview(data))
 
 
 @server.tool(
@@ -150,7 +179,7 @@ async def analyze_qualitative(
     source_types: Annotated[list[str] | None, Field(description="Optional filter: ['10-K', '10-Q', 'earnings_transcript']", default=None)] = None,
     min_year: Annotated[int | None, Field(description="Earliest filing year to include", default=None)] = None,
     max_year: Annotated[int | None, Field(description="Latest filing year to include", default=None)] = None,
-) -> str:
+) -> list | str:
     client = get_client()
     job = await client.start_grain_analysis(
         tickers=tickers,
@@ -211,7 +240,7 @@ async def analyze_qualitative(
             theme_summary["ticker_scores"].append(ticker_entry)
         summary["themes"].append(theme_summary)
 
-    return _fmt(summary)
+    return _with_widget(_fmt(summary), grain_score_card(summary))
 
 
 @server.tool(
@@ -335,10 +364,10 @@ async def train_models(
 )
 async def get_training_progress(
     job_id: Annotated[str, Field(description="The training job ID from train_models")],
-) -> str:
+) -> list:
     client = get_client()
     result = await client.get_batch_training_progress(job_id)
-    return _fmt({
+    data = {
         "job_id": result.get("job_id"),
         "status": result.get("status"),
         "current_asset": result.get("current_asset"),
@@ -350,7 +379,8 @@ async def get_training_progress(
         "train_loss": result.get("train_loss"),
         "val_loss": result.get("val_loss"),
         "error_message": result.get("error_message"),
-    })
+    }
+    return _with_widget(_fmt(data), training_progress(data))
 
 
 # ══════════════════════════════════════════════════
@@ -367,7 +397,7 @@ async def simulate_betas(
     model_group_id: Annotated[str, Field(description="UUID of the trained model group")],
     simulation_mode: Annotated[str, Field(description="Must match training mode", default="single_shot_linear")] = "single_shot_linear",
     horizon: Annotated[int, Field(description="Forecast horizon in trading days", default=20)] = 20,
-) -> str:
+) -> list | str:
     client = get_client()
     batch = await client.simulate_betas_batch(
         model_group_id=model_group_id,
@@ -394,12 +424,12 @@ async def simulate_betas(
         "total": results.get("total_count"),
         "assets": {},
     }
-    for asset, data in per_asset.items():
+    for asset, asset_data in per_asset.items():
         summary["assets"][asset] = {
-            "status": data.get("status"),
-            "linear_betas": data.get("linear_betas"),
-            "alpha": data.get("alpha"),
-            "residual_std": data.get("residual_std"),
+            "status": asset_data.get("status"),
+            "linear_betas": asset_data.get("linear_betas"),
+            "alpha": asset_data.get("alpha"),
+            "residual_std": asset_data.get("residual_std"),
         }
 
     factor_stats = results.get("factor_stats", {})
@@ -407,7 +437,7 @@ async def simulate_betas(
         summary["factor_means"] = factor_stats.get("means")
         summary["factor_stds"] = factor_stats.get("stds")
 
-    return _fmt(summary)
+    return _with_widget(_fmt(summary), betas_heatmap(summary))
 
 
 @server.tool(
@@ -484,10 +514,10 @@ async def get_returns_results(
 async def test_portfolio_risk(
     simulation_batch_id: Annotated[str, Field(description="From simulate_betas")],
     weights: Annotated[dict[str, float], Field(description="Portfolio weights by ticker (e.g. {'AAPL': 0.4, 'MSFT': 0.3})")],
-) -> str:
+) -> list:
     client = get_client()
     result = await client.portfolio_test(simulation_batch_id, weights)
-    return _fmt({
+    data = {
         "portfolio_betas": result.get("portfolio_betas"),
         "weighted_beta": result.get("weighted_beta"),
         "expected_return": result.get("expected_return"),
@@ -498,7 +528,8 @@ async def test_portfolio_risk(
         "risk_contribution": result.get("risk_contribution"),
         "marginal_ctr": result.get("marginal_ctr"),
         "n_assets": result.get("n_assets"),
-    })
+    }
+    return _with_widget(_fmt(data), risk_dashboard(data))
 
 
 # ══════════════════════════════════════════════════
