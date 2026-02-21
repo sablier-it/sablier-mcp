@@ -217,8 +217,9 @@ async def analyze_qualitative(
             "message": "Analysis still running. Use get_analysis_status with this job_id to check later.",
         })
 
-    # Summarize results
-    themes_data = result.get("results", {}).get("themes", [])
+    # Summarize results — API nests as results.results (list of theme objects)
+    raw_results = result.get("results", {})
+    themes_data = raw_results.get("results", []) or raw_results.get("themes", [])
     summary = {
         "status": "completed",
         "processing_time_seconds": result.get("processing_time_seconds"),
@@ -227,8 +228,8 @@ async def analyze_qualitative(
     for theme in themes_data:
         theme_summary = {
             "theme": theme.get("theme"),
-            "portfolio_score": theme.get("portfolio_score"),
-            "portfolio_tier": theme.get("portfolio_tier_name"),
+            "display_name": theme.get("display_name"),
+            "portfolio_score": theme.get("portfolio_score") or theme.get("max_exposure", {}).get("score"),
             "direction": theme.get("direction"),
             "confidence": theme.get("confidence"),
             "ticker_scores": [],
@@ -237,7 +238,7 @@ async def analyze_qualitative(
             ticker_entry = {
                 "ticker": ts.get("ticker"),
                 "score": ts.get("score"),
-                "tier": ts.get("tier_name"),
+                "tier": ts.get("tier") or ts.get("tier_name"),
                 "direction": ts.get("direction"),
                 "confidence": ts.get("confidence"),
                 "top_evidence": [],
