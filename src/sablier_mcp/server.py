@@ -231,7 +231,7 @@ async def analyze_qualitative(
             }
             for ev in (ts.get("evidence") or [])[:3]:
                 ticker_entry["top_evidence"].append({
-                    "passage": ev.get("passage", "")[:300],
+                    "passage": (ev.get("passage") or "")[:300],
                     "source": ev.get("source"),
                     "source_type": ev.get("source_type"),
                     "fiscal_period": ev.get("fiscal_period"),

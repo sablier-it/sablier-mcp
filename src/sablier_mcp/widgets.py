@@ -158,8 +158,8 @@ def grain_score_card(data: dict[str, Any]) -> str:
             ev_html = ""
             for ev in (ts.get("top_evidence") or [])[:2]:
                 passage = html.escape((ev.get("passage") or "")[:180])
-                src = ev.get("source_type", "")
-                period = ev.get("fiscal_period", "")
+                src = ev.get("source_type") or ""
+                period = ev.get("fiscal_period") or ""
                 ev_html += f"""<div style="margin-top:6px;padding:8px;background:rgba(99,102,241,0.06);border-radius:6px;font-size:11px;color:{_TEXT_MUTED};line-height:1.4">
                     <span style="color:{_ACCENT_LIGHT};font-weight:600">{html.escape(src)} {html.escape(period)}</span><br>
                     &ldquo;{passage}&hellip;&rdquo;
