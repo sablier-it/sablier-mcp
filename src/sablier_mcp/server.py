@@ -83,6 +83,59 @@ def _with_widget(text: str, html: str) -> list:
     ]
 
 
+def _portfolio_tickers(portfolio: dict) -> list[str]:
+    """Extract ticker symbols from a portfolio response.
+
+    The API returns asset_names as {display_name: ticker} and weights as
+    {display_name: weight}.  Fall back to an 'assets' list if present.
+    """
+    asset_names = portfolio.get("asset_names", {})
+    if asset_names:
+        return list(asset_names.values())
+    # Fallback for list-style responses
+    assets = portfolio.get("assets", [])
+    return [a.get("ticker") for a in assets if a.get("ticker")]
+
+
+async def _ensure_portfolio(
+    portfolio_id: str | None,
+    tickers: list[str] | None,
+    weights: list[float] | None,
+) -> tuple[dict, str | None]:
+    """Resolve or auto-create a portfolio.
+
+    Returns (portfolio_dict, error_string).  If error_string is not None
+    the caller should return it immediately.
+    """
+    client = get_client()
+
+    if portfolio_id:
+        if err := _validate_uuid(portfolio_id, "portfolio_id"):
+            return {}, err
+        portfolio = await client.get_portfolio(portfolio_id)
+        if not _portfolio_tickers(portfolio):
+            return {}, "Error: portfolio has no assets."
+        return portfolio, None
+
+    if not tickers:
+        return {}, (
+            "Error: provide either portfolio_id (from create_portfolio / list_portfolios) "
+            "or tickers (e.g. ['AAPL', 'MSFT'])."
+        )
+
+    # Auto-assign weights: explicit > equal
+    if not weights:
+        weights = [1.0 / len(tickers)] * len(tickers)
+    if len(weights) != len(tickers):
+        return {}, "Error: tickers and weights must have the same length."
+
+    # Auto-create portfolio
+    name = ", ".join(tickers)
+    assets = [{"ticker": t, "weight": w} for t, w in zip(tickers, weights)]
+    portfolio = await client.create_portfolio(name, assets)
+    return portfolio, None
+
+
 _NOT_LOGGED_IN = (
     "Error: You need to log in first. "
     "If you already have a Sablier account, use the login tool with your email and password. "
@@ -184,7 +237,7 @@ async def login(
 
 @server.tool(
     name="search_features",
-    description="Search for tickers (stocks, ETFs) and market features (VIX, DXY, rates). Use this to find valid tickers before create_portfolio, or to discover macro factors. Start here if the user mentions a company or indicator you need to look up. WORKFLOW: search_features → create_portfolio → run_full_analysis (or step-by-step: create_models → train_models → simulate_betas).",
+    description="Search for tickers (stocks, ETFs) and market features (VIX, DXY, rates). Use this to validate tickers before creating a portfolio. WORKFLOW: When a user mentions assets, validate tickers → create_portfolio (single asset = 100% weight; multiple = ask for weights or equal) → then run both analyze_qualitative (thematic) AND run_full_analysis (quantitative) on the same portfolio for a full risk picture.",
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
 )
 async def search_features(
@@ -221,7 +274,7 @@ async def search_features(
 
 @server.tool(
     name="list_portfolios",
-    description="List the user's existing portfolios with names, IDs, asset compositions, and status. Use this first when the user refers to a portfolio by name — you need the portfolio ID and its tickers for modeling. WORKFLOW: list_portfolios → list_feature_set_templates (pick factors) → run_full_analysis.",
+    description="List the user's existing portfolios with names, IDs, asset compositions, and status. Use this when the user refers to an existing portfolio. WORKFLOW: list_portfolios → list_feature_set_templates (ask 'what do you want to test against?') → run_full_analysis with portfolio_id.",
     annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def list_portfolios(
@@ -238,8 +291,8 @@ async def list_portfolios(
             summary.append({
                 "id": p["id"],
                 "name": p["name"],
-                "assets": p.get("assets", []),
-                "status": p.get("status"),
+                "tickers": _portfolio_tickers(p),
+                "weights": p.get("weights", {}),
                 "created_at": p.get("created_at"),
             })
         data = {"total": result.get("total", len(summary)), "portfolios": summary}
@@ -270,7 +323,7 @@ async def get_portfolio(
 
 @server.tool(
     name="create_portfolio",
-    description="Create a new portfolio from tickers and weights. Weights must sum to 1.0. NEXT STEP: ask the user 'What market drivers do you want to test this portfolio against?' and call list_feature_set_templates to show options (Macro, Market, Themes), then run_full_analysis.",
+    description="Create a new portfolio from tickers and weights. Weights must sum to 1.0. For a single asset, use weight 1.0. For multiple assets, ask the user for weights or default to equal weights. IMPORTANT: A portfolio must always be created before running any analysis (both qualitative and quantitative). NEXT STEPS: (1) ask 'What market drivers do you want to test against?' → list_feature_set_templates → run_full_analysis, and/or (2) ask about themes → analyze_qualitative. Both use the same portfolio_id.",
 )
 async def create_portfolio(
     name: Annotated[str, Field(description="Portfolio name (e.g. 'Tech Portfolio')")],
@@ -287,13 +340,18 @@ async def create_portfolio(
         assets = [{"ticker": t, "weight": w} for t, w in zip(tickers, weights)]
         client = get_client()
         result = await client.create_portfolio(name, assets, description=description or None)
+        portfolio_id = result["id"]
         return _fmt({
-            "id": result["id"],
+            "portfolio_id": portfolio_id,
             "name": result["name"],
-            "assets": result.get("assets", []),
+            "tickers": _portfolio_tickers(result),
+            "weights": result.get("weights", {}),
             "target_set_id": result.get("target_set_id"),
-            "status": result.get("status"),
-            "message": "Portfolio created. Use list_model_groups to check for existing models, or create_models to create new ones.",
+            "message": (
+                f"Portfolio created (ID: {portfolio_id}). "
+                "Next: use this portfolio_id with run_full_analysis (quantitative) "
+                "and/or analyze_qualitative (thematic) for a full risk picture."
+            ),
         })
     except SablierAPIError as e:
         return _api_error(e)
@@ -306,12 +364,20 @@ async def create_portfolio(
 
 @server.tool(
     name="analyze_qualitative",
-    description="Run qualitative analysis on tickers for specific themes. Scans SEC filings (10-K, 10-Q) and earnings calls to score how exposed each company is to a theme (0-100 scale). Returns scores, supporting evidence passages, and sources. To analyze a portfolio, first use list_portfolios to get its tickers. Auto-polls up to 5 min; if it times out use get_analysis_status.",
+    description=(
+        "Run qualitative analysis for specific themes. Scans SEC filings (10-K, 10-Q) and earnings calls "
+        "to score how exposed each company is to a theme (0-100 scale). "
+        "You can pass EITHER portfolio_id (from an existing portfolio) OR tickers directly. "
+        "If you pass tickers without a portfolio_id, a portfolio is auto-created. "
+        "Auto-polls up to 5 min; if it times out use get_analysis_status. "
+        "TIP: For a full risk picture, also run run_full_analysis on the same portfolio."
+    ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
 )
 async def analyze_qualitative(
-    tickers: Annotated[list[str], Field(description="Tickers to analyze (e.g. ['AAPL', 'MSFT'])")],
     themes: Annotated[list[str], Field(description="Themes to score (e.g. ['AI exposure', 'China risk', 'debt levels'])")],
+    portfolio_id: Annotated[str | None, Field(description="UUID of an existing portfolio. If omitted, provide tickers instead.", default=None)] = None,
+    tickers: Annotated[list[str] | None, Field(description="Tickers to analyze (e.g. ['AAPL', 'MSFT']). Auto-creates a portfolio if portfolio_id is not given.", default=None)] = None,
     source_types: Annotated[list[str] | None, Field(description="Optional filter: ['10-K', '10-Q', 'earnings_call']", default=None)] = None,
     min_year: Annotated[int | None, Field(description="Earliest filing year to include", default=None)] = None,
     max_year: Annotated[int | None, Field(description="Latest filing year to include", default=None)] = None,
@@ -319,9 +385,14 @@ async def analyze_qualitative(
     if err := _require_auth():
         return err
     try:
+        portfolio, err = await _ensure_portfolio(portfolio_id, tickers, None)
+        if err:
+            return err
+        resolved_tickers = _portfolio_tickers(portfolio)
+
         client = get_client()
         job = await client.start_grain_analysis(
-            tickers=tickers,
+            tickers=resolved_tickers,
             themes=themes,
             source_types=source_types,
             min_year=min_year,
@@ -467,21 +538,33 @@ async def list_feature_set_templates() -> str:
 
 @server.tool(
     name="create_models",
-    description="Set up an analysis for a portfolio against chosen market drivers. Requires: conditioning_set_id from list_feature_set_templates. Returns model_group_id. NEXT: train_models → simulate_betas. TIP: prefer run_full_analysis which does everything in one call.",
+    description="Set up an analysis for a portfolio against chosen market drivers. Requires: portfolio_id (from create_portfolio or list_portfolios) and conditioning_set_id (from list_feature_set_templates). Returns model_group_id. NEXT: train_models → simulate_betas. TIP: prefer run_full_analysis which does everything in one call.",
 )
 async def create_models(
+    portfolio_id: Annotated[str, Field(description="UUID of the portfolio")],
     conditioning_set_id: Annotated[str, Field(description="UUID of the conditioning set (market factors)")],
-    asset_tickers: Annotated[list[str], Field(description="Tickers to create models for (e.g. ['AAPL', 'MSFT'])")],
 ) -> str:
     if err := _require_auth():
+        return err
+    if err := _validate_uuid(portfolio_id, "portfolio_id"):
         return err
     if err := _validate_uuid(conditioning_set_id, "conditioning_set_id"):
         return err
     try:
         client = get_client()
+        # Get portfolio to extract tickers and target_set_id
+        portfolio = await client.get_portfolio(portfolio_id)
+        target_set_id = portfolio.get("target_set_id")
+        asset_tickers = _portfolio_tickers(portfolio)
+        if not asset_tickers:
+            return "Error: portfolio has no assets. Create a portfolio with tickers first."
+        portfolio_name = portfolio.get("name", "")
+
         result = await client.batch_create_models(
             conditioning_set_id=conditioning_set_id,
             asset_tickers=asset_tickers,
+            parent_target_set_id=target_set_id,
+            group_name=f"{portfolio_name}" if portfolio_name else None,
         )
         return _fmt({
             "model_group_id": result.get("model_group_id"),
@@ -515,7 +598,7 @@ async def train_models(
         client = get_client()
         result = await client.train_batch(
             model_group_id=model_group_id,
-            training_mode="single_shot_linear",
+            training_mode="rolling_huber",
         )
         return _fmt({
             "batch_id": result.get("batch_id"),
@@ -583,7 +666,7 @@ async def simulate_betas(
         client = get_client()
         batch = await client.simulate_betas_batch(
             model_group_id=model_group_id,
-            simulation_mode="single_shot_linear",
+            simulation_mode="rolling_huber",
             horizon=horizon,
         )
         sim_batch_id = batch.get("simulation_batch_id")
@@ -823,16 +906,21 @@ async def list_scenarios(
 @server.tool(
     name="run_full_analysis",
     description=(
-        "One-shot analysis: builds factor models, trains them, and computes how each asset responds to market drivers — "
-        "all in one call. This replicates the full Moment workflow from the Sablier UI. "
-        "Requires: conditioning_set_id (from list_feature_set_templates — ask the user 'what do you want to test your portfolio against?') "
-        "and asset_tickers (from the portfolio). Returns per-asset factor exposures (betas) + simulation_batch_id. "
-        "After this completes, use test_portfolio_risk for risk metrics or simulate_returns for what-if scenarios."
+        "One-shot quantitative analysis: builds factor models, trains them, and computes how each asset "
+        "responds to market drivers — all in one call. "
+        "You can pass EITHER portfolio_id (from an existing portfolio) OR tickers directly. "
+        "If you pass tickers without a portfolio_id, a portfolio is auto-created (equal weights by default). "
+        "Also requires conditioning_set_id from list_feature_set_templates — ask the user "
+        "'what do you want to test your portfolio against?'. "
+        "After this completes, use test_portfolio_risk for risk metrics or simulate_returns for what-if scenarios. "
+        "TIP: For a full risk picture, also run analyze_qualitative on the same portfolio."
     ),
 )
 async def run_full_analysis(
     conditioning_set_id: Annotated[str, Field(description="UUID of the conditioning set (from list_feature_set_templates)")],
-    asset_tickers: Annotated[list[str], Field(description="Tickers to model (e.g. ['AAPL', 'MSFT', 'NVDA'])")],
+    portfolio_id: Annotated[str | None, Field(description="UUID of an existing portfolio. If omitted, provide tickers instead.", default=None)] = None,
+    tickers: Annotated[list[str] | None, Field(description="Tickers to analyze (e.g. ['AAPL', 'MSFT']). Auto-creates a portfolio if portfolio_id is not given.", default=None)] = None,
+    weights: Annotated[list[float] | None, Field(description="Optional weights for tickers (must sum to 1.0). Defaults to equal weights.", default=None)] = None,
     horizon: Annotated[int, Field(description="Forecast horizon in trading days", default=20)] = 20,
 ) -> list | str:
     if err := _require_auth():
@@ -840,13 +928,24 @@ async def run_full_analysis(
     if err := _validate_uuid(conditioning_set_id, "conditioning_set_id"):
         return err
 
-    client = get_client()
-
     try:
-        # Step 1: Create models
+        # Step 0: Resolve or auto-create portfolio
+        portfolio, err = await _ensure_portfolio(portfolio_id, tickers, weights)
+        if err:
+            return err
+        portfolio_id = portfolio["id"]
+        target_set_id = portfolio.get("target_set_id")
+        asset_tickers = _portfolio_tickers(portfolio)
+        portfolio_name = portfolio.get("name", "")
+
+        client = get_client()
+
+        # Step 1: Create models (linked to portfolio via parent_target_set_id)
         create_result = await client.batch_create_models(
             conditioning_set_id=conditioning_set_id,
             asset_tickers=asset_tickers,
+            parent_target_set_id=target_set_id,
+            group_name=portfolio_name or None,
         )
         model_group_id = create_result.get("model_group_id")
         if not model_group_id:
@@ -864,7 +963,7 @@ async def run_full_analysis(
         # Step 2: Train
         train_result = await client.train_batch(
             model_group_id=model_group_id,
-            training_mode="single_shot_linear",
+            training_mode="rolling_huber",
         )
         job_id = train_result.get("job_id")
         if not job_id:
@@ -889,7 +988,7 @@ async def run_full_analysis(
         # Step 4: Simulate betas
         batch = await client.simulate_betas_batch(
             model_group_id=model_group_id,
-            simulation_mode="single_shot_linear",
+            simulation_mode="rolling_huber",
             horizon=horizon,
         )
         sim_batch_id = batch.get("simulation_batch_id")
@@ -911,6 +1010,7 @@ async def run_full_analysis(
             "status": "completed",
             "model_group_id": model_group_id,
             "simulation_batch_id": sim_batch_id,
+            "portfolio_id": portfolio_id,
             "models_created": total_created,
             "conditioning_features": results.get("conditioning_features", []),
             "assets": {},

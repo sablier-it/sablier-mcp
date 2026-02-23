@@ -197,15 +197,19 @@ class SablierClient:
         conditioning_set_id: str,
         asset_tickers: list[str],
         name_template: str = "{ticker}_model",
+        parent_target_set_id: str | None = None,
+        group_name: str | None = None,
     ) -> dict:
-        return await self._post(
-            "/models/batch",
-            json={
-                "conditioning_set_id": conditioning_set_id,
-                "asset_tickers": asset_tickers,
-                "name_template": name_template,
-            },
-        )
+        body: dict[str, Any] = {
+            "conditioning_set_id": conditioning_set_id,
+            "asset_tickers": asset_tickers,
+            "name_template": name_template,
+        }
+        if parent_target_set_id:
+            body["parent_target_set_id"] = parent_target_set_id
+        if group_name:
+            body["group_name"] = group_name
+        return await self._post("/models/batch", json=body)
 
     # ──────────────────────────────────────────────
     # Feature Sets
@@ -221,21 +225,13 @@ class SablierClient:
     async def train_batch(
         self,
         model_group_id: str,
-        training_mode: str = "single_shot_linear",
-        max_epochs: int = 100,
-        learning_rate: float = 0.001,
-        hidden_dim: int = 128,
-        n_layers: int = 2,
+        training_mode: str = "rolling_huber",
     ) -> dict:
         return await self._post(
             "/ml/train/batch",
             json={
                 "model_group_id": model_group_id,
                 "training_mode": training_mode,
-                "max_epochs": max_epochs,
-                "learning_rate": learning_rate,
-                "hidden_dim": hidden_dim,
-                "n_layers": n_layers,
             },
         )
 
@@ -264,7 +260,7 @@ class SablierClient:
     async def simulate_betas_batch(
         self,
         model_group_id: str,
-        simulation_mode: str = "single_shot_linear",
+        simulation_mode: str = "rolling_huber",
         horizon: int = 20,
     ) -> dict:
         return await self._post(
