@@ -90,7 +90,7 @@ def _with_widget(text: str, html: str) -> list:
 
 @server.tool(
     name="search_features",
-    description="Search for tickers (stocks, ETFs) and market features (VIX, DXY, rates). Use this to find valid tickers before create_portfolio, or to discover macro factors. Start here if the user mentions a company or indicator you need to look up.",
+    description="Search for tickers (stocks, ETFs) and market features (VIX, DXY, rates). Use this to find valid tickers before create_portfolio, or to discover macro factors. Start here if the user mentions a company or indicator you need to look up. WORKFLOW: search_features → create_portfolio → run_full_analysis (or step-by-step: create_models → train_models → simulate_betas).",
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
 )
 async def search_features(
@@ -125,7 +125,7 @@ async def search_features(
 
 @server.tool(
     name="list_portfolios",
-    description="List the user's existing portfolios with names, IDs, asset compositions, and status. Use this first when the user refers to a portfolio by name — you need the portfolio ID for other tools.",
+    description="List the user's existing portfolios with names, IDs, asset compositions, and status. Use this first when the user refers to a portfolio by name — you need the portfolio ID and its tickers for modeling. WORKFLOW: list_portfolios → list_feature_set_templates (pick factors) → run_full_analysis.",
     annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def list_portfolios(
@@ -170,7 +170,7 @@ async def get_portfolio(
 
 @server.tool(
     name="create_portfolio",
-    description="Create a new portfolio from tickers and weights. Weights must sum to 1.0. After creating, use list_model_groups to see if models exist, or create_models to set up new ones. Workflow: create_portfolio → create_models → train_models → simulate_betas.",
+    description="Create a new portfolio from tickers and weights. Weights must sum to 1.0. NEXT STEP: use list_feature_set_templates to browse the Factors Library (pre-built conditioning sets like Macro, Market, Themes), then run_full_analysis to create models, train, and get betas in one shot.",
 )
 async def create_portfolio(
     name: Annotated[str, Field(description="Portfolio name (e.g. 'Tech Portfolio')")],
@@ -310,7 +310,7 @@ async def get_analysis_status(
 
 @server.tool(
     name="list_model_groups",
-    description="List all model groups with their training and simulation status. Each group contains per-asset models sharing the same conditioning set. Use this to find the model_group_id needed by train_models and simulate_betas.",
+    description="List all model groups with their training and simulation status. Each group = (portfolio + conditioning set) containing per-asset models. Use this to find existing model_group_ids, check training status, or see available simulation_batch_ids for downstream tools (test_portfolio_risk, simulate_returns).",
     annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def list_model_groups() -> str:
@@ -343,7 +343,7 @@ async def list_model_groups() -> str:
 
 @server.tool(
     name="list_feature_set_templates",
-    description="List available conditioning set templates (predefined market factor sets like macro, rates, equity). Returns template IDs needed by create_models. A conditioning set defines which factors the model learns exposures to.",
+    description="Browse the Factors Library — pre-built conditioning sets organized by category (Macro, Market, Themes). Each template contains curated market factors (e.g. rates, volatility, commodities) that models learn exposures to. Returns conditioning_set_id needed by create_models or run_full_analysis. IMPORTANT: Always show the user available templates so they can choose which factors drive their analysis.",
     annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def list_feature_set_templates() -> str:
@@ -357,7 +357,7 @@ async def list_feature_set_templates() -> str:
 
 @server.tool(
     name="create_models",
-    description="Create per-asset factor models for a portfolio. Requires: conditioning_set_id from list_feature_set_templates. After creating, use train_models to start training. Workflow: create_models → train_models → simulate_betas.",
+    description="Create per-asset factor models for a portfolio. Requires: conditioning_set_id from list_feature_set_templates (the Factors Library). Returns model_group_id. NEXT: train_models → simulate_betas. TIP: prefer run_full_analysis which does create + train + simulate in one call.",
 )
 async def create_models(
     conditioning_set_id: Annotated[str, Field(description="UUID of the conditioning set (market factors)")],
@@ -372,10 +372,12 @@ async def create_models(
             asset_tickers=asset_tickers,
         )
         return _fmt({
+            "model_group_id": result.get("model_group_id"),
+            "conditioning_set_id": result.get("conditioning_set_id"),
             "total_created": result.get("total_created"),
             "total_failed": result.get("total_failed"),
-            "models": result.get("models", []),
-            "message": "Models created. Use train_models with the model_group_id to start training.",
+            "models": result.get("created_models", []),
+            "message": "Models created. Next step: use train_models with this model_group_id to start training.",
         })
     except SablierAPIError as e:
         return _api_error(e)
@@ -388,7 +390,7 @@ async def create_models(
 
 @server.tool(
     name="train_models",
-    description="Start training for all models in a model group. Requires: model_group_id from list_model_groups or create_models. Use get_training_progress to monitor. After training completes, use simulate_betas. Modes: single_shot_linear (fast), single_shot_nonlinear (moderate), rollout_nonlinear (thorough).",
+    description="Start training for all models in a model group. Requires: model_group_id from create_models or list_model_groups. Returns job_id. Use get_training_progress to poll until 'completed', then simulate_betas. Modes: single_shot_linear (fast, recommended), single_shot_nonlinear (moderate), rollout_nonlinear (thorough). TIP: prefer run_full_analysis which handles the full chain automatically.",
 )
 async def train_models(
     model_group_id: Annotated[str, Field(description="UUID of the model group to train")],
@@ -453,7 +455,7 @@ async def get_training_progress(
 
 @server.tool(
     name="simulate_betas",
-    description="Compute regime-dependent factor betas for all assets in a trained model group. Requires: model_group_id from list_model_groups (status must be 'trained'). simulation_mode must match the training mode. Auto-polls up to 5 min. Returns a simulation_batch_id needed by test_portfolio_risk and simulate_returns.",
+    description="Compute regime-dependent factor betas for all assets in a trained model group. Requires: model_group_id (status must be 'trained'). simulation_mode must match the training mode used. Auto-polls up to 5 min. Returns simulation_batch_id + per-asset betas. NEXT: use test_portfolio_risk (VaR/CVaR) or simulate_returns (Monte Carlo under a factor scenario).",
     annotations=ToolAnnotations(openWorldHint=True),
 )
 async def simulate_betas(
@@ -535,7 +537,7 @@ async def get_betas_results(
 
 @server.tool(
     name="simulate_returns",
-    description="Simulate return distributions under a factor scenario. Requires: simulation_batch_id from simulate_betas. Factor keys must match the conditioning features (e.g. {'VIX': 35, 'DXY': 110}). Auto-polls until ready.",
+    description="Simulate return distributions under a factor scenario. Requires: simulation_batch_id from simulate_betas or run_full_analysis. Factor keys must match the conditioning features returned in the betas results (e.g. {'VIX': 35, 'DXY': 110}). Auto-polls until ready.",
     annotations=ToolAnnotations(openWorldHint=True),
 )
 async def simulate_returns(
@@ -593,7 +595,7 @@ async def get_returns_results(
 
 @server.tool(
     name="test_portfolio_risk",
-    description="Run a portfolio risk test. Requires: simulation_batch_id from simulate_betas. Returns expected return, VaR 95%, CVaR 95%, risk contribution per factor, and marginal contribution per asset. Weights must sum to 1.0 and tickers must match the simulated assets.",
+    description="Run a portfolio risk test. Requires: simulation_batch_id from simulate_betas or run_full_analysis. Returns expected return, VaR 95%, CVaR 95%, risk contribution per factor, and marginal contribution per asset. Weights must sum to 1.0 and tickers must match the simulated assets.",
     annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def test_portfolio_risk(
@@ -683,6 +685,128 @@ async def list_scenarios(
                 "created_at": s.get("created_at"),
             })
         return _fmt({"total": result.get("total", len(summary)), "scenarios": summary})
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+# ══════════════════════════════════════════════════
+# Full Analysis Orchestrator
+# ══════════════════════════════════════════════════
+
+
+@server.tool(
+    name="run_full_analysis",
+    description=(
+        "One-shot orchestrator: creates models, trains them, and simulates factor betas — "
+        "all in one call. This replicates the full Moment workflow from the Sablier UI. "
+        "Requires: conditioning_set_id (from list_feature_set_templates — the Factors Library) "
+        "and asset_tickers (from the portfolio). Returns simulation_batch_id + betas for all assets. "
+        "After this completes, use test_portfolio_risk or simulate_returns for scenario analysis."
+    ),
+)
+async def run_full_analysis(
+    conditioning_set_id: Annotated[str, Field(description="UUID of the conditioning set (from list_feature_set_templates)")],
+    asset_tickers: Annotated[list[str], Field(description="Tickers to model (e.g. ['AAPL', 'MSFT', 'NVDA'])")],
+    training_mode: Annotated[str, Field(description="Training mode: 'single_shot_linear' (fast), 'single_shot_nonlinear', or 'rollout_nonlinear'", default="single_shot_linear")] = "single_shot_linear",
+    horizon: Annotated[int, Field(description="Forecast horizon in trading days", default=20)] = 20,
+) -> list | str:
+    if err := _validate_uuid(conditioning_set_id, "conditioning_set_id"):
+        return err
+
+    client = get_client()
+
+    try:
+        # Step 1: Create models
+        create_result = await client.batch_create_models(
+            conditioning_set_id=conditioning_set_id,
+            asset_tickers=asset_tickers,
+        )
+        model_group_id = create_result.get("model_group_id")
+        if not model_group_id:
+            return "Error: model creation did not return a model_group_id."
+
+        total_created = create_result.get("total_created", 0)
+        total_failed = create_result.get("total_failed", 0)
+        if total_created == 0:
+            return _fmt({
+                "error": "No models were created.",
+                "total_failed": total_failed,
+                "failed_assets": create_result.get("failed_assets", []),
+            })
+
+        # Step 2: Train
+        train_result = await client.train_batch(
+            model_group_id=model_group_id,
+            training_mode=training_mode,
+        )
+        job_id = train_result.get("job_id")
+        if not job_id:
+            return "Error: training did not return a job_id."
+
+        # Step 3: Poll training until complete
+        train_status = await client.poll_training(job_id)
+        if train_status.get("status") == "failed":
+            return _fmt({
+                "error": "Training failed.",
+                "model_group_id": model_group_id,
+                "details": train_status.get("error_message"),
+            })
+        if train_status.get("status") != "completed":
+            return _fmt({
+                "status": "training_timeout",
+                "model_group_id": model_group_id,
+                "job_id": job_id,
+                "message": "Training is still running. Use get_training_progress with job_id to monitor, then simulate_betas once complete.",
+            })
+
+        # Step 4: Simulate betas
+        batch = await client.simulate_betas_batch(
+            model_group_id=model_group_id,
+            simulation_mode=training_mode,
+            horizon=horizon,
+        )
+        sim_batch_id = batch.get("simulation_batch_id")
+
+        # Step 5: Poll betas until complete
+        results = await client.poll_betas_batch(sim_batch_id)
+
+        if not results or not results.get("all_completed"):
+            return _fmt({
+                "status": "simulation_timeout",
+                "model_group_id": model_group_id,
+                "simulation_batch_id": sim_batch_id,
+                "message": "Betas simulation still running. Use get_betas_results with simulation_batch_id to check later.",
+            })
+
+        # Build summary
+        per_asset = results.get("per_asset_results", {})
+        summary = {
+            "status": "completed",
+            "model_group_id": model_group_id,
+            "simulation_batch_id": sim_batch_id,
+            "models_created": total_created,
+            "conditioning_features": results.get("conditioning_features", []),
+            "assets": {},
+        }
+        for asset, asset_data in per_asset.items():
+            summary["assets"][asset] = {
+                "status": asset_data.get("status"),
+                "linear_betas": asset_data.get("linear_betas"),
+                "alpha": asset_data.get("alpha"),
+                "residual_std": asset_data.get("residual_std"),
+            }
+
+        factor_stats = results.get("factor_stats", {})
+        if factor_stats:
+            summary["factor_means"] = factor_stats.get("means")
+            summary["factor_stds"] = factor_stats.get("stds")
+
+        summary["next_steps"] = (
+            "Use test_portfolio_risk with simulation_batch_id and portfolio weights to get VaR/CVaR, "
+            "or simulate_returns with factor values to generate return distributions under a scenario."
+        )
+
+        return _with_widget(_fmt(summary), betas_heatmap(summary))
     except SablierAPIError as e:
         return _api_error(e)
 

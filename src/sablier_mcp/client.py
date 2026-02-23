@@ -208,6 +208,21 @@ class SablierClient:
     async def get_batch_training_progress(self, job_id: str) -> dict:
         return await self._get(f"/ml/train/batch/{job_id}/progress")
 
+    async def poll_training(
+        self, job_id: str, timeout: float = MAX_POLL_TIME
+    ) -> dict:
+        """Poll a training job until completion or timeout."""
+        elapsed = 0.0
+        result = {}
+        while elapsed < timeout:
+            result = await self.get_batch_training_progress(job_id)
+            status = result.get("status", "")
+            if status in ("completed", "failed"):
+                return result
+            await asyncio.sleep(POLL_INTERVAL)
+            elapsed += POLL_INTERVAL
+        return result
+
     # ──────────────────────────────────────────────
     # Simulation — Betas
     # ──────────────────────────────────────────────
