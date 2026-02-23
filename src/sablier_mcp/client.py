@@ -30,23 +30,57 @@ class SablierClient:
 
     def __init__(self):
         self.base_url = os.getenv("SABLIER_API_URL", DEFAULT_BASE_URL).rstrip("/")
-        self.api_key = os.getenv("SABLIER_API_KEY", "")
-        if not self.api_key:
-            raise ValueError(
-                "SABLIER_API_KEY environment variable is required. "
-                "Get an API key from the Sablier dashboard."
-            )
+        self._auth_token: str | None = os.getenv("SABLIER_API_KEY") or None
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
+            headers={"Content-Type": "application/json"},
             timeout=DEFAULT_TIMEOUT,
         )
+        if self._auth_token:
+            self._client.headers["Authorization"] = f"Bearer {self._auth_token}"
+
+    @property
+    def is_authenticated(self) -> bool:
+        return self._auth_token is not None
+
+    def set_auth_token(self, token: str) -> None:
+        """Set the auth token (API key or JWT) for this session."""
+        self._auth_token = token
+        self._client.headers["Authorization"] = f"Bearer {token}"
 
     async def close(self):
         await self._client.aclose()
+
+    # ──────────────────────────────────────────────
+    # Auth (unauthenticated endpoints)
+    # ──────────────────────────────────────────────
+
+    async def register(
+        self, email: str, name: str, company: str, role: str, password: str
+    ) -> dict:
+        """Register a new Sablier account. No auth required."""
+        return await self._post(
+            "/auth/register",
+            json={
+                "email": email,
+                "name": name,
+                "company": company,
+                "role": role,
+                "password": password,
+            },
+        )
+
+    async def login(self, email: str, password: str) -> dict:
+        """Login and get JWT tokens. No auth required."""
+        result = await self._post(
+            "/auth/login",
+            json={"email": email, "password": password},
+        )
+        # Auto-set the access token for this session
+        access_token = result.get("access_token")
+        if access_token:
+            self.set_auth_token(access_token)
+        return result
 
     async def _request(self, method: str, path: str, **kwargs) -> Any:
         response = await self._client.request(method, path, **kwargs)
