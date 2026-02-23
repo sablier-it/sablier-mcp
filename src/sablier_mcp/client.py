@@ -105,14 +105,6 @@ class SablierClient:
             body["description"] = description
         return await self._post("/portfolios/from-assets", json=body)
 
-    async def get_compatible_simulations(
-        self, portfolio_id: str, limit: int = 100
-    ) -> list[dict]:
-        return await self._get(
-            f"/portfolios/{portfolio_id}/compatible-simulations",
-            params={"limit": limit},
-        )
-
     # ──────────────────────────────────────────────
     # GRAIN (Qualitative Analysis)
     # ──────────────────────────────────────────────
@@ -212,9 +204,6 @@ class SablierClient:
                 "n_layers": n_layers,
             },
         )
-
-    async def get_training_status(self, model_id: str) -> dict:
-        return await self._get(f"/ml/train/{model_id}/status")
 
     async def get_batch_training_progress(self, job_id: str) -> dict:
         return await self._get(f"/ml/train/batch/{job_id}/progress")
@@ -349,12 +338,3 @@ class SablierClient:
     # Tests
     # ──────────────────────────────────────────────
 
-    async def run_portfolio_test(
-        self, portfolio_id: str, simulation_id: str
-    ) -> dict:
-        return await self._post(
-            "/tests", json={"portfolio_id": portfolio_id, "simulation_id": simulation_id}
-        )
-
-    async def get_test_results(self, test_id: str) -> dict:
-        return await self._get(f"/tests/{test_id}/results")

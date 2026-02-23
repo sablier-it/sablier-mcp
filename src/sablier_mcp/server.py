@@ -70,7 +70,7 @@ def _with_widget(text: str, html: str) -> list:
 
 @server.tool(
     name="search_features",
-    description="Search for tickers (stocks, ETFs) and market features (VIX, DXY, rates). Use this to find available tickers before creating a portfolio, or to discover macro factors for conditioning sets.",
+    description="Search for tickers (stocks, ETFs) and market features (VIX, DXY, rates). Use this to find valid tickers before create_portfolio, or to discover macro factors. Start here if the user mentions a company or indicator you need to look up.",
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
 )
 async def search_features(
@@ -102,7 +102,7 @@ async def search_features(
 
 @server.tool(
     name="list_portfolios",
-    description="List the user's existing portfolios with names, IDs, asset compositions, and status.",
+    description="List the user's existing portfolios with names, IDs, asset compositions, and status. Use this first when the user refers to a portfolio by name — you need the portfolio ID for other tools.",
     annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def list_portfolios(
@@ -126,7 +126,7 @@ async def list_portfolios(
 
 @server.tool(
     name="get_portfolio",
-    description="Get detailed information about a specific portfolio including assets and weights.",
+    description="Get detailed information about a specific portfolio including assets, weights, and associated feature sets. Use the portfolio ID from list_portfolios.",
     annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def get_portfolio(
@@ -139,7 +139,7 @@ async def get_portfolio(
 
 @server.tool(
     name="create_portfolio",
-    description="Create a new portfolio from tickers and weights. Weights should sum to 1.0. This automatically creates the underlying feature sets needed for modeling.",
+    description="Create a new portfolio from tickers and weights. Weights must sum to 1.0. After creating, use list_model_groups to see if models exist, or create_models to set up new ones. Workflow: create_portfolio → create_models → train_models → simulate_betas.",
 )
 async def create_portfolio(
     name: Annotated[str, Field(description="Portfolio name (e.g. 'Tech Portfolio')")],
@@ -170,7 +170,7 @@ async def create_portfolio(
 
 @server.tool(
     name="analyze_qualitative",
-    description="Run GRAIN qualitative analysis on tickers for specific themes. Analyzes SEC filings (10-K, 10-Q) and earnings call transcripts to score thematic exposures. Returns scores, evidence passages, and source breakdowns. Auto-polls until results are ready (up to 5 minutes).",
+    description="Run GRAIN qualitative analysis on tickers for specific themes. Analyzes SEC filings (10-K, 10-Q) and earnings transcripts to score thematic exposures (0-100). Returns scores, evidence passages, and source breakdowns. To analyze a portfolio, first use list_portfolios to get its tickers. Auto-polls up to 5 min; if it times out use get_analysis_status.",
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
 )
 async def analyze_qualitative(
@@ -245,7 +245,7 @@ async def analyze_qualitative(
 
 @server.tool(
     name="get_analysis_status",
-    description="Check the status of a running GRAIN qualitative analysis. Use this if analyze_qualitative timed out.",
+    description="Check the status of a running GRAIN analysis job. Only needed if analyze_qualitative timed out — pass the job_id it returned.",
     annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def get_analysis_status(
@@ -268,7 +268,7 @@ async def get_analysis_status(
 
 @server.tool(
     name="list_model_groups",
-    description="List all model groups with their training and simulation status. A model group contains per-asset models sharing the same conditioning set (market factors).",
+    description="List all model groups with their training and simulation status. Each group contains per-asset models sharing the same conditioning set. Use this to find the model_group_id needed by train_models and simulate_betas.",
     annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def list_model_groups() -> str:
@@ -298,7 +298,7 @@ async def list_model_groups() -> str:
 
 @server.tool(
     name="list_feature_set_templates",
-    description="List available conditioning set templates (predefined market factor sets). Use these when creating models — a conditioning set defines what factors the model learns exposures to.",
+    description="List available conditioning set templates (predefined market factor sets like macro, rates, equity). Returns template IDs needed by create_models. A conditioning set defines which factors the model learns exposures to.",
     annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def list_feature_set_templates() -> str:
@@ -309,7 +309,7 @@ async def list_feature_set_templates() -> str:
 
 @server.tool(
     name="create_models",
-    description="Batch create per-asset factor models. Each ticker gets its own model that learns regime-dependent exposures to the factors in the conditioning set.",
+    description="Create per-asset factor models for a portfolio. Requires: conditioning_set_id from list_feature_set_templates. After creating, use train_models to start training. Workflow: create_models → train_models → simulate_betas.",
 )
 async def create_models(
     conditioning_set_id: Annotated[str, Field(description="UUID of the conditioning set (market factors)")],
@@ -335,7 +335,7 @@ async def create_models(
 
 @server.tool(
     name="train_models",
-    description="Start batch training for all models in a model group. Training runs on GPU. Use get_training_progress to monitor. Modes: single_shot_linear (fast, ~1 min), single_shot_nonlinear (~5 min), rollout_nonlinear (~15 min).",
+    description="Start training for all models in a model group. Requires: model_group_id from list_model_groups or create_models. Use get_training_progress to monitor. After training completes, use simulate_betas. Modes: single_shot_linear (fast), single_shot_nonlinear (moderate), rollout_nonlinear (thorough).",
 )
 async def train_models(
     model_group_id: Annotated[str, Field(description="UUID of the model group to train")],
@@ -359,7 +359,7 @@ async def train_models(
 
 @server.tool(
     name="get_training_progress",
-    description="Check the progress of a batch training job including current epoch, loss, and completion status.",
+    description="Check training progress including epoch, loss, and completion. Pass the job_id from train_models. Once status is 'completed', use simulate_betas on the model group.",
     annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def get_training_progress(
@@ -390,7 +390,7 @@ async def get_training_progress(
 
 @server.tool(
     name="simulate_betas",
-    description="Compute regime-dependent factor exposures (betas) for all assets in a model group. Unlike static betas, these change based on current market conditions. Runs on GPU, auto-polls until ready (up to 5 min).",
+    description="Compute regime-dependent factor betas for all assets in a trained model group. Requires: model_group_id from list_model_groups (status must be 'trained'). simulation_mode must match the training mode. Auto-polls up to 5 min. Returns a simulation_batch_id needed by test_portfolio_risk and simulate_returns.",
     annotations=ToolAnnotations(openWorldHint=True),
 )
 async def simulate_betas(
@@ -409,10 +409,12 @@ async def simulate_betas(
     # Poll until complete
     results = await client.poll_betas_batch(sim_batch_id)
 
-    if not results:
+    if not results or not results.get("all_completed"):
         return _fmt({
             "simulation_batch_id": sim_batch_id,
             "status": "running",
+            "completed": results.get("completed_count", 0) if results else 0,
+            "total": results.get("total_count", 0) if results else 0,
             "message": "Simulation still running. Use get_betas_results to check later.",
         })
 
@@ -442,7 +444,7 @@ async def simulate_betas(
 
 @server.tool(
     name="get_betas_results",
-    description="Get detailed factor beta results from a completed simulation batch. Includes per-asset betas, sensitivity curves, factor statistics, and residual correlations.",
+    description="Get full beta results from a completed simulation. Only needed if simulate_betas timed out or you want raw details. Pass the simulation_batch_id from simulate_betas.",
     annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def get_betas_results(
@@ -460,7 +462,7 @@ async def get_betas_results(
 
 @server.tool(
     name="simulate_returns",
-    description="Simulate return distributions under a specific factor scenario. Given factor values (e.g. VIX=35 for stress), samples thousands of possible return outcomes. Auto-polls until ready.",
+    description="Simulate return distributions under a factor scenario. Requires: simulation_batch_id from simulate_betas. Factor keys must match the conditioning features (e.g. {'VIX': 35, 'DXY': 110}). Auto-polls until ready.",
     annotations=ToolAnnotations(openWorldHint=True),
 )
 async def simulate_returns(
@@ -478,11 +480,11 @@ async def simulate_returns(
 
     results = await client.poll_returns_batch(returns_batch_id)
 
-    if not results:
+    if not results or not results.get("all_completed"):
         return _fmt({
             "returns_batch_id": returns_batch_id,
             "status": "running",
-            "message": "Returns simulation still running.",
+            "message": "Returns simulation still running. Use get_returns_results to check later.",
         })
 
     return _fmt(results)
@@ -490,7 +492,7 @@ async def simulate_returns(
 
 @server.tool(
     name="get_returns_results",
-    description="Get results from a completed returns simulation.",
+    description="Get results from a completed returns simulation. Only needed if simulate_returns timed out. Pass the returns_batch_id from simulate_returns.",
     annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def get_returns_results(
@@ -508,7 +510,7 @@ async def get_returns_results(
 
 @server.tool(
     name="test_portfolio_risk",
-    description="Run a portfolio risk test using simulation results. Returns portfolio-level factor betas, expected return, VaR, CVaR, risk contribution per factor, and marginal contribution per asset.",
+    description="Run a portfolio risk test. Requires: simulation_batch_id from simulate_betas. Returns expected return, VaR 95%, CVaR 95%, risk contribution per factor, and marginal contribution per asset. Weights must sum to 1.0 and tickers must match the simulated assets.",
     annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def test_portfolio_risk(
@@ -539,7 +541,7 @@ async def test_portfolio_risk(
 
 @server.tool(
     name="create_scenario",
-    description="Create a named what-if scenario. Each factor uses: {'type': 'fixed', 'value': 35} for exact value, {'type': 'percentile', 'value': 95} for historical percentile, or {'type': 'shock', 'value': 2.0} for std dev shift.",
+    description="Save a named what-if scenario for reuse. Requires a model_id from list_model_groups. Factor spec format: {'type': 'fixed', 'value': 35} for exact value, {'type': 'percentile', 'value': 95} for historical percentile, {'type': 'shock', 'value': 2.0} for std dev shift. Use simulate_returns to run the scenario.",
 )
 async def create_scenario(
     model_id: Annotated[str, Field(description="UUID of the model this scenario applies to")],
@@ -564,7 +566,7 @@ async def create_scenario(
 
 @server.tool(
     name="list_scenarios",
-    description="List existing scenarios, optionally filtered by model.",
+    description="List saved scenarios. Optionally filter by model_id from list_model_groups.",
     annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def list_scenarios(
