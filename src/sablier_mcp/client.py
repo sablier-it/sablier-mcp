@@ -148,12 +148,35 @@ class SablierClient:
         return await self._get(f"/portfolios/{portfolio_id}")
 
     async def create_portfolio(
-        self, name: str, assets: list[dict], description: str | None = None
+        self, name: str, assets: list[dict], description: str | None = None,
+        capital: float = 100_000.0,
     ) -> dict:
-        body: dict[str, Any] = {"name": name, "assets": assets}
+        body: dict[str, Any] = {"name": name, "assets": assets, "capital": capital}
         if description:
             body["description"] = description
         return await self._post("/portfolios/from-assets", json=body)
+
+    async def update_portfolio(
+        self, portfolio_id: str, **fields: Any
+    ) -> dict:
+        """Update a portfolio. Pass only the fields to change (name, description, weights, capital)."""
+        return await self._request("PATCH", f"/portfolios/{portfolio_id}", json=fields)
+
+    async def delete_portfolio(self, portfolio_id: str) -> dict:
+        return await self._delete(f"/portfolios/{portfolio_id}")
+
+    async def get_portfolio_live_value(self, portfolio_id: str) -> dict:
+        return await self._get(f"/portfolios/{portfolio_id}/live-value")
+
+    async def get_portfolio_analytics(
+        self, portfolio_id: str, timeframe: str = "1Y"
+    ) -> dict:
+        return await self._get(
+            f"/portfolios/{portfolio_id}/analytics", params={"timeframe": timeframe}
+        )
+
+    async def get_asset_profiles(self, portfolio_id: str) -> dict:
+        return await self._get(f"/portfolios/{portfolio_id}/asset-profiles")
 
     # ──────────────────────────────────────────────
     # GRAIN (Qualitative Analysis)
@@ -167,6 +190,10 @@ class SablierClient:
         min_year: int | None = None,
         max_year: int | None = None,
         use_transcripts: bool = True,
+        weights: dict[str, float] | None = None,
+        portfolio_id: str | None = None,
+        portfolio_name: str | None = None,
+        custom_keywords: dict[str, list[str]] | None = None,
     ) -> dict:
         body: dict[str, Any] = {
             "tickers": tickers,
@@ -179,6 +206,14 @@ class SablierClient:
             body["min_year"] = min_year
         if max_year:
             body["max_year"] = max_year
+        if weights:
+            body["weights"] = weights
+        if portfolio_id:
+            body["portfolio_id"] = portfolio_id
+        if portfolio_name:
+            body["portfolio_name"] = portfolio_name
+        if custom_keywords:
+            body["custom_keywords"] = custom_keywords
         return await self._post("/grain/analyze", json=body)
 
     async def get_grain_job(self, job_id: str) -> dict:
@@ -198,6 +233,24 @@ class SablierClient:
             elapsed += POLL_INTERVAL
         return result  # Return last status even if timed out
 
+    async def generate_grain_keywords(self, theme: str) -> dict:
+        return await self._post("/grain/generate-keywords", json={"theme": theme})
+
+    async def list_grain_themes(self) -> list[dict]:
+        return await self._get("/grain/themes")
+
+    async def list_grain_analyses(self, portfolio_id: str | None = None) -> list[dict]:
+        params: dict[str, Any] = {}
+        if portfolio_id:
+            params["portfolio_id"] = portfolio_id
+        return await self._get("/grain/analyses", params=params)
+
+    async def get_grain_analysis(self, analysis_id: str) -> dict:
+        return await self._get(f"/grain/analyses/{analysis_id}")
+
+    async def delete_grain_analysis(self, analysis_id: str) -> dict:
+        return await self._delete(f"/grain/analyses/{analysis_id}")
+
     # ──────────────────────────────────────────────
     # Models
     # ──────────────────────────────────────────────
@@ -207,6 +260,12 @@ class SablierClient:
 
     async def list_model_groups(self) -> list[dict]:
         return await self._get("/models/groups")
+
+    async def delete_model_group(self, group_id: str) -> dict:
+        return await self._delete(f"/models/groups/{group_id}")
+
+    async def list_group_simulations(self, group_id: str) -> dict:
+        return await self._get(f"/ml/model-groups/{group_id}/simulations")
 
     async def batch_create_models(
         self,
@@ -241,13 +300,12 @@ class SablierClient:
     async def train_batch(
         self,
         model_group_id: str,
-        training_mode: str = "rolling_huber",
     ) -> dict:
         return await self._post(
             "/ml/train/batch",
             json={
                 "model_group_id": model_group_id,
-                "training_mode": training_mode,
+                "training_mode": "rolling_huber",
             },
         )
 
@@ -276,17 +334,15 @@ class SablierClient:
     async def simulate_betas_batch(
         self,
         model_group_id: str,
-        simulation_mode: str = "rolling_huber",
-        horizon: int = 20,
+        historical_lookback_days: int | None = None,
     ) -> dict:
-        return await self._post(
-            "/ml/simulate-betas/batch",
-            json={
-                "model_group_id": model_group_id,
-                "simulation_mode": simulation_mode,
-                "horizon": horizon,
-            },
-        )
+        body: dict[str, Any] = {
+            "model_group_id": model_group_id,
+            "simulation_mode": "rolling_huber",
+        }
+        if historical_lookback_days is not None:
+            body["historical_lookback_days"] = historical_lookback_days
+        return await self._post("/ml/simulate-betas/batch", json=body)
 
     async def get_betas_batch_status(self, simulation_batch_id: str) -> dict:
         return await self._get(
@@ -338,6 +394,7 @@ class SablierClient:
                 "simulation_batch_id": simulation_batch_id,
                 "factors": factors,
                 "n_samples": n_samples,
+                "use_raw_values": True,
             },
         )
 
@@ -394,6 +451,14 @@ class SablierClient:
         if model_id:
             params["model_id"] = model_id
         return await self._get("/scenarios", params=params)
+
+    async def list_simulation_history(
+        self, simulation_batch_id: str
+    ) -> dict:
+        """List past scenario runs for a given betas simulation batch."""
+        return await self._get(
+            f"/ml/simulate-returns/batch/history/{simulation_batch_id}"
+        )
 
     # ──────────────────────────────────────────────
     # Tests

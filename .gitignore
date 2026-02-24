@@ -13,3 +13,6 @@ venv/
 
 # mcp-use deployment
 .mcp-use
+
+# Manual testing
+Tests/

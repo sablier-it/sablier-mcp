@@ -6,14 +6,20 @@ Implements the MCP SDK's OAuthAuthorizationServerProvider so that Claude Desktop
   1. Client connects → server returns 401
   2. Browser opens → user sees a login form served by this module
   3. User enters email/password → validated against the Sablier backend
-  4. Auth code → token exchange → client is authenticated
+  4. Server generates a long-lived API key for the user
+  5. Auth code → token exchange → client is authenticated with API key
 
-All state is kept in-memory (fine for single-instance; swap to Redis for HA).
+The API key (sk_live_...) is encoded into a stateless HMAC-signed OAuth token.
+API keys never expire, so there is no refresh dance or session timeout.
+Sessions survive Cloud Run container restarts without external storage.
 """
 
 import base64
 import contextvars
+import hashlib
+import hmac as _hmac
 import json as _json
+import logging
 import os
 import secrets
 import time
@@ -22,9 +28,17 @@ from typing import Any
 
 import httpx
 
-# Contextvar set by load_access_token so tool handlers can retrieve the Sablier JWT.
-current_sablier_jwt: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "current_sablier_jwt", default=None
+logger = logging.getLogger("sablier-mcp.auth")
+
+# Contextvar set by load_access_token so tool handlers can retrieve the Sablier API key.
+current_sablier_token: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "current_sablier_token", default=None
+)
+
+# Contextvar set by ASGI middleware before the SDK's authorize handler runs.
+# Allows get_client() to reconstruct clients lost after a server restart.
+_pending_auth_redirect: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_pending_auth_redirect", default=None
 )
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse
@@ -46,8 +60,7 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 # ──────────────────────────────────────────────────
 
 _CODE_TTL = 300  # 5 minutes
-_ACCESS_TTL_FALLBACK = 840  # 14 min fallback if JWT can't be parsed
-_REFRESH_TTL = 7 * 24 * 3600  # 7 days
+_TOKEN_TTL = 365 * 24 * 3600  # 1 year (API key never expires; this is just the OAuth wrapper)
 
 _SABLIER_API_URL = os.getenv(
     "SABLIER_API_URL",
@@ -59,20 +72,48 @@ def _random_token(nbytes: int = 32) -> str:
     return secrets.token_urlsafe(nbytes)
 
 
-def _jwt_expires_in(token: str) -> int:
-    """Extract the ``exp`` claim from a JWT and return seconds until expiry.
+# ──────────────────────────────────────────────────
+# Stateless token encoding (survives container restarts)
+# ──────────────────────────────────────────────────
 
-    Returns at least 60 s.  Falls back to ``_ACCESS_TTL_FALLBACK`` on error.
-    A 30 s buffer is subtracted so we refresh *before* the JWT actually dies.
-    """
+# MCP_TOKEN_SECRET must be set in Cloud Run for tokens to survive restarts.
+# If unset, a random secret is generated (tokens valid only for this instance).
+_TOKEN_SECRET: bytes = (os.getenv("MCP_TOKEN_SECRET") or "").encode() or secrets.token_bytes(32)
+
+
+def _encode_stateless_token(payload: dict) -> str:
+    """Encode a payload into a self-contained HMAC-signed token string."""
+    raw = _json.dumps(payload, separators=(",", ":")).encode()
+    sig = _hmac.new(_TOKEN_SECRET, raw, hashlib.sha256).hexdigest()[:32]
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=") + "." + sig
+
+
+def _decode_stateless_token(token_str: str) -> dict | None:
+    """Decode and verify a self-contained token. Returns None if invalid/tampered."""
     try:
-        payload = token.split(".")[1]
-        payload += "=" * (4 - len(payload) % 4)
-        data = _json.loads(base64.urlsafe_b64decode(payload))
-        remaining = int(data["exp"] - time.time()) - 30  # 30 s buffer
-        return max(remaining, 60)
+        parts = token_str.rsplit(".", 1)
+        if len(parts) != 2:
+            return None
+        b64_part, sig = parts
+        padding = 4 - len(b64_part) % 4
+        if padding != 4:
+            b64_part += "=" * padding
+        raw = base64.urlsafe_b64decode(b64_part)
+        expected_sig = _hmac.new(_TOKEN_SECRET, raw, hashlib.sha256).hexdigest()[:32]
+        if not _hmac.compare_digest(sig, expected_sig):
+            return None
+        return _json.loads(raw)
     except Exception:
-        return _ACCESS_TTL_FALLBACK
+        return None
+
+
+def _is_localhost_redirect(uri: str) -> bool:
+    """Only allow redirects to localhost — prevents open redirect attacks."""
+    try:
+        parsed = urllib.parse.urlparse(uri)
+        return parsed.scheme == "http" and parsed.hostname in ("localhost", "127.0.0.1", "::1")
+    except Exception:
+        return False
 
 
 # ──────────────────────────────────────────────────
@@ -81,19 +122,18 @@ def _jwt_expires_in(token: str) -> int:
 
 
 class SablierAuthorizationCode(AuthorizationCode):
-    """Authorization code enriched with the Sablier JWT obtained at login."""
-    sablier_jwt: str
-    sablier_refresh_token: str | None = None
+    """Authorization code enriched with the Sablier API key obtained at login."""
+    sablier_api_key: str
 
 
 class SablierAccessToken(AccessToken):
-    """Access token that maps to a Sablier JWT."""
-    sablier_jwt: str
+    """Access token that carries a Sablier API key."""
+    sablier_api_key: str
 
 
 class SablierRefreshToken(RefreshToken):
-    """Refresh token that maps to a Sablier refresh JWT."""
-    sablier_refresh_token: str
+    """Refresh token that carries the same Sablier API key (for SDK compatibility)."""
+    sablier_api_key: str
 
 
 # ──────────────────────────────────────────────────
@@ -119,7 +159,31 @@ class SablierOAuthProvider(
     # ── Client Registration ──────────────────────
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
-        return self._clients.get(client_id)
+        client = self._clients.get(client_id)
+        if client is not None:
+            return client
+
+        # Client was registered before a server restart (in-memory state lost).
+        # Reconstruct using the redirect_uri from the current /authorize request.
+        redirect_uri = _pending_auth_redirect.get()
+        if not redirect_uri or not _is_localhost_redirect(redirect_uri):
+            return None
+
+        logger.info(
+            "Reconstructing client %s after restart (redirect: %s)",
+            client_id, redirect_uri,
+        )
+        restored = OAuthClientInformationFull(
+            client_id=client_id,
+            client_id_issued_at=int(time.time()),
+            redirect_uris=[redirect_uri],
+            token_endpoint_auth_method="none",
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+            client_name="MCP Client (restored)",
+        )
+        self._clients[client_id] = restored
+        return restored
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         if not client_info.client_id:
@@ -151,32 +215,47 @@ class SablierOAuthProvider(
         self._auth_codes.pop(authorization_code.code, None)
 
         now = time.time()
-        access_ttl = _jwt_expires_in(authorization_code.sablier_jwt)
+        client_id = client.client_id or ""
+        scopes = authorization_code.scopes
+        api_key = authorization_code.sablier_api_key
 
-        # Issue access token — expires when the underlying Sablier JWT expires
-        access_token_str = _random_token()
+        # Issue stateless access token — API key encoded inside.
+        # API key never expires, so the session lives until the OAuth wrapper expires (1 year).
+        access_token_str = _encode_stateless_token({
+            "t": "access",
+            "cid": client_id,
+            "sc": scopes,
+            "exp": int(now + _TOKEN_TTL),
+            "sak": api_key,
+        })
         self._access_tokens[access_token_str] = SablierAccessToken(
             token=access_token_str,
-            client_id=client.client_id or "",
-            scopes=authorization_code.scopes,
-            expires_at=int(now + access_ttl),
-            sablier_jwt=authorization_code.sablier_jwt,
+            client_id=client_id,
+            scopes=scopes,
+            expires_at=int(now + _TOKEN_TTL),
+            sablier_api_key=api_key,
         )
 
-        # Issue refresh token (valid 7 days, backed by Sablier refresh token)
-        refresh_token_str = _random_token()
+        # Issue stateless refresh token (for SDK compatibility)
+        refresh_token_str = _encode_stateless_token({
+            "t": "refresh",
+            "cid": client_id,
+            "sc": scopes,
+            "exp": int(now + _TOKEN_TTL),
+            "sak": api_key,
+        })
         self._refresh_tokens[refresh_token_str] = SablierRefreshToken(
             token=refresh_token_str,
-            client_id=client.client_id or "",
-            scopes=authorization_code.scopes,
-            expires_at=int(now + _REFRESH_TTL),
-            sablier_refresh_token=authorization_code.sablier_refresh_token or "",
+            client_id=client_id,
+            scopes=scopes,
+            expires_at=int(now + _TOKEN_TTL),
+            sablier_api_key=api_key,
         )
 
         return OAuthToken(
             access_token=access_token_str,
             token_type="Bearer",
-            expires_in=access_ttl,
+            expires_in=_TOKEN_TTL,
             refresh_token=refresh_token_str,
         )
 
@@ -186,6 +265,23 @@ class SablierOAuthProvider(
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> SablierRefreshToken | None:
         rt = self._refresh_tokens.get(refresh_token)
+
+        # Fallback: decode stateless token after container restart
+        if rt is None:
+            payload = _decode_stateless_token(refresh_token)
+            if payload and payload.get("t") == "refresh":
+                if payload.get("exp", 0) < time.time():
+                    return None
+                rt = SablierRefreshToken(
+                    token=refresh_token,
+                    client_id=payload.get("cid", ""),
+                    scopes=payload.get("sc", []),
+                    expires_at=payload["exp"],
+                    sablier_api_key=payload.get("sak", ""),
+                )
+                self._refresh_tokens[refresh_token] = rt
+                logger.info("Recovered refresh token from stateless encoding after restart")
+
         if rt and rt.expires_at and rt.expires_at < time.time():
             del self._refresh_tokens[refresh_token]
             return None
@@ -197,59 +293,54 @@ class SablierOAuthProvider(
         refresh_token: SablierRefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
-        # Call Sablier backend to get a fresh 15-min JWT
-        sablier_refresh = refresh_token.sablier_refresh_token
-        new_sablier_jwt = ""
+        # API key doesn't expire — just re-issue the same token with a fresh TTL.
+        api_key = refresh_token.sablier_api_key
+        if not api_key:
+            raise Exception("No API key in refresh token — please log in again")
 
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as http:
-                resp = await http.post(
-                    f"{_SABLIER_API_URL}/auth/refresh",
-                    json={"refresh_token": sablier_refresh},
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    new_sablier_jwt = data.get("access_token", "")
-                    # Backend may rotate refresh tokens — use new one if provided
-                    sablier_refresh = data.get("refresh_token", sablier_refresh)
-        except Exception:
-            pass
-
-        if not new_sablier_jwt:
-            # Refresh failed — the Sablier refresh token may have expired.
-            # Client must re-authenticate via the browser login flow.
-            raise Exception("Sablier refresh token expired — please log in again")
-
-        # Revoke old OAuth refresh token
+        # Revoke old refresh token
         self._refresh_tokens.pop(refresh_token.token, None)
 
         now = time.time()
-        access_ttl = _jwt_expires_in(new_sablier_jwt)
+        client_id = client.client_id or ""
+        resolved_scopes = scopes or refresh_token.scopes
 
-        # Issue new access token tied to the fresh Sablier JWT
-        access_token_str = _random_token()
+        # Re-issue stateless access token with same API key
+        access_token_str = _encode_stateless_token({
+            "t": "access",
+            "cid": client_id,
+            "sc": resolved_scopes,
+            "exp": int(now + _TOKEN_TTL),
+            "sak": api_key,
+        })
         self._access_tokens[access_token_str] = SablierAccessToken(
             token=access_token_str,
-            client_id=client.client_id or "",
-            scopes=scopes or refresh_token.scopes,
-            expires_at=int(now + access_ttl),
-            sablier_jwt=new_sablier_jwt,
+            client_id=client_id,
+            scopes=resolved_scopes,
+            expires_at=int(now + _TOKEN_TTL),
+            sablier_api_key=api_key,
         )
 
-        # Issue new OAuth refresh token (same Sablier refresh token)
-        new_refresh_str = _random_token()
+        # Re-issue stateless refresh token
+        new_refresh_str = _encode_stateless_token({
+            "t": "refresh",
+            "cid": client_id,
+            "sc": resolved_scopes,
+            "exp": int(now + _TOKEN_TTL),
+            "sak": api_key,
+        })
         self._refresh_tokens[new_refresh_str] = SablierRefreshToken(
             token=new_refresh_str,
-            client_id=client.client_id or "",
-            scopes=scopes or refresh_token.scopes,
-            expires_at=int(now + _REFRESH_TTL),
-            sablier_refresh_token=sablier_refresh,
+            client_id=client_id,
+            scopes=resolved_scopes,
+            expires_at=int(now + _TOKEN_TTL),
+            sablier_api_key=api_key,
         )
 
         return OAuthToken(
             access_token=access_token_str,
             token_type="Bearer",
-            expires_in=access_ttl,
+            expires_in=_TOKEN_TTL,
             refresh_token=new_refresh_str,
         )
 
@@ -257,11 +348,29 @@ class SablierOAuthProvider(
 
     async def load_access_token(self, token: str) -> SablierAccessToken | None:
         at = self._access_tokens.get(token)
+
+        # Fallback: decode stateless token after container restart
+        if at is None:
+            payload = _decode_stateless_token(token)
+            if payload and payload.get("t") == "access":
+                if payload.get("exp", 0) < time.time():
+                    return None
+                at = SablierAccessToken(
+                    token=token,
+                    client_id=payload.get("cid", ""),
+                    scopes=payload.get("sc", []),
+                    expires_at=payload["exp"],
+                    sablier_api_key=payload.get("sak", ""),
+                )
+                self._access_tokens[token] = at  # re-cache
+                logger.info("Recovered access token from stateless encoding after restart")
+
         if at and at.expires_at and at.expires_at < time.time():
             del self._access_tokens[token]
             return None
         if at:
-            current_sablier_jwt.set(at.sablier_jwt)
+            # API key — just set it in the contextvar. No refresh needed.
+            current_sablier_token.set(at.sablier_api_key)
         return at
 
     # ── Revocation ───────────────────────────────
@@ -279,8 +388,7 @@ class SablierOAuthProvider(
     def complete_login(
         self,
         session_id: str,
-        sablier_jwt: str,
-        sablier_refresh_token: str | None,
+        sablier_api_key: str,
     ) -> tuple[str, str | None]:
         """Complete login: generate auth code, return (redirect_url, error).
 
@@ -301,8 +409,7 @@ class SablierOAuthProvider(
             redirect_uri=params.redirect_uri,
             redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
             resource=params.resource,
-            sablier_jwt=sablier_jwt,
-            sablier_refresh_token=sablier_refresh_token,
+            sablier_api_key=sablier_api_key,
         )
 
         redirect_url = construct_redirect_uri(
@@ -311,11 +418,6 @@ class SablierOAuthProvider(
             state=params.state,
         )
         return redirect_url, None
-
-    def get_sablier_jwt(self, access_token: str) -> str | None:
-        """Get the Sablier JWT associated with an OAuth access token."""
-        at = self._access_tokens.get(access_token)
-        return at.sablier_jwt if at else None
 
 
 # ──────────────────────────────────────────────────
@@ -510,7 +612,7 @@ _LOGIN_PAGE = """<!DOCTYPE html>
       <button type="submit">Sign in</button>
     </form>
     <div class="footer">
-      <span>Don't have an account? <a href="https://www.sablier-ai.com/login" target="_blank">Sign up</a></span>
+      <span>Don't have an account? <a href="https://www.sablier-ai.com" target="_blank">Sign up</a></span>
       <a href="https://www.sablier-ai.com/" target="_blank">Explore Sablier &rarr;</a>
     </div>
   </div>
@@ -559,7 +661,7 @@ async def login_page(request: Request, provider: SablierOAuthProvider) -> HTMLRe
     if not email or not password:
         return _render_login(session_id, error="Please enter both email and password.", email=email)
 
-    # Validate against Sablier backend
+    # Step 1: Authenticate against Sablier backend (get short-lived JWT)
     try:
         async with httpx.AsyncClient(timeout=30.0) as http:
             resp = await http.post(
@@ -581,7 +683,6 @@ async def login_page(request: Request, provider: SablierOAuthProvider) -> HTMLRe
 
         data = resp.json()
         sablier_jwt = data.get("access_token", "")
-        sablier_refresh = data.get("refresh_token")
 
         if not sablier_jwt:
             return _render_login(session_id, error="Login failed. Please try again.", email=email)
@@ -589,8 +690,45 @@ async def login_page(request: Request, provider: SablierOAuthProvider) -> HTMLRe
     except Exception:
         return _render_login(session_id, error="Could not reach Sablier. Please try again.", email=email)
 
-    # Complete the OAuth flow
-    redirect_url, err = provider.complete_login(session_id, sablier_jwt, sablier_refresh)
+    # Step 2: Clean up old MCP API keys, then create a fresh one
+    _MCP_KEY_NAME = "Claude Desktop"
+    _auth_headers = {"Content-Type": "application/json", "Authorization": f"Bearer {sablier_jwt}"}
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as http:
+            # Delete any existing MCP keys to avoid accumulation
+            list_resp = await http.get(f"{_SABLIER_API_URL}/api-keys", headers=_auth_headers)
+            if list_resp.status_code == 200:
+                for key in list_resp.json().get("api_keys", []):
+                    if key.get("name") == _MCP_KEY_NAME:
+                        key_id = key.get("id")
+                        if key_id:
+                            await http.delete(f"{_SABLIER_API_URL}/api-keys/{key_id}", headers=_auth_headers)
+                            logger.info("Deleted old MCP API key: %s", key_id)
+
+            # Create a new key
+            resp = await http.post(
+                f"{_SABLIER_API_URL}/api-keys",
+                json={"name": _MCP_KEY_NAME},
+                headers=_auth_headers,
+            )
+
+        if resp.status_code >= 400:
+            detail = resp.json().get("detail", "Unknown error") if resp.status_code < 500 else "Server error"
+            logger.error("Failed to create API key: %s %s", resp.status_code, detail)
+            return _render_login(session_id, error="Login succeeded but failed to create API key. Please try again.", email=email)
+
+        api_key = resp.json().get("api_key", "")
+        if not api_key:
+            return _render_login(session_id, error="Login succeeded but API key was empty. Please try again.", email=email)
+
+        logger.info("Created API key for MCP session (prefix: %s...)", api_key[:12])
+
+    except Exception as exc:
+        logger.error("Failed to create API key: %s", exc)
+        return _render_login(session_id, error="Could not create API key. Please try again.", email=email)
+
+    # Complete the OAuth flow with the API key (not JWT)
+    redirect_url, err = provider.complete_login(session_id, api_key)
     if err:
         return _render_login(session_id, error=err, email=email)
 

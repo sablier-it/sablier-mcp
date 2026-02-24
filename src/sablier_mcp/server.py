@@ -9,7 +9,9 @@ Supports both local (stdio) and remote (streamable-http) transport.
 Remote mode uses OAuth 2.0 — Claude Desktop opens a browser for login.
 """
 
+import asyncio
 import json
+import logging
 import os
 import re
 import urllib.parse
@@ -25,16 +27,17 @@ from mcp.types import (
 )
 from pydantic import Field
 
-from sablier_mcp.auth import SablierOAuthProvider, current_sablier_jwt, login_page
+from sablier_mcp.auth import SablierOAuthProvider, current_sablier_token, login_page, _pending_auth_redirect
 from sablier_mcp.client import SablierClient, SablierAPIError
 from sablier_mcp.widgets import (
     betas_heatmap,
     grain_score_card,
     portfolio_overview,
     risk_dashboard,
-    training_progress,
 )
 
+
+logger = logging.getLogger("sablier-mcp")
 
 # ══════════════════════════════════════════════════
 # Server setup
@@ -80,23 +83,23 @@ if _oauth_provider is not None:
 # ══════════════════════════════════════════════════
 
 _stdio_client: SablierClient | None = None
-_jwt_clients: dict[str, SablierClient] = {}
+_token_clients: dict[str, SablierClient] = {}
 
 
 def get_client() -> SablierClient:
     """Get a SablierClient for the current user.
 
-    In remote (OAuth) mode: uses the JWT from the authenticated session.
+    In remote (OAuth) mode: uses the API key from the authenticated session.
     In stdio mode: uses SABLIER_API_KEY from the environment.
     """
     global _stdio_client
 
-    # Check for OAuth JWT (set by the auth middleware)
-    jwt = current_sablier_jwt.get(None)
-    if jwt:
-        if jwt not in _jwt_clients:
-            _jwt_clients[jwt] = SablierClient.from_token(jwt)
-        return _jwt_clients[jwt]
+    # Check for API key (set by load_access_token in auth middleware)
+    token = current_sablier_token.get(None)
+    if token:
+        if token not in _token_clients:
+            _token_clients[token] = SablierClient.from_token(token)
+        return _token_clients[token]
 
     # Fallback: stdio mode with API key
     if _stdio_client is None:
@@ -250,9 +253,9 @@ async def _ensure_portfolio(
 
 
 _NOT_LOGGED_IN = (
-    "Error: You need to log in first. "
-    "If you already have a Sablier account, use the login tool with your email and password. "
-    "If you're new, use create_account to sign up — it's free."
+    "Error: Not authenticated. "
+    "Set the SABLIER_API_KEY environment variable to your Sablier API key. "
+    "You can create one at https://app.sablier.co/settings/api-keys."
 )
 
 
@@ -262,90 +265,12 @@ def _require_auth() -> str | None:
     In remote (OAuth) mode the SDK middleware handles auth, so this
     always passes.  In stdio mode it checks SABLIER_API_KEY.
     """
-    if current_sablier_jwt.get(None):
+    if current_sablier_token.get(None):
         return None  # OAuth-authenticated
     client = get_client()
     if not client.is_authenticated:
         return _NOT_LOGGED_IN
     return None
-
-
-# ══════════════════════════════════════════════════
-# Account — Sign up & Log in
-# ══════════════════════════════════════════════════
-
-
-@server.tool(
-    name="create_account",
-    description=(
-        "Create a free Sablier account. This is the first step for new users. "
-        "After signing up, the user will receive a verification email — "
-        "they must click the link to activate their account. "
-        "Once verified, they can log in via the browser prompt (remote) or the login tool (local)."
-    ),
-)
-async def create_account(
-    email: Annotated[str, Field(description="User's email address")],
-    name: Annotated[str, Field(description="User's full name")],
-    company: Annotated[str, Field(description="Company or organization name")],
-    role: Annotated[str, Field(description="User's role (e.g. 'Portfolio Manager', 'Analyst', 'Student')")],
-    password: Annotated[str, Field(description="Password (min 8 characters)")],
-) -> str:
-    try:
-        client = get_client()
-        result = await client.register(
-            email=email, name=name, company=company, role=role, password=password
-        )
-        return _fmt({
-            "status": "account_created",
-            "message": (
-                f"Account created for {email}! "
-                "A verification email has been sent — the user needs to click the link in their inbox to activate the account. "
-                "Once verified, use the login tool with this email and password to start using Sablier."
-            ),
-            "user_id": result.get("user_id"),
-        })
-    except SablierAPIError as e:
-        if e.status_code == 409 or "already" in str(e.detail).lower():
-            return (
-                "This email is already registered. "
-                "Use the login tool instead, or check your inbox for the verification email if you haven't activated yet."
-            )
-        return _api_error(e)
-
-
-@server.tool(
-    name="login",
-    description=(
-        "Log in to Sablier with email and password (for local/stdio mode). "
-        "If connected via Claude Desktop or another remote client, authentication "
-        "happens automatically via the browser — this tool is not needed. "
-        "The user must have a verified account (created via create_account)."
-    ),
-)
-async def login(
-    email: Annotated[str, Field(description="Email address")],
-    password: Annotated[str, Field(description="Password")],
-) -> str:
-    try:
-        client = get_client()
-        result = await client.login(email=email, password=password)
-        user = result.get("user", {})
-        return _fmt({
-            "status": "logged_in",
-            "message": f"Welcome back, {user.get('name', 'there')}! You're now logged in and ready to go.",
-            "user": {
-                "name": user.get("name"),
-                "email": user.get("email"),
-                "company": user.get("company"),
-            },
-        })
-    except SablierAPIError as e:
-        if e.status_code == 401:
-            return "Incorrect email or password. Please try again, or use create_account if you don't have an account yet."
-        if e.status_code == 403 or "verif" in str(e.detail).lower():
-            return "Your email hasn't been verified yet. Please check your inbox and click the verification link first."
-        return _api_error(e)
 
 
 # ══════════════════════════════════════════════════
@@ -355,7 +280,7 @@ async def login(
 
 @server.tool(
     name="search_features",
-    description="Search for tickers (stocks, ETFs) and market features (VIX, DXY, rates). Use this to validate tickers before creating a portfolio. WORKFLOW: When a user mentions assets, validate tickers → create_portfolio (single asset = 100% weight; multiple = ask for weights or equal) → then run both analyze_qualitative (thematic) AND run_full_analysis (quantitative) on the same portfolio for a full risk picture.",
+    description="Search for tickers (stocks, ETFs) and market indicators (VIX, DXY, rates). Returns matching symbols with descriptions. Use this to validate tickers before creating a portfolio.",
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
 )
 async def search_features(
@@ -392,7 +317,7 @@ async def search_features(
 
 @server.tool(
     name="list_portfolios",
-    description="List the user's existing portfolios with names, IDs, asset compositions, and status. Use this when the user refers to an existing portfolio. WORKFLOW: list_portfolios → list_feature_set_templates (ask 'what do you want to test against?') → run_full_analysis with portfolio_id.",
+    description="List the user's existing portfolios with names, IDs, asset compositions, and status.",
     annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def list_portfolios(
@@ -411,6 +336,8 @@ async def list_portfolios(
                 "name": p["name"],
                 "tickers": _portfolio_tickers(p),
                 "weights": p.get("weights", {}),
+                "capital": p.get("capital", 100_000),
+                "description": p.get("description", ""),
                 "created_at": p.get("created_at"),
             })
         data = {"total": result.get("total", len(summary)), "portfolios": summary}
@@ -441,12 +368,13 @@ async def get_portfolio(
 
 @server.tool(
     name="create_portfolio",
-    description="Create a new portfolio from tickers and weights. Weights must sum to 1.0. For a single asset, use weight 1.0. For multiple assets, ask the user for weights or default to equal weights. IMPORTANT: A portfolio must always be created before running any analysis (both qualitative and quantitative). NEXT STEPS: (1) ask 'What market drivers do you want to test against?' → list_feature_set_templates → run_full_analysis, and/or (2) ask about themes → analyze_qualitative. Both use the same portfolio_id.",
+    description="Create a new portfolio from tickers and weights. Weights must sum to 1.0. For a single asset, use weight 1.0.",
 )
 async def create_portfolio(
     name: Annotated[str, Field(description="Portfolio name (e.g. 'Tech Portfolio')")],
     tickers: Annotated[list[str], Field(description="Ticker symbols (e.g. ['AAPL', 'MSFT', 'NVDA'])")],
-    weights: Annotated[list[float], Field(description="Corresponding weights (e.g. [0.4, 0.3, 0.3])")],
+    weights: Annotated[list[float], Field(description="Corresponding weights summing to 1.0 (e.g. [0.4, 0.3, 0.3])")],
+    capital: Annotated[float, Field(description="Total capital allocation in USD (default $100,000)", default=100_000.0)] = 100_000.0,
     description: Annotated[str, Field(description="Optional description", default="")] = "",
 ) -> str:
     if err := _require_auth():
@@ -457,13 +385,14 @@ async def create_portfolio(
     try:
         assets = [{"ticker": t, "weight": w} for t, w in zip(tickers, weights)]
         client = get_client()
-        result = await client.create_portfolio(name, assets, description=description or None)
+        result = await client.create_portfolio(name, assets, description=description or None, capital=capital)
         portfolio_id = result["id"]
         return _fmt({
             "portfolio_id": portfolio_id,
             "name": result["name"],
             "tickers": _portfolio_tickers(result),
             "weights": result.get("weights", {}),
+            "capital": result.get("capital", capital),
             "target_set_id": result.get("target_set_id"),
             "message": (
                 f"Portfolio created (ID: {portfolio_id}). "
@@ -471,6 +400,112 @@ async def create_portfolio(
                 "and/or analyze_qualitative (thematic) for a full risk picture."
             ),
         })
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="update_portfolio",
+    description=(
+        "Update an existing portfolio. Can change name, description, weights, and/or capital. "
+        "Only pass the fields you want to update — omitted fields stay unchanged. "
+        "Weights must sum to 1.0 if provided."
+    ),
+)
+async def update_portfolio(
+    portfolio_id: Annotated[str, Field(description="The portfolio UUID")],
+    name: Annotated[str | None, Field(description="New portfolio name", default=None)] = None,
+    description: Annotated[str | None, Field(description="New description", default=None)] = None,
+    weights: Annotated[dict[str, float] | None, Field(description="New weights by ticker (e.g. {'AAPL': 0.5, 'MSFT': 0.5}). Must sum to 1.0.", default=None)] = None,
+    capital: Annotated[float | None, Field(description="New capital allocation in USD", default=None)] = None,
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(portfolio_id, "portfolio_id"):
+        return err
+    fields: dict = {}
+    if name is not None:
+        fields["name"] = name
+    if description is not None:
+        fields["description"] = description
+    if weights is not None:
+        fields["weights"] = weights
+    if capital is not None:
+        fields["capital"] = capital
+    if not fields:
+        return "Error: provide at least one field to update (name, description, weights, capital)."
+    try:
+        client = get_client()
+        result = await client.update_portfolio(portfolio_id, **fields)
+        return _fmt({
+            "portfolio_id": result["id"],
+            "name": result["name"],
+            "weights": result.get("weights", {}),
+            "capital": result.get("capital"),
+            "message": "Portfolio updated successfully.",
+        })
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+
+@server.tool(
+    name="get_portfolio_value",
+    description="Get the current live value of a portfolio: total value, P&L, and per-position breakdown.",
+    annotations=ToolAnnotations(readOnlyHint=True),
+)
+async def get_portfolio_value(
+    portfolio_id: Annotated[str, Field(description="The portfolio UUID")],
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(portfolio_id, "portfolio_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.get_portfolio_live_value(portfolio_id)
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="get_portfolio_analytics",
+    description="Get portfolio analytics: Sharpe ratio, volatility, expected return, max drawdown, and beta. Supports timeframes: 1W, 1M, 1Y, 2Y, 5Y.",
+    annotations=ToolAnnotations(readOnlyHint=True),
+)
+async def get_portfolio_analytics(
+    portfolio_id: Annotated[str, Field(description="The portfolio UUID")],
+    timeframe: Annotated[str, Field(description="Timeframe: 1W, 1M, 1Y, 2Y, or 5Y (default 1Y)", default="1Y")] = "1Y",
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(portfolio_id, "portfolio_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.get_portfolio_analytics(portfolio_id, timeframe=timeframe)
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="get_asset_profiles",
+    description="Get asset classification for a portfolio: sector, industry, country, exchange, and asset type per holding.",
+    annotations=ToolAnnotations(readOnlyHint=True),
+)
+async def get_asset_profiles(
+    portfolio_id: Annotated[str, Field(description="The portfolio UUID")],
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(portfolio_id, "portfolio_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.get_asset_profiles(portfolio_id)
+        return _fmt(result)
     except SablierAPIError as e:
         return _api_error(e)
 
@@ -483,20 +518,17 @@ async def create_portfolio(
 @server.tool(
     name="analyze_qualitative",
     description=(
-        "Run qualitative analysis for specific themes. Scans SEC filings (10-K, 10-Q) and earnings calls "
-        "to score how exposed each company is to a theme (0-100 scale). "
-        "You can pass EITHER portfolio_id (from an existing portfolio) OR tickers directly. "
-        "If you pass tickers without a portfolio_id, a portfolio is auto-created. "
-        "Auto-polls up to 5 min; if it times out use get_analysis_status. "
-        "TIP: For a full risk picture, also run run_full_analysis on the same portfolio."
+        "Run qualitative (GRAIN) analysis: scans SEC filings and earnings calls to score company exposure "
+        "to themes (0-100). Supports predefined themes ('AI exposure') or custom themes. "
+        "Pass either portfolio_id or tickers directly."
     ),
     annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
 )
 async def analyze_qualitative(
-    themes: Annotated[list[str], Field(description="Themes to score (e.g. ['AI exposure', 'China risk', 'debt levels'])")],
+    themes: Annotated[list[str], Field(description="Themes to score (e.g. ['AI exposure', 'Saudi Arabia risk', 'debt levels'])")],
     portfolio_id: Annotated[str | None, Field(description="UUID of an existing portfolio. If omitted, provide tickers instead.", default=None)] = None,
     tickers: Annotated[list[str] | None, Field(description="Tickers to analyze (e.g. ['AAPL', 'MSFT']). Auto-creates a portfolio if portfolio_id is not given.", default=None)] = None,
-    source_types: Annotated[list[str] | None, Field(description="Optional filter: ['10-K', '10-Q', 'earnings_call']", default=None)] = None,
+    source_types: Annotated[list[str] | None, Field(description="Document types: ['10-K', '10-Q', 'earnings_call']. Default: all.", default=None)] = None,
     min_year: Annotated[int | None, Field(description="Earliest filing year to include", default=None)] = None,
     max_year: Annotated[int | None, Field(description="Latest filing year to include", default=None)] = None,
 ) -> list | str:
@@ -508,15 +540,40 @@ async def analyze_qualitative(
             return err
         resolved_tickers = _portfolio_tickers(portfolio)
 
+        weights_dict = portfolio.get("weights", {})
+        p_id = portfolio.get("id")
+        p_name = portfolio.get("name")
+
         client = get_client()
+
+        # Auto-generate keywords for each theme.  The backend returns
+        # is_predefined=True for library themes (keywords already built-in)
+        # and is_predefined=False for custom themes (keywords generated via LLM).
+        # We only need to send custom_keywords for non-predefined themes.
+        custom_keywords: dict[str, list[str]] = {}
+        resolved_themes: list[str] = []
+        for theme in themes:
+            kw_result = await client.generate_grain_keywords(theme)
+            resolved_themes.append(kw_result.get("theme", theme))
+            if not kw_result.get("is_predefined", False):
+                keywords = kw_result.get("keywords", [])[:10]
+                if keywords:
+                    custom_keywords[kw_result.get("theme", theme)] = keywords
+
         job = await client.start_grain_analysis(
             tickers=resolved_tickers,
-            themes=themes,
+            themes=resolved_themes,
             source_types=source_types,
             min_year=min_year,
             max_year=max_year,
+            weights=weights_dict or None,
+            portfolio_id=p_id,
+            portfolio_name=p_name,
+            custom_keywords=custom_keywords or None,
         )
-        job_id = job["job_id"]
+        job_id = job.get("job_id")
+        if not job_id:
+            return "Error: GRAIN analysis did not return a job_id."
 
         # Poll until complete
         result = await client.poll_grain_job(job_id)
@@ -528,10 +585,10 @@ async def analyze_qualitative(
             return _fmt({
                 "status": result.get("status"),
                 "job_id": job_id,
-                "message": "Analysis still running. Use get_analysis_status with this job_id to check later.",
+                "message": "Analysis is still running (this can take a few minutes). Please try again shortly.",
             })
 
-        # Summarize results — API nests as results.results (list of theme objects)
+        # Summarize results
         raw_results = result.get("results", {})
         themes_data = raw_results.get("results", []) or raw_results.get("themes", [])
         summary = {
@@ -544,8 +601,11 @@ async def analyze_qualitative(
                 "theme": theme.get("theme"),
                 "display_name": theme.get("display_name"),
                 "portfolio_score": theme.get("portfolio_score") or theme.get("max_exposure", {}).get("score"),
+                "portfolio_tier": theme.get("portfolio_tier"),
                 "direction": theme.get("direction"),
+                "exposure_at_risk": theme.get("exposure_at_risk"),
                 "confidence": theme.get("confidence"),
+                "top_contributors": theme.get("top_contributors"),
                 "ticker_scores": [],
             }
             for ts in theme.get("ticker_scores", []):
@@ -555,14 +615,16 @@ async def analyze_qualitative(
                     "tier": ts.get("tier") or ts.get("tier_name"),
                     "direction": ts.get("direction"),
                     "confidence": ts.get("confidence"),
+                    "source_breakdown": ts.get("source_breakdown"),
                     "top_evidence": [],
                 }
-                for ev in (ts.get("evidence") or [])[:3]:
+                for ev in (ts.get("evidence") or [])[:5]:
                     ticker_entry["top_evidence"].append({
-                        "passage": (ev.get("passage") or "")[:300],
+                        "passage": (ev.get("passage") or "")[:500],
                         "source": ev.get("source"),
                         "source_type": ev.get("source_type"),
                         "fiscal_period": ev.get("fiscal_period"),
+                        "filing_date": ev.get("filing_date"),
                         "why_relevant": ev.get("why_relevant"),
                     })
                 theme_summary["ticker_scores"].append(ticker_entry)
@@ -574,28 +636,69 @@ async def analyze_qualitative(
 
 
 @server.tool(
-    name="get_analysis_status",
-    description="Check the status of a running GRAIN analysis job. Only needed if analyze_qualitative timed out — pass the job_id it returned.",
+    name="list_themes",
+    description="Browse the GRAIN theme library. Returns predefined themes with names, descriptions, keywords, and categories.",
     annotations=ToolAnnotations(readOnlyHint=True),
 )
-async def get_analysis_status(
-    job_id: Annotated[str, Field(description="The GRAIN job ID from analyze_qualitative")],
-) -> str:
+async def list_themes() -> str:
     if err := _require_auth():
-        return err
-    if err := _validate_uuid(job_id, "job_id"):
         return err
     try:
         client = get_client()
-        result = await client.get_grain_job(job_id)
-        return _fmt({
-            "job_id": job_id,
-            "status": result.get("status"),
-            "progress": result.get("progress"),
-            "error_message": result.get("error_message"),
-        })
+        themes = await client.list_grain_themes()
+        summary = []
+        for t in themes:
+            summary.append({
+                "id": t.get("id") or t.get("name"),
+                "display_name": t.get("display_name"),
+                "description": t.get("description"),
+                "category": t.get("category"),
+                "keywords": t.get("keywords", [])[:5],
+            })
+        return _fmt(summary)
     except SablierAPIError as e:
         return _api_error(e)
+
+
+@server.tool(
+    name="list_grain_analyses",
+    description="List past qualitative (GRAIN) analyses. Optionally filter by portfolio_id.",
+    annotations=ToolAnnotations(readOnlyHint=True),
+)
+async def list_grain_analyses(
+    portfolio_id: Annotated[str | None, Field(description="Optional: filter by portfolio UUID", default=None)] = None,
+) -> str:
+    if err := _require_auth():
+        return err
+    if portfolio_id and (err := _validate_uuid(portfolio_id, "portfolio_id")):
+        return err
+    try:
+        client = get_client()
+        analyses = await client.list_grain_analyses(portfolio_id=portfolio_id)
+        return _fmt(analyses)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="get_grain_analysis",
+    description="Load a saved GRAIN analysis with full results: theme scores, per-ticker breakdown, and evidence passages.",
+    annotations=ToolAnnotations(readOnlyHint=True),
+)
+async def get_grain_analysis(
+    analysis_id: Annotated[str, Field(description="The analysis UUID from list_grain_analyses")],
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(analysis_id, "analysis_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.get_grain_analysis(analysis_id)
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
 
 
 # ══════════════════════════════════════════════════
@@ -640,7 +743,7 @@ async def list_model_groups() -> str:
 
 @server.tool(
     name="list_feature_set_templates",
-    description="Browse the Factors Library — pre-built sets of market drivers organized by category (Macro, Market, Themes). Each template defines what forces the portfolio is tested against (e.g. interest rates, volatility, commodities, credit spreads). Returns conditioning_set_id needed by create_models or run_full_analysis. IMPORTANT: Present these as 'What do you want to test your portfolio against?' — avoid jargon like 'conditioning set'. Show the template names and their factors so the user can pick.",
+    description="Browse pre-built sets of market drivers (e.g. interest rates, volatility, commodities). Returns template names, factors, and conditioning_set_id needed by run_full_analysis.",
     annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def list_feature_set_templates() -> str:
@@ -654,127 +757,22 @@ async def list_feature_set_templates() -> str:
         return _api_error(e)
 
 
-@server.tool(
-    name="create_models",
-    description="Set up an analysis for a portfolio against chosen market drivers. Requires: portfolio_id (from create_portfolio or list_portfolios) and conditioning_set_id (from list_feature_set_templates). Returns model_group_id. NEXT: train_models → simulate_betas. TIP: prefer run_full_analysis which does everything in one call.",
-)
-async def create_models(
-    portfolio_id: Annotated[str, Field(description="UUID of the portfolio")],
-    conditioning_set_id: Annotated[str, Field(description="UUID of the conditioning set (market factors)")],
-) -> str:
-    if err := _require_auth():
-        return err
-    if err := _validate_uuid(portfolio_id, "portfolio_id"):
-        return err
-    if err := _validate_uuid(conditioning_set_id, "conditioning_set_id"):
-        return err
-    try:
-        client = get_client()
-        # Get portfolio to extract tickers and target_set_id
-        portfolio = await client.get_portfolio(portfolio_id)
-        target_set_id = portfolio.get("target_set_id")
-        asset_tickers = _portfolio_tickers(portfolio)
-        if not asset_tickers:
-            return "Error: portfolio has no assets. Create a portfolio with tickers first."
-        portfolio_name = portfolio.get("name", "")
-
-        result = await client.batch_create_models(
-            conditioning_set_id=conditioning_set_id,
-            asset_tickers=asset_tickers,
-            parent_target_set_id=target_set_id,
-            group_name=f"{portfolio_name}" if portfolio_name else None,
-        )
-        return _fmt({
-            "model_group_id": result.get("model_group_id"),
-            "conditioning_set_id": result.get("conditioning_set_id"),
-            "total_created": result.get("total_created"),
-            "total_failed": result.get("total_failed"),
-            "models": result.get("created_models", []),
-            "message": "Models created. Next step: use train_models with this model_group_id to start training.",
-        })
-    except SablierAPIError as e:
-        return _api_error(e)
 
 
-# ══════════════════════════════════════════════════
-# Training
-# ══════════════════════════════════════════════════
-
-
-@server.tool(
-    name="train_models",
-    description="Start training for all models in a model group. Requires: model_group_id from create_models or list_model_groups. Returns job_id. Use get_training_progress to poll until 'completed', then simulate_betas. TIP: prefer run_full_analysis which handles the full chain automatically.",
-)
-async def train_models(
-    model_group_id: Annotated[str, Field(description="UUID of the model group to train")],
-) -> str:
-    if err := _require_auth():
-        return err
-    if err := _validate_uuid(model_group_id, "model_group_id"):
-        return err
-    try:
-        client = get_client()
-        result = await client.train_batch(
-            model_group_id=model_group_id,
-            training_mode="rolling_huber",
-        )
-        return _fmt({
-            "batch_id": result.get("batch_id"),
-            "job_id": result.get("job_id"),
-            "status": result.get("status"),
-            "total_models": result.get("total_models"),
-            "message": "Training started. Use get_training_progress with the job_id to monitor.",
-        })
-    except SablierAPIError as e:
-        return _api_error(e)
-
-
-@server.tool(
-    name="get_training_progress",
-    description="Check how the analysis training is progressing. Pass the job_id from train_models. Once status is 'completed', use simulate_betas. Tell the user which asset is currently being processed and overall progress percentage.",
-    annotations=ToolAnnotations(readOnlyHint=True),
-)
-async def get_training_progress(
-    job_id: Annotated[str, Field(description="The training job ID from train_models")],
-) -> list:
-    if err := _require_auth():
-        return err
-    if err := _validate_uuid(job_id, "job_id"):
-        return err
-    try:
-        client = get_client()
-        result = await client.get_batch_training_progress(job_id)
-        data = {
-            "job_id": result.get("job_id"),
-            "status": result.get("status"),
-            "current_asset": result.get("current_asset"),
-            "completed_models": result.get("completed_models"),
-            "total_models": result.get("total_models"),
-            "progress_percent": result.get("progress_percent"),
-            "current_epoch": result.get("current_epoch"),
-            "max_epochs": result.get("max_epochs"),
-            "train_loss": result.get("train_loss"),
-            "val_loss": result.get("val_loss"),
-            "error_message": result.get("error_message"),
-        }
-        return _with_widget(_fmt(data), training_progress(data))
-    except SablierAPIError as e:
-        return _api_error(e)
-
-
-# ══════════════════════════════════════════════════
-# Factor Analysis (Betas Simulation)
-# ══════════════════════════════════════════════════
 
 
 @server.tool(
     name="simulate_betas",
-    description="Compute how each asset in a trained model group responds to the chosen market drivers. Requires: model_group_id (status must be 'trained'). Auto-polls up to 5 min. Returns per-asset factor exposures + simulation_batch_id. NEXT: use test_portfolio_risk for risk metrics or simulate_returns for what-if scenarios. The results include factor_means and factor_stds — use these to show the user current market levels when they want to run scenarios.",
+    description=(
+        "Compute how each asset in a trained model group responds to the chosen market drivers. "
+        "Requires model_group_id (status must be 'trained'). Auto-polls until complete. "
+        "Returns per-asset factor exposures, simulation_batch_id, and current factor levels (factor_means)."
+    ),
     annotations=ToolAnnotations(openWorldHint=True),
 )
 async def simulate_betas(
-    model_group_id: Annotated[str, Field(description="UUID of the trained model group")],
-    horizon: Annotated[int, Field(description="Forecast horizon in trading days", default=20)] = 20,
+    model_group_id: Annotated[str, Field(description="UUID of the trained model group (from run_full_analysis or list_model_groups)")],
+    lookback_days: Annotated[int | None, Field(description="Historical lookback window in trading days", default=None)] = None,
 ) -> list | str:
     if err := _require_auth():
         return err
@@ -784,52 +782,28 @@ async def simulate_betas(
         client = get_client()
         batch = await client.simulate_betas_batch(
             model_group_id=model_group_id,
-            simulation_mode="rolling_huber",
-            horizon=horizon,
+            historical_lookback_days=lookback_days,
         )
         sim_batch_id = batch.get("simulation_batch_id")
+        if not sim_batch_id:
+            return "Error: betas simulation did not return a simulation_batch_id."
 
-        # Poll until complete
         results = await client.poll_betas_batch(sim_batch_id)
 
         if not results or not results.get("all_completed"):
             return _fmt({
                 "simulation_batch_id": sim_batch_id,
                 "status": "running",
-                "completed": results.get("completed_count", 0) if results else 0,
-                "total": results.get("total_count", 0) if results else 0,
-                "message": "Simulation still running. Use get_betas_results to check later.",
+                "message": "Simulation is still running. Please try again shortly.",
             })
 
         flat = _flatten_betas(results)
         summary = {
             "simulation_batch_id": sim_batch_id,
-            "completed": results.get("completed_count"),
-            "total": results.get("total_count"),
             **flat,
         }
 
         return _with_widget(_fmt(summary), betas_heatmap(summary))
-    except SablierAPIError as e:
-        return _api_error(e)
-
-
-@server.tool(
-    name="get_betas_results",
-    description="Get full beta results from a completed simulation. Only needed if simulate_betas timed out or you want raw details. Pass the simulation_batch_id from simulate_betas.",
-    annotations=ToolAnnotations(readOnlyHint=True),
-)
-async def get_betas_results(
-    simulation_batch_id: Annotated[str, Field(description="The simulation batch ID from simulate_betas")],
-) -> str:
-    if err := _require_auth():
-        return err
-    if err := _validate_uuid(simulation_batch_id, "simulation_batch_id"):
-        return err
-    try:
-        client = get_client()
-        results = await client.get_betas_batch_results(simulation_batch_id)
-        return _fmt(results)
     except SablierAPIError as e:
         return _api_error(e)
 
@@ -841,12 +815,16 @@ async def get_betas_results(
 
 @server.tool(
     name="simulate_returns",
-    description="Simulate return distributions under a what-if scenario. Requires: simulation_batch_id from simulate_betas or run_full_analysis. IMPORTANT: Before calling this, show the user the full list of market drivers from the betas results (conditioning_features) along with their current values (factor_means from the betas output). Ask: 'Which of these would you like to change, and to what value?' Then pass the modified values as the factors dict. Factor keys must match the conditioning_features exactly. Auto-polls until ready.",
+    description=(
+        "Simulate return distributions under a what-if scenario. "
+        "Requires simulation_batch_id from run_full_analysis. "
+        "Factor values are raw price levels (not percentages). Use factor_means from the analysis results as baseline."
+    ),
     annotations=ToolAnnotations(openWorldHint=True),
 )
 async def simulate_returns(
-    simulation_batch_id: Annotated[str, Field(description="From simulate_betas")],
-    factors: Annotated[dict[str, float], Field(description="Factor scenario values (e.g. {'VIX': 35, 'DXY': 110})")],
+    simulation_batch_id: Annotated[str, Field(description="From run_full_analysis results")],
+    factors: Annotated[dict[str, float], Field(description="Target raw price levels for each factor (e.g. {'SPY': 648.27, 'VIX': 35}). Keys must match conditioning_features.")],
     n_samples: Annotated[int, Field(description="Number of Monte Carlo samples", default=5000)] = 5000,
 ) -> str:
     if err := _require_auth():
@@ -861,6 +839,8 @@ async def simulate_returns(
             n_samples=n_samples,
         )
         returns_batch_id = batch.get("returns_batch_id")
+        if not returns_batch_id:
+            return "Error: returns simulation did not return a returns_batch_id."
 
         results = await client.poll_returns_batch(returns_batch_id)
 
@@ -868,29 +848,9 @@ async def simulate_returns(
             return _fmt({
                 "returns_batch_id": returns_batch_id,
                 "status": "running",
-                "message": "Returns simulation still running. Use get_returns_results to check later.",
+                "message": "Returns simulation is still running. Please try again shortly.",
             })
 
-        return _fmt(results)
-    except SablierAPIError as e:
-        return _api_error(e)
-
-
-@server.tool(
-    name="get_returns_results",
-    description="Get results from a completed returns simulation. Only needed if simulate_returns timed out. Pass the returns_batch_id from simulate_returns.",
-    annotations=ToolAnnotations(readOnlyHint=True),
-)
-async def get_returns_results(
-    returns_batch_id: Annotated[str, Field(description="The returns batch ID from simulate_returns")],
-) -> str:
-    if err := _require_auth():
-        return err
-    if err := _validate_uuid(returns_batch_id, "returns_batch_id"):
-        return err
-    try:
-        client = get_client()
-        results = await client.get_returns_batch_results(returns_batch_id)
         return _fmt(results)
     except SablierAPIError as e:
         return _api_error(e)
@@ -903,11 +863,11 @@ async def get_returns_results(
 
 @server.tool(
     name="test_portfolio_risk",
-    description="Run a portfolio risk test. Requires: simulation_batch_id from simulate_betas or run_full_analysis. Returns expected return, VaR 95%, CVaR 95%, risk contribution per factor, and marginal contribution per asset. Weights must sum to 1.0 and tickers must match the simulated assets.",
+    description="Compute portfolio risk metrics: expected return, VaR 95%, CVaR 95%, risk contribution per factor, and marginal contribution per asset. Requires simulation_batch_id from run_full_analysis.",
     annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def test_portfolio_risk(
-    simulation_batch_id: Annotated[str, Field(description="From simulate_betas")],
+    simulation_batch_id: Annotated[str, Field(description="From run_full_analysis results")],
     weights: Annotated[dict[str, float], Field(description="Portfolio weights by ticker (e.g. {'AAPL': 0.4, 'MSFT': 0.3})")],
 ) -> list:
     if err := _require_auth():
@@ -941,7 +901,7 @@ async def test_portfolio_risk(
 
 @server.tool(
     name="create_scenario",
-    description="Save a named what-if scenario for reuse. Requires a model_id from list_model_groups. Factor spec format: {'type': 'fixed', 'value': 35} for exact value, {'type': 'percentile', 'value': 95} for historical percentile, {'type': 'shock', 'value': 2.0} for std dev shift. Use simulate_returns to run the scenario.",
+    description="Save a named what-if scenario for reuse. Factor spec types: 'fixed' (exact value), 'percentile' (historical), 'shock' (std dev shift).",
 )
 async def create_scenario(
     model_id: Annotated[str, Field(description="UUID of the model this scenario applies to")],
@@ -1011,14 +971,10 @@ async def list_scenarios(
 @server.tool(
     name="run_full_analysis",
     description=(
-        "One-shot quantitative analysis: builds factor models, trains them, and computes how each asset "
-        "responds to market drivers — all in one call. "
-        "You can pass EITHER portfolio_id (from an existing portfolio) OR tickers directly. "
-        "If you pass tickers without a portfolio_id, a portfolio is auto-created (equal weights by default). "
-        "Also requires conditioning_set_id from list_feature_set_templates — ask the user "
-        "'what do you want to test your portfolio against?'. "
-        "After this completes, use test_portfolio_risk for risk metrics or simulate_returns for what-if scenarios. "
-        "TIP: For a full risk picture, also run analyze_qualitative on the same portfolio."
+        "One-shot quantitative analysis: builds factor models, trains, and computes asset sensitivities to "
+        "market drivers. Pass either portfolio_id or tickers directly (auto-creates portfolio with equal weights). "
+        "Requires conditioning_set_id from list_feature_set_templates. "
+        "Returns factor exposures, simulation_batch_id for use with test_portfolio_risk or simulate_returns."
     ),
 )
 async def run_full_analysis(
@@ -1026,7 +982,6 @@ async def run_full_analysis(
     portfolio_id: Annotated[str | None, Field(description="UUID of an existing portfolio. If omitted, provide tickers instead.", default=None)] = None,
     tickers: Annotated[list[str] | None, Field(description="Tickers to analyze (e.g. ['AAPL', 'MSFT']). Auto-creates a portfolio if portfolio_id is not given.", default=None)] = None,
     weights: Annotated[list[float] | None, Field(description="Optional weights for tickers (must sum to 1.0). Defaults to equal weights.", default=None)] = None,
-    horizon: Annotated[int, Field(description="Forecast horizon in trading days", default=20)] = 20,
 ) -> list | str:
     if err := _require_auth():
         return err
@@ -1046,12 +1001,12 @@ async def run_full_analysis(
         client = get_client()
 
         # Step 1: Create models (linked to portfolio via parent_target_set_id)
-        create_result = await client.batch_create_models(
+        create_result = await _retry_api_call(lambda: client.batch_create_models(
             conditioning_set_id=conditioning_set_id,
             asset_tickers=asset_tickers,
             parent_target_set_id=target_set_id,
             group_name=portfolio_name or None,
-        )
+        ))
         model_group_id = create_result.get("model_group_id")
         if not model_group_id:
             return "Error: model creation did not return a model_group_id."
@@ -1065,11 +1020,10 @@ async def run_full_analysis(
                 "failed_assets": create_result.get("failed_assets", []),
             })
 
-        # Step 2: Train
-        train_result = await client.train_batch(
+        # Step 2: Train (with retry for transient server errors)
+        train_result = await _retry_api_call(lambda: client.train_batch(
             model_group_id=model_group_id,
-            training_mode="rolling_huber",
-        )
+        ))
         job_id = train_result.get("job_id")
         if not job_id:
             return "Error: training did not return a job_id."
@@ -1087,16 +1041,16 @@ async def run_full_analysis(
                 "status": "training_timeout",
                 "model_group_id": model_group_id,
                 "job_id": job_id,
-                "message": "Training is still running. Use get_training_progress with job_id to monitor, then simulate_betas once complete.",
+                "message": "Training is still running (this can take a few minutes for large portfolios). Please try again shortly.",
             })
 
-        # Step 4: Simulate betas
-        batch = await client.simulate_betas_batch(
+        # Step 4: Simulate betas (with retry)
+        batch = await _retry_api_call(lambda: client.simulate_betas_batch(
             model_group_id=model_group_id,
-            simulation_mode="rolling_huber",
-            horizon=horizon,
-        )
+        ))
         sim_batch_id = batch.get("simulation_batch_id")
+        if not sim_batch_id:
+            return "Error: betas simulation did not return a simulation_batch_id."
 
         # Step 5: Poll betas until complete
         results = await client.poll_betas_batch(sim_batch_id)
@@ -1106,7 +1060,7 @@ async def run_full_analysis(
                 "status": "simulation_timeout",
                 "model_group_id": model_group_id,
                 "simulation_batch_id": sim_batch_id,
-                "message": "Betas simulation still running. Use get_betas_results with simulation_batch_id to check later.",
+                "message": "Simulation is still running. Please try again shortly.",
             })
 
         # Build summary
@@ -1127,6 +1081,285 @@ async def run_full_analysis(
         return _with_widget(_fmt(summary), betas_heatmap(summary))
     except SablierAPIError as e:
         return _api_error(e)
+    except Exception as e:
+        logger.error("run_full_analysis failed: %s", e, exc_info=True)
+        return "Analysis failed unexpectedly. Please try again."
+
+
+@server.tool(
+    name="sablier_full_analysis",
+    description=(
+        "Run both quantitative (factor models + betas) and qualitative (GRAIN theme scoring) analysis "
+        "on a portfolio in parallel. Combines run_full_analysis and analyze_qualitative into one call. "
+        "Returns both factor exposures and theme scores together."
+    ),
+)
+async def sablier_full_analysis(
+    conditioning_set_id: Annotated[str, Field(description="UUID of the conditioning set (from list_feature_set_templates)")],
+    themes: Annotated[list[str], Field(description="Themes to score (e.g. ['AI exposure', 'Saudi Arabia risk', 'debt levels'])")],
+    portfolio_id: Annotated[str | None, Field(description="UUID of an existing portfolio. If omitted, provide tickers instead.", default=None)] = None,
+    tickers: Annotated[list[str] | None, Field(description="Tickers to analyze (e.g. ['AAPL', 'MSFT']). Auto-creates a portfolio if portfolio_id is not given.", default=None)] = None,
+    weights: Annotated[list[float] | None, Field(description="Optional weights for tickers (must sum to 1.0). Defaults to equal weights.", default=None)] = None,
+    source_types: Annotated[list[str] | None, Field(description="GRAIN document types: ['10-K', '10-Q', 'earnings_call']. Default: all.", default=None)] = None,
+    min_year: Annotated[int | None, Field(description="GRAIN: earliest filing year", default=None)] = None,
+    max_year: Annotated[int | None, Field(description="GRAIN: latest filing year", default=None)] = None,
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(conditioning_set_id, "conditioning_set_id"):
+        return err
+
+    try:
+        portfolio, err = await _ensure_portfolio(portfolio_id, tickers, weights)
+        if err:
+            return err
+
+        client = get_client()
+
+        # Run both pipelines in parallel
+        quant_result, qual_result = await asyncio.gather(
+            _quant_pipeline(client, portfolio, conditioning_set_id),
+            _qual_pipeline(client, portfolio, themes, source_types, min_year, max_year),
+            return_exceptions=True,
+        )
+
+        # Handle exceptions from either pipeline
+        if isinstance(quant_result, Exception):
+            logger.error("sablier_full_analysis quant pipeline failed: %s", quant_result, exc_info=quant_result)
+            quant_result = {"status": "error", "error": str(quant_result)}
+        if isinstance(qual_result, Exception):
+            logger.error("sablier_full_analysis qual pipeline failed: %s", qual_result, exc_info=qual_result)
+            qual_result = {"status": "error", "error": str(qual_result)}
+
+        combined = {
+            "portfolio_id": portfolio.get("id"),
+            "quantitative": quant_result,
+            "qualitative": qual_result,
+        }
+
+        return _fmt(combined)
+    except SablierAPIError as e:
+        return _api_error(e)
+    except Exception as e:
+        logger.error("sablier_full_analysis failed: %s", e, exc_info=True)
+        return "Analysis failed unexpectedly. Please try again."
+
+
+async def _quant_pipeline(
+    client: SablierClient,
+    portfolio: dict,
+    conditioning_set_id: str,
+) -> dict:
+    """Run the quantitative pipeline: create models → train → simulate betas.
+
+    Returns a dict with status, IDs, and betas (or partial results on timeout).
+    """
+    portfolio_id = portfolio["id"]
+    target_set_id = portfolio.get("target_set_id")
+    asset_tickers = _portfolio_tickers(portfolio)
+    portfolio_name = portfolio.get("name", "")
+
+    create_result = await _retry_api_call(lambda: client.batch_create_models(
+        conditioning_set_id=conditioning_set_id,
+        asset_tickers=asset_tickers,
+        parent_target_set_id=target_set_id,
+        group_name=portfolio_name or None,
+    ))
+    model_group_id = create_result.get("model_group_id")
+    if not model_group_id:
+        return {"status": "error", "error": "model creation did not return a model_group_id"}
+
+    total_created = create_result.get("total_created", 0)
+    if total_created == 0:
+        return {
+            "status": "error",
+            "error": "No models were created.",
+            "total_failed": create_result.get("total_failed", 0),
+        }
+
+    train_result = await _retry_api_call(lambda: client.train_batch(
+        model_group_id=model_group_id,
+    ))
+    job_id = train_result.get("job_id")
+    if not job_id:
+        return {"status": "error", "model_group_id": model_group_id, "error": "training did not return a job_id"}
+
+    train_status = await client.poll_training(job_id)
+    if train_status.get("status") == "failed":
+        return {"status": "failed", "model_group_id": model_group_id, "error": train_status.get("error_message")}
+    if train_status.get("status") != "completed":
+        return {
+            "status": "training_timeout",
+            "model_group_id": model_group_id,
+            "job_id": job_id,
+            "message": "Training is still running.",
+        }
+
+    batch = await _retry_api_call(lambda: client.simulate_betas_batch(
+        model_group_id=model_group_id,
+    ))
+    sim_batch_id = batch.get("simulation_batch_id")
+    if not sim_batch_id:
+        return {"status": "error", "model_group_id": model_group_id, "error": "betas simulation did not return a simulation_batch_id"}
+
+    results = await client.poll_betas_batch(sim_batch_id)
+    if not results or not results.get("all_completed"):
+        return {
+            "status": "simulation_timeout",
+            "model_group_id": model_group_id,
+            "simulation_batch_id": sim_batch_id,
+            "message": "Simulation is still running.",
+        }
+
+    flat = _flatten_betas(results)
+    return {
+        "status": "completed",
+        "model_group_id": model_group_id,
+        "simulation_batch_id": sim_batch_id,
+        "portfolio_id": portfolio_id,
+        "models_created": total_created,
+        **flat,
+    }
+
+
+async def _qual_pipeline(
+    client: SablierClient,
+    portfolio: dict,
+    themes: list[str],
+    source_types: list[str] | None = None,
+    min_year: int | None = None,
+    max_year: int | None = None,
+) -> dict:
+    """Run the qualitative (GRAIN) pipeline: keywords → analysis → poll → summarize.
+
+    Returns a dict with status and theme scores (or partial results on timeout/failure).
+    """
+    resolved_tickers = _portfolio_tickers(portfolio)
+    weights_dict = portfolio.get("weights", {})
+    p_id = portfolio.get("id")
+    p_name = portfolio.get("name")
+
+    custom_keywords: dict[str, list[str]] = {}
+    resolved_themes: list[str] = []
+    for theme in themes:
+        kw_result = await client.generate_grain_keywords(theme)
+        resolved_themes.append(kw_result.get("theme", theme))
+        if not kw_result.get("is_predefined", False):
+            keywords = kw_result.get("keywords", [])[:10]
+            if keywords:
+                custom_keywords[kw_result.get("theme", theme)] = keywords
+
+    job = await client.start_grain_analysis(
+        tickers=resolved_tickers,
+        themes=resolved_themes,
+        source_types=source_types,
+        min_year=min_year,
+        max_year=max_year,
+        weights=weights_dict or None,
+        portfolio_id=p_id,
+        portfolio_name=p_name,
+        custom_keywords=custom_keywords or None,
+    )
+    job_id = job.get("job_id")
+    if not job_id:
+        return {"status": "error", "error": "GRAIN analysis did not return a job_id"}
+
+    result = await client.poll_grain_job(job_id)
+
+    if result.get("status") == "failed":
+        return {"status": "failed", "error": result.get("error_message", "Unknown error")}
+
+    if result.get("status") != "completed":
+        return {
+            "status": result.get("status", "timeout"),
+            "job_id": job_id,
+            "message": "Analysis is still running.",
+        }
+
+    raw_results = result.get("results", {})
+    themes_data = raw_results.get("results", []) or raw_results.get("themes", [])
+    summary: dict = {
+        "status": "completed",
+        "processing_time_seconds": result.get("processing_time_seconds"),
+        "themes": [],
+    }
+    for theme in themes_data:
+        theme_summary: dict = {
+            "theme": theme.get("theme"),
+            "display_name": theme.get("display_name"),
+            "portfolio_score": theme.get("portfolio_score") or theme.get("max_exposure", {}).get("score"),
+            "portfolio_tier": theme.get("portfolio_tier"),
+            "direction": theme.get("direction"),
+            "exposure_at_risk": theme.get("exposure_at_risk"),
+            "confidence": theme.get("confidence"),
+            "top_contributors": theme.get("top_contributors"),
+            "ticker_scores": [],
+        }
+        for ts in theme.get("ticker_scores", []):
+            ticker_entry: dict = {
+                "ticker": ts.get("ticker"),
+                "score": ts.get("score"),
+                "tier": ts.get("tier") or ts.get("tier_name"),
+                "direction": ts.get("direction"),
+                "confidence": ts.get("confidence"),
+                "source_breakdown": ts.get("source_breakdown"),
+                "top_evidence": [],
+            }
+            for ev in (ts.get("evidence") or [])[:5]:
+                ticker_entry["top_evidence"].append({
+                    "passage": (ev.get("passage") or "")[:500],
+                    "source": ev.get("source"),
+                    "source_type": ev.get("source_type"),
+                    "fiscal_period": ev.get("fiscal_period"),
+                    "filing_date": ev.get("filing_date"),
+                    "why_relevant": ev.get("why_relevant"),
+                })
+            theme_summary["ticker_scores"].append(ticker_entry)
+        summary["themes"].append(theme_summary)
+
+    return summary
+
+
+async def _retry_api_call(coro_fn, max_retries: int = 2, delay: float = 3.0):
+    """Retry an async API call on transient server errors (5xx).
+
+    coro_fn must be a zero-arg callable that returns a coroutine, e.g.:
+        await _retry_api_call(lambda: client.train_batch(model_group_id=mgid))
+    """
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            return await coro_fn()
+        except SablierAPIError as e:
+            last_exc = e
+            if e.status_code < 500 or attempt == max_retries:
+                raise
+            logger.warning("Transient %s on attempt %d/%d — retrying in %.0fs", e, attempt + 1, max_retries + 1, delay)
+            await asyncio.sleep(delay)
+            delay *= 2  # exponential backoff
+    raise last_exc  # unreachable, but keeps type checker happy
+
+
+# ══════════════════════════════════════════════════
+# ASGI middleware — captures redirect_uri from /authorize
+# before the SDK's handler calls get_client().
+# ══════════════════════════════════════════════════
+
+
+class CaptureRedirectMiddleware:
+    """Pure ASGI middleware that sets _pending_auth_redirect contextvar."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path", "") == "/authorize":
+            qs = scope.get("query_string", b"").decode()
+            params = urllib.parse.parse_qs(qs)
+            redirect_uri = params.get("redirect_uri", [None])[0]
+            if redirect_uri:
+                _pending_auth_redirect.set(redirect_uri)
+        await self.app(scope, receive, send)
 
 
 # ══════════════════════════════════════════════════
@@ -1138,7 +1371,21 @@ def main():
     if _transport == "stdio":
         server.run(transport="stdio")
     else:
-        server.run(transport="streamable-http")
+        import uvicorn
+
+        starlette_app = server.streamable_http_app()
+        wrapped_app = CaptureRedirectMiddleware(starlette_app)
+
+        config = uvicorn.Config(
+            wrapped_app,
+            host="0.0.0.0",
+            port=_port,
+            log_level="info",
+        )
+        uvicorn_server = uvicorn.Server(config)
+
+        import asyncio
+        asyncio.run(uvicorn_server.serve())
 
 
 if __name__ == "__main__":
