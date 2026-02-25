@@ -780,7 +780,7 @@ async def list_feature_set_templates() -> str:
     name="simulate_betas",
     description=(
         "Compute how each asset in a trained model group responds to the chosen market drivers. "
-        "Requires model_group_id (status must be 'trained'). Auto-polls until complete. "
+        "Requires model_group_id (status must be 'trained'). Synchronous — returns results directly. "
         "Returns per-asset factor exposures, simulation_batch_id, and current factor levels (factor_means)."
     ),
     annotations=ToolAnnotations(openWorldHint=True),
@@ -795,21 +795,19 @@ async def simulate_betas(
         return err
     try:
         client = get_client()
-        batch = await client.simulate_betas_batch(
+        results = await client.simulate_betas_batch(
             model_group_id=model_group_id,
             historical_lookback_days=lookback_days,
         )
-        sim_batch_id = batch.get("simulation_batch_id")
+        sim_batch_id = results.get("simulation_batch_id")
         if not sim_batch_id:
             return "Error: betas simulation did not return a simulation_batch_id."
 
-        results = await client.poll_betas_batch(sim_batch_id)
-
-        if not results or not results.get("all_completed"):
+        if not results.get("all_completed"):
             return _fmt({
                 "simulation_batch_id": sim_batch_id,
-                "status": "running",
-                "message": "Simulation is still running. Please try again shortly.",
+                "status": results.get("status", "unknown"),
+                "message": "Simulation did not complete successfully.",
             })
 
         flat = _flatten_betas(results)
@@ -849,11 +847,8 @@ async def run_model_validation(
         if not validation_batch_id:
             return "Error: validation did not return a validation_batch_id."
 
-        # If Moment models, status is already 'completed' (synchronous)
-        if batch.get("status") == "completed":
-            results = await client.get_batch_validation_results(validation_batch_id)
-        else:
-            results = await client.poll_batch_validation(validation_batch_id)
+        # Moment validation is synchronous — fetch full results
+        results = await client.get_batch_validation_results(validation_batch_id)
 
         return _format_validation_results(model_group_id, results)
     except SablierAPIError as e:
@@ -941,22 +936,20 @@ async def simulate_returns(
         return err
     try:
         client = get_client()
-        batch = await client.simulate_returns_batch(
+        results = await client.simulate_returns_batch(
             simulation_batch_id=simulation_batch_id,
             factors=factors,
             n_samples=n_samples,
         )
-        returns_batch_id = batch.get("returns_batch_id")
+        returns_batch_id = results.get("returns_batch_id")
         if not returns_batch_id:
             return "Error: returns simulation did not return a returns_batch_id."
 
-        results = await client.poll_returns_batch(returns_batch_id)
-
-        if not results or not results.get("all_completed"):
+        if not results.get("all_completed"):
             return _fmt({
                 "returns_batch_id": returns_batch_id,
-                "status": "running",
-                "message": "Returns simulation is still running. Please try again shortly.",
+                "status": results.get("status", "unknown"),
+                "message": "Returns simulation did not complete successfully.",
             })
 
         # Format per-asset risk metrics from the summary field
@@ -1116,47 +1109,36 @@ async def analyze_quantitative(
                 "failed_assets": create_result.get("failed_assets", []),
             })
 
-        # Step 2: Train (with retry for transient server errors)
+        # Step 2: Train (synchronous — returns completed results directly)
         train_result = await _retry_api_call(lambda: client.train_batch(
             model_group_id=model_group_id,
         ))
-        job_id = train_result.get("job_id")
-        if not job_id:
-            return "Error: training did not return a job_id."
-
-        # Step 3: Poll training until complete
-        train_status = await client.poll_training(job_id)
-        if train_status.get("status") == "failed":
+        if train_result.get("status") == "failed":
             return _fmt({
                 "error": "Training failed.",
                 "model_group_id": model_group_id,
-                "details": train_status.get("error_message"),
+                "details": train_result.get("error_message"),
             })
-        if train_status.get("status") != "completed":
+        if train_result.get("status") != "completed":
             return _fmt({
-                "status": "training_timeout",
+                "error": "Training did not complete.",
                 "model_group_id": model_group_id,
-                "job_id": job_id,
-                "message": "Training is still running (this can take a few minutes for large portfolios). Please try again shortly.",
+                "status": train_result.get("status"),
             })
 
-        # Step 4: Simulate betas (with retry)
-        batch = await _retry_api_call(lambda: client.simulate_betas_batch(
+        # Step 3: Simulate betas (synchronous — returns full results directly)
+        results = await _retry_api_call(lambda: client.simulate_betas_batch(
             model_group_id=model_group_id,
         ))
-        sim_batch_id = batch.get("simulation_batch_id")
+        sim_batch_id = results.get("simulation_batch_id")
         if not sim_batch_id:
             return "Error: betas simulation did not return a simulation_batch_id."
 
-        # Step 5: Poll betas until complete
-        results = await client.poll_betas_batch(sim_batch_id)
-
-        if not results or not results.get("all_completed"):
+        if not results.get("all_completed"):
             return _fmt({
-                "status": "simulation_timeout",
+                "error": "Simulation did not complete.",
                 "model_group_id": model_group_id,
                 "simulation_batch_id": sim_batch_id,
-                "message": "Simulation is still running. Please try again shortly.",
             })
 
         # Build summary

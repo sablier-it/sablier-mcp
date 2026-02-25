@@ -12,8 +12,9 @@ load_dotenv()
 
 DEFAULT_BASE_URL = "https://sablier-api-215397666394.us-central1.run.app/api/v1"
 DEFAULT_TIMEOUT = 60.0
+TRAINING_TIMEOUT = 180.0  # Training can take 30-120s for large portfolios
 POLL_INTERVAL = 3.0
-MAX_POLL_TIME = 300.0  # 5 minutes
+MAX_POLL_TIME = 300.0  # 5 minutes (GRAIN only)
 
 
 class SablierAPIError(Exception):
@@ -265,7 +266,7 @@ class SablierClient:
         return await self._delete(f"/models/groups/{group_id}")
 
     async def list_group_simulations(self, group_id: str) -> dict:
-        return await self._get(f"/ml/model-groups/{group_id}/simulations")
+        return await self._get(f"/moment/model-groups/{group_id}/simulations")
 
     async def batch_create_models(
         self,
@@ -294,41 +295,24 @@ class SablierClient:
         return await self._get("/feature-sets/templates")
 
     # ──────────────────────────────────────────────
-    # Training
+    # Training (Moment — synchronous, returns results directly)
     # ──────────────────────────────────────────────
 
     async def train_batch(
         self,
         model_group_id: str,
     ) -> dict:
+        """Train all models in a group. Synchronous — returns completed results directly."""
         return await self._post(
-            "/ml/train/batch",
+            "/moment/train/batch",
             json={
                 "model_group_id": model_group_id,
-                "training_mode": "rolling_huber",
             },
+            timeout=TRAINING_TIMEOUT,
         )
 
-    async def get_batch_training_progress(self, job_id: str) -> dict:
-        return await self._get(f"/ml/train/batch/{job_id}/progress")
-
-    async def poll_training(
-        self, job_id: str, timeout: float = MAX_POLL_TIME
-    ) -> dict:
-        """Poll a training job until completion or timeout."""
-        elapsed = 0.0
-        result = {}
-        while elapsed < timeout:
-            result = await self.get_batch_training_progress(job_id)
-            status = result.get("status", "")
-            if status in ("completed", "failed"):
-                return result
-            await asyncio.sleep(POLL_INTERVAL)
-            elapsed += POLL_INTERVAL
-        return result
-
     # ──────────────────────────────────────────────
-    # Simulation — Betas
+    # Simulation — Betas (Moment — synchronous)
     # ──────────────────────────────────────────────
 
     async def simulate_betas_batch(
@@ -336,50 +320,29 @@ class SablierClient:
         model_group_id: str,
         historical_lookback_days: int | None = None,
     ) -> dict:
+        """Compute factor exposures for all models. Synchronous — returns full results."""
         body: dict[str, Any] = {
             "model_group_id": model_group_id,
-            "simulation_mode": "rolling_huber",
         }
         if historical_lookback_days is not None:
             body["historical_lookback_days"] = historical_lookback_days
-        return await self._post("/ml/simulate-betas/batch", json=body)
-
-    async def get_betas_batch_status(self, simulation_batch_id: str) -> dict:
-        return await self._get(
-            f"/ml/simulate-betas/batch/{simulation_batch_id}/status"
-        )
+        return await self._post("/moment/simulate-betas/batch", json=body)
 
     async def get_betas_batch_results(self, simulation_batch_id: str) -> dict:
         return await self._get(
-            f"/ml/simulate-betas/batch/{simulation_batch_id}/results"
+            f"/moment/simulate-betas/batch/{simulation_batch_id}/results"
         )
-
-    async def poll_betas_batch(
-        self, simulation_batch_id: str, timeout: float = MAX_POLL_TIME
-    ) -> dict:
-        """Poll batch betas simulation until all complete or timeout."""
-        elapsed = 0.0
-        while elapsed < timeout:
-            result = await self.get_betas_batch_status(simulation_batch_id)
-            if result.get("all_completed") or result.get("status") in (
-                "completed",
-                "failed",
-            ):
-                return await self.get_betas_batch_results(simulation_batch_id)
-            await asyncio.sleep(POLL_INTERVAL)
-            elapsed += POLL_INTERVAL
-        return await self.get_betas_batch_results(simulation_batch_id)
 
     async def portfolio_test(
         self, simulation_batch_id: str, weights: dict[str, float]
     ) -> dict:
         return await self._post(
-            f"/ml/simulate-betas/batch/{simulation_batch_id}/portfolio-test",
+            f"/moment/simulate-betas/batch/{simulation_batch_id}/portfolio-test",
             json={"weights": weights},
         )
 
     # ──────────────────────────────────────────────
-    # Simulation — Returns
+    # Simulation — Returns (Moment — synchronous)
     # ──────────────────────────────────────────────
 
     async def simulate_returns_batch(
@@ -388,8 +351,9 @@ class SablierClient:
         factors: dict[str, float],
         n_samples: int = 5000,
     ) -> dict:
+        """Run return simulation with factor scenario. Synchronous — returns full results."""
         return await self._post(
-            "/ml/simulate-returns/batch",
+            "/moment/simulate-returns/batch",
             json={
                 "simulation_batch_id": simulation_batch_id,
                 "factors": factors,
@@ -398,31 +362,10 @@ class SablierClient:
             },
         )
 
-    async def get_returns_batch_status(self, returns_batch_id: str) -> dict:
-        return await self._get(
-            f"/ml/simulate-returns/batch/{returns_batch_id}/status"
-        )
-
     async def get_returns_batch_results(self, returns_batch_id: str) -> dict:
         return await self._get(
-            f"/ml/simulate-returns/batch/{returns_batch_id}/results"
+            f"/moment/simulate-returns/batch/{returns_batch_id}/results"
         )
-
-    async def poll_returns_batch(
-        self, returns_batch_id: str, timeout: float = MAX_POLL_TIME
-    ) -> dict:
-        """Poll batch returns simulation until complete or timeout."""
-        elapsed = 0.0
-        while elapsed < timeout:
-            result = await self.get_returns_batch_status(returns_batch_id)
-            if result.get("all_completed") or result.get("status") in (
-                "completed",
-                "failed",
-            ):
-                return await self.get_returns_batch_results(returns_batch_id)
-            await asyncio.sleep(POLL_INTERVAL)
-            elapsed += POLL_INTERVAL
-        return await self.get_returns_batch_results(returns_batch_id)
 
     # ──────────────────────────────────────────────
     # Scenarios
@@ -453,58 +396,39 @@ class SablierClient:
         return await self._get("/scenarios", params=params)
 
     # ──────────────────────────────────────────────
-    # Validation
+    # Validation (Moment — synchronous)
     # ──────────────────────────────────────────────
 
     async def get_latest_group_validation(self, model_group_id: str) -> dict:
-        return await self._get(f"/ml/validation/group/{model_group_id}/latest")
+        return await self._get(f"/moment/validation/group/{model_group_id}/latest")
 
     async def trigger_batch_validation(
         self,
         model_group_id: str,
-        validation_mode: str = "rolling_huber",
         n_samples: int = 200,
         max_starting_points: int = 100,
     ) -> dict:
+        """Validate all models in a group. Synchronous — returns completed results."""
         return await self._post(
-            "/ml/validation/batch",
+            "/moment/validation/batch",
             json={
                 "model_group_id": model_group_id,
-                "validation_mode": validation_mode,
                 "n_samples": n_samples,
                 "max_starting_points": max_starting_points,
             },
         )
 
-    async def get_batch_validation_status(self, validation_batch_id: str) -> dict:
-        return await self._get(
-            f"/ml/validation/batch/{validation_batch_id}/status"
-        )
-
     async def get_batch_validation_results(self, validation_batch_id: str) -> dict:
         return await self._get(
-            f"/ml/validation/batch/{validation_batch_id}/results"
+            f"/moment/validation/batch/{validation_batch_id}/results"
         )
-
-    async def poll_batch_validation(
-        self, validation_batch_id: str, timeout: float = MAX_POLL_TIME
-    ) -> dict:
-        """Poll batch validation until complete or timeout."""
-        elapsed = 0.0
-        while elapsed < timeout:
-            status = await self.get_batch_validation_status(validation_batch_id)
-            if status.get("all_done") or status.get("status") in ("completed", "failed"):
-                return await self.get_batch_validation_results(validation_batch_id)
-            await asyncio.sleep(POLL_INTERVAL)
-            elapsed += POLL_INTERVAL
-        return await self.get_batch_validation_results(validation_batch_id)
 
     async def list_simulation_history(
         self, simulation_batch_id: str
     ) -> dict:
         """List past scenario runs for a given betas simulation batch."""
         return await self._get(
-            f"/ml/simulate-returns/batch/history/{simulation_batch_id}"
+            f"/moment/simulate-returns/batch/history/{simulation_batch_id}"
         )
 
     # ──────────────────────────────────────────────
