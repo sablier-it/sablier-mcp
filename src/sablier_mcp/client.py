@@ -12,9 +12,9 @@ load_dotenv()
 
 DEFAULT_BASE_URL = "https://sablier-api-215397666394.us-central1.run.app/api/v1"
 DEFAULT_TIMEOUT = 60.0
-TRAINING_TIMEOUT = 180.0  # Training can take 30-120s for large portfolios
+LONG_TIMEOUT = 300.0  # 5 minutes — for synchronous training/simulation
 POLL_INTERVAL = 3.0
-MAX_POLL_TIME = 300.0  # 5 minutes (GRAIN only)
+MAX_POLL_TIME = 300.0  # 5 minutes
 
 
 class SablierAPIError(Exception):
@@ -115,6 +115,11 @@ class SablierClient:
         return await self._request("GET", path, **kwargs)
 
     async def _post(self, path: str, **kwargs) -> Any:
+        return await self._request("POST", path, **kwargs)
+
+    async def _post_long(self, path: str, **kwargs) -> Any:
+        """POST with extended timeout for synchronous training/simulation."""
+        kwargs.setdefault("timeout", LONG_TIMEOUT)
         return await self._request("POST", path, **kwargs)
 
     async def _delete(self, path: str, **kwargs) -> Any:
@@ -302,13 +307,12 @@ class SablierClient:
         self,
         model_group_id: str,
     ) -> dict:
-        """Train all models in a group. Synchronous — returns completed results directly."""
-        return await self._post(
+        """Batch train all models in a group. Synchronous — returns results directly."""
+        return await self._post_long(
             "/moment/train/batch",
             json={
                 "model_group_id": model_group_id,
             },
-            timeout=TRAINING_TIMEOUT,
         )
 
     # ──────────────────────────────────────────────
@@ -320,13 +324,13 @@ class SablierClient:
         model_group_id: str,
         historical_lookback_days: int | None = None,
     ) -> dict:
-        """Compute factor exposures for all models. Synchronous — returns full results."""
+        """Compute factor exposures for all models in a group. Synchronous."""
         body: dict[str, Any] = {
             "model_group_id": model_group_id,
         }
         if historical_lookback_days is not None:
             body["historical_lookback_days"] = historical_lookback_days
-        return await self._post("/moment/simulate-betas/batch", json=body)
+        return await self._post_long("/moment/simulate-betas/batch", json=body)
 
     async def get_betas_batch_results(self, simulation_batch_id: str) -> dict:
         return await self._get(
@@ -351,8 +355,8 @@ class SablierClient:
         factors: dict[str, float],
         n_samples: int = 5000,
     ) -> dict:
-        """Run return simulation with factor scenario. Synchronous — returns full results."""
-        return await self._post(
+        """Sample returns under stressed factor values. Synchronous."""
+        return await self._post_long(
             "/moment/simulate-returns/batch",
             json={
                 "simulation_batch_id": simulation_batch_id,
@@ -408,8 +412,8 @@ class SablierClient:
         n_samples: int = 200,
         max_starting_points: int = 100,
     ) -> dict:
-        """Validate all models in a group. Synchronous — returns completed results."""
-        return await self._post(
+        """Run validation for all models in a group. Synchronous."""
+        return await self._post_long(
             "/moment/validation/batch",
             json={
                 "model_group_id": model_group_id,

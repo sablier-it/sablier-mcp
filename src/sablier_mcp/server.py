@@ -780,7 +780,7 @@ async def list_feature_set_templates() -> str:
     name="simulate_betas",
     description=(
         "Compute how each asset in a trained model group responds to the chosen market drivers. "
-        "Requires model_group_id (status must be 'trained'). Synchronous — returns results directly. "
+        "Requires model_group_id (status must be 'trained'). "
         "Returns per-asset factor exposures, simulation_batch_id, and current factor levels (factor_means)."
     ),
     annotations=ToolAnnotations(openWorldHint=True),
@@ -795,6 +795,7 @@ async def simulate_betas(
         return err
     try:
         client = get_client()
+        # Synchronous — Moment returns results directly
         results = await client.simulate_betas_batch(
             model_group_id=model_group_id,
             historical_lookback_days=lookback_days,
@@ -802,13 +803,6 @@ async def simulate_betas(
         sim_batch_id = results.get("simulation_batch_id")
         if not sim_batch_id:
             return "Error: betas simulation did not return a simulation_batch_id."
-
-        if not results.get("all_completed"):
-            return _fmt({
-                "simulation_batch_id": sim_batch_id,
-                "status": results.get("status", "unknown"),
-                "message": "Simulation did not complete successfully.",
-            })
 
         flat = _flatten_betas(results)
         summary = {
@@ -841,15 +835,14 @@ async def run_model_validation(
         return err
     try:
         client = get_client()
+        # Synchronous — Moment returns results directly
         batch = await client.trigger_batch_validation(model_group_id)
 
         validation_batch_id = batch.get("validation_batch_id")
         if not validation_batch_id:
             return "Error: validation did not return a validation_batch_id."
 
-        # Moment validation is synchronous — fetch full results
         results = await client.get_batch_validation_results(validation_batch_id)
-
         return _format_validation_results(model_group_id, results)
     except SablierAPIError as e:
         return _api_error(e)
@@ -936,6 +929,7 @@ async def simulate_returns(
         return err
     try:
         client = get_client()
+        # Synchronous — Moment returns results directly
         results = await client.simulate_returns_batch(
             simulation_batch_id=simulation_batch_id,
             factors=factors,
@@ -944,13 +938,6 @@ async def simulate_returns(
         returns_batch_id = results.get("returns_batch_id")
         if not returns_batch_id:
             return "Error: returns simulation did not return a returns_batch_id."
-
-        if not results.get("all_completed"):
-            return _fmt({
-                "returns_batch_id": returns_batch_id,
-                "status": results.get("status", "unknown"),
-                "message": "Returns simulation did not complete successfully.",
-            })
 
         # Format per-asset risk metrics from the summary field
         per_asset = results.get("per_asset_results", {})
@@ -1109,24 +1096,18 @@ async def analyze_quantitative(
                 "failed_assets": create_result.get("failed_assets", []),
             })
 
-        # Step 2: Train (synchronous — returns completed results directly)
+        # Step 2: Train (synchronous — Moment returns results directly)
         train_result = await _retry_api_call(lambda: client.train_batch(
             model_group_id=model_group_id,
         ))
-        if train_result.get("status") == "failed":
+        if train_result.get("status") == "failed" or train_result.get("failed", 0) == train_result.get("total", 0):
             return _fmt({
                 "error": "Training failed.",
                 "model_group_id": model_group_id,
-                "details": train_result.get("error_message"),
-            })
-        if train_result.get("status") != "completed":
-            return _fmt({
-                "error": "Training did not complete.",
-                "model_group_id": model_group_id,
-                "status": train_result.get("status"),
+                "details": train_result.get("results", []),
             })
 
-        # Step 3: Simulate betas (synchronous — returns full results directly)
+        # Step 3: Simulate betas (synchronous — Moment returns results directly)
         results = await _retry_api_call(lambda: client.simulate_betas_batch(
             model_group_id=model_group_id,
         ))
