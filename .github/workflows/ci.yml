@@ -39,7 +39,7 @@ jobs:
       - uses: google-github-actions/setup-gcloud@v2
 
       - name: Deploy to staging
-        run: bash deploy_staging.sh --rebuild
+        run: bash deploy_staging.sh
 
   deploy-production:
     needs: build-check
@@ -56,4 +56,4 @@ jobs:
       - uses: google-github-actions/setup-gcloud@v2
 
       - name: Deploy to production
-        run: bash deploy.sh --rebuild
+        run: bash deploy.sh

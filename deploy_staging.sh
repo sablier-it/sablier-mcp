@@ -1,7 +1,7 @@
 #!/bin/bash
 # Cloud Run Deployment for Sablier MCP Server - STAGING
-# Deploys to sablier-mcp-staging, pointing at staging backend API.
-# Usage: ./deploy_staging.sh [--rebuild]
+# Deploys to sablier-mcp-staging.
+# Usage: ./deploy_staging.sh [--staging-backend]
 
 set -e
 
@@ -19,7 +19,6 @@ fi
 
 SERVICE_NAME="sablier-mcp-staging"
 REGION="us-central1"
-IMAGE_NAME="gcr.io/${PROJECT_ID}/sablier-mcp"
 PROJECT_NUMBER=$(gcloud projects describe ${PROJECT_ID} --format='value(projectNumber)' 2>/dev/null || echo '215397666394')
 SERVICE_URL="https://${SERVICE_NAME}-${PROJECT_NUMBER}.${REGION}.run.app"
 
@@ -27,10 +26,8 @@ SERVICE_URL="https://${SERVICE_NAME}-${PROJECT_NUMBER}.${REGION}.run.app"
 # Override with --staging-backend to use the staging backend instead.
 BACKEND_API_URL="https://sablier-api-${PROJECT_NUMBER}.${REGION}.run.app/api/v1"
 
-REBUILD=false
 for arg in "$@"; do
     case $arg in
-        --rebuild) REBUILD=true ;;
         --staging-backend)
             BACKEND_API_URL="https://sablier-api-staging-${PROJECT_NUMBER}.${REGION}.run.app/api/v1"
             echo "Using STAGING backend API"
@@ -38,25 +35,13 @@ for arg in "$@"; do
     esac
 done
 
-if [[ "$REBUILD" == true ]]; then
-    echo "Building Docker image..."
-    gcloud builds submit \
-        --tag "${IMAGE_NAME}:latest" \
-        --project=${PROJECT_ID} \
-        --timeout=10m \
-        .
-    echo "Image built successfully"
-else
-    echo "Using existing image..."
-fi
-
 echo "Deploying to Cloud Run..."
 echo "  Service: ${SERVICE_NAME} (STAGING)"
 echo "  URL: ${SERVICE_URL}"
 echo "  Backend API: ${BACKEND_API_URL}"
 
 gcloud run deploy ${SERVICE_NAME} \
-    --image ${IMAGE_NAME}:latest \
+    --source . \
     --platform managed \
     --region ${REGION} \
     --project ${PROJECT_ID} \

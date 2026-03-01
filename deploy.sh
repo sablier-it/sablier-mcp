@@ -1,6 +1,6 @@
 #!/bin/bash
 # Cloud Run Deployment for Sablier MCP Server - PRODUCTION
-# Usage: ./deploy.sh [--rebuild]
+# Usage: ./deploy.sh
 
 set -e
 
@@ -18,35 +18,15 @@ fi
 
 SERVICE_NAME="sablier-mcp"
 REGION="us-central1"
-IMAGE_NAME="gcr.io/${PROJECT_ID}/sablier-mcp"
 PROJECT_NUMBER=$(gcloud projects describe ${PROJECT_ID} --format='value(projectNumber)' 2>/dev/null || echo '215397666394')
 SERVICE_URL="https://${SERVICE_NAME}-${PROJECT_NUMBER}.${REGION}.run.app"
-
-REBUILD=false
-for arg in "$@"; do
-    case $arg in
-        --rebuild) REBUILD=true ;;
-    esac
-done
-
-if [[ "$REBUILD" == true ]]; then
-    echo "Building Docker image..."
-    gcloud builds submit \
-        --tag "${IMAGE_NAME}:latest" \
-        --project=${PROJECT_ID} \
-        --timeout=10m \
-        .
-    echo "Image built successfully"
-else
-    echo "Using existing image..."
-fi
 
 echo "Deploying to Cloud Run..."
 echo "  Service: ${SERVICE_NAME}"
 echo "  URL: ${SERVICE_URL}"
 
 gcloud run deploy ${SERVICE_NAME} \
-    --image ${IMAGE_NAME}:latest \
+    --source . \
     --platform managed \
     --region ${REGION} \
     --project ${PROJECT_ID} \
