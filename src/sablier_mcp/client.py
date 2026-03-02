@@ -143,6 +143,65 @@ class SablierClient:
             params["source"] = source
         return await self._get("/features/search", params=params)
 
+    async def add_feature(
+        self,
+        ticker: str,
+        source: str,
+        display_name: str | None = None,
+        description: str | None = None,
+        category: str | None = None,
+        is_asset: bool = False,
+        data_type: str | None = None,
+        units: str | None = None,
+        frequency: str = "daily",
+        metadata: dict | None = None,
+    ) -> dict:
+        """Add a feature to the available_features catalog."""
+        body: dict[str, Any] = {"ticker": ticker, "source": source, "is_asset": is_asset, "frequency": frequency}
+        if display_name:
+            body["display_name"] = display_name
+        if description:
+            body["description"] = description
+        if category:
+            body["category"] = category
+        if data_type:
+            body["data_type"] = data_type
+        if units:
+            body["units"] = units
+        if metadata:
+            body["metadata"] = metadata
+        return await self._post("/features/available", json=body)
+
+    async def refresh_feature_data(self, tickers: list[str]) -> dict:
+        """Refresh training data for specific tickers."""
+        return await self._post_long("/features/available/refresh", json={"tickers": tickers})
+
+    async def list_transformations(self) -> list[dict]:
+        """List available transformation types for derived features."""
+        return await self._get("/features/transformations")
+
+    async def create_derived_feature(
+        self,
+        name: str,
+        base_feature: str,
+        transformation: str,
+        parameters: dict,
+        display_name: str | None = None,
+        description: str | None = None,
+    ) -> dict:
+        """Create a derived feature."""
+        body: dict[str, Any] = {
+            "name": name,
+            "base_feature": base_feature,
+            "transformation": transformation,
+            "parameters": parameters,
+        }
+        if display_name:
+            body["display_name"] = display_name
+        if description:
+            body["description"] = description
+        return await self._post("/features/derived", json=body)
+
     # ──────────────────────────────────────────────
     # Portfolios
     # ──────────────────────────────────────────────
@@ -183,6 +242,25 @@ class SablierClient:
 
     async def get_asset_profiles(self, portfolio_id: str) -> dict:
         return await self._get(f"/portfolios/{portfolio_id}/asset-profiles")
+
+    async def optimize_portfolio(
+        self, portfolio_id: str, simulation_batch_id: str,
+        objective: str = "max_sharpe",
+    ) -> dict:
+        """Find optimal portfolio weights."""
+        return await self._post(
+            f"/portfolios/{portfolio_id}/optimize",
+            json={"simulation_batch_id": simulation_batch_id, "objective": objective},
+        )
+
+    async def get_efficient_frontier(
+        self, portfolio_id: str, n_points: int = 20,
+    ) -> dict:
+        """Calculate efficient frontier for portfolio assets."""
+        return await self._get(
+            f"/portfolios/{portfolio_id}/efficient-frontier",
+            params={"n_points": n_points},
+        )
 
     # ──────────────────────────────────────────────
     # GRAIN (Qualitative Analysis)
@@ -272,6 +350,9 @@ class SablierClient:
 
     async def list_group_simulations(self, group_id: str) -> dict:
         return await self._get(f"/moment/model-groups/{group_id}/simulations")
+
+    async def get_residual_correlation(self, group_id: str) -> dict:
+        return await self._get(f"/moment/model-groups/{group_id}/residual-correlation")
 
     async def batch_create_models(
         self,
@@ -399,6 +480,19 @@ class SablierClient:
             params["model_id"] = model_id
         return await self._get("/scenarios", params=params)
 
+    async def get_scenario(self, scenario_id: str) -> dict:
+        return await self._get(f"/scenarios/{scenario_id}")
+
+    async def update_scenario(self, scenario_id: str, **fields: Any) -> dict:
+        """Update a scenario. Pass only the fields to change."""
+        return await self._request("PATCH", f"/scenarios/{scenario_id}", json=fields)
+
+    async def delete_scenario(self, scenario_id: str) -> dict:
+        return await self._delete(f"/scenarios/{scenario_id}")
+
+    async def clone_scenario(self, scenario_id: str) -> dict:
+        return await self._post(f"/scenarios/{scenario_id}/clone")
+
     # ──────────────────────────────────────────────
     # Validation (Moment — synchronous)
     # ──────────────────────────────────────────────
@@ -442,6 +536,98 @@ class SablierClient:
     async def get_market_radar(self) -> dict:
         """Get comprehensive market radar snapshot with 50+ indicators and regime signals."""
         return await self._get("/market/radar")
+
+    # ──────────────────────────────────────────────
+    # Flow (Generative Time Series)
+    # ──────────────────────────────────────────────
+
+    async def flow_train(
+        self,
+        model_group_id: str,
+        horizon: int = 20,
+        obs_length: int = 60,
+        max_epochs: int = 500,
+        lr: float = 1e-3,
+        batch_size: int = 64,
+        patience: int = 50,
+    ) -> dict:
+        """Start async OT-CFM flow model training job."""
+        body: dict[str, Any] = {
+            "model_group_id": model_group_id,
+            "horizon": horizon,
+            "obs_length": obs_length,
+            "max_epochs": max_epochs,
+            "lr": lr,
+            "batch_size": batch_size,
+            "patience": patience,
+        }
+        return await self._post("/flow/train", json=body)
+
+    async def flow_train_status(self, job_id: str) -> dict:
+        return await self._get(f"/flow/train/{job_id}/status")
+
+    async def poll_flow_train(
+        self, job_id: str, timeout: float = MAX_POLL_TIME
+    ) -> dict:
+        """Poll a flow training job until completion or timeout."""
+        elapsed = 0.0
+        while elapsed < timeout:
+            result = await self.flow_train_status(job_id)
+            status = result.get("status", "")
+            if status in ("completed", "failed"):
+                return result
+            await asyncio.sleep(POLL_INTERVAL)
+            elapsed += POLL_INTERVAL
+        return result
+
+    async def flow_generate_paths(
+        self,
+        model_group_id: str,
+        n_paths: int = 100,
+        horizon: int | None = None,
+    ) -> dict:
+        """Start async path generation job."""
+        body: dict[str, Any] = {
+            "model_group_id": model_group_id,
+            "n_paths": n_paths,
+        }
+        if horizon is not None:
+            body["horizon"] = horizon
+        return await self._post("/flow/generate-paths", json=body)
+
+    async def flow_generate_constrained_paths(
+        self,
+        model_group_id: str,
+        constraints: list[dict],
+        n_paths: int = 100,
+        horizon: int | None = None,
+    ) -> dict:
+        """Start async constrained path generation job (SMC filtering)."""
+        body: dict[str, Any] = {
+            "model_group_id": model_group_id,
+            "constraints": constraints,
+            "n_paths": n_paths,
+        }
+        if horizon is not None:
+            body["horizon"] = horizon
+        return await self._post("/flow/generate-constrained-paths", json=body)
+
+    async def flow_get_results(self, job_id: str) -> dict:
+        return await self._get(f"/flow/{job_id}/results")
+
+    async def poll_flow_job(
+        self, job_id: str, status_path: str, timeout: float = MAX_POLL_TIME
+    ) -> dict:
+        """Poll any flow job (train or generate) until completion."""
+        elapsed = 0.0
+        while elapsed < timeout:
+            result = await self._get(status_path)
+            status = result.get("status", "")
+            if status in ("completed", "failed"):
+                return result
+            await asyncio.sleep(POLL_INTERVAL)
+            elapsed += POLL_INTERVAL
+        return result
 
     # ──────────────────────────────────────────────
     # Tests

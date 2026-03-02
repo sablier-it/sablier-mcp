@@ -317,6 +317,118 @@ async def search_features(
 
 
 # ══════════════════════════════════════════════════
+# Feature Catalog Management
+# ══════════════════════════════════════════════════
+
+
+@server.tool(
+    name="add_feature",
+    description=(
+        "Add a ticker to the feature catalog so it can be used in portfolios or conditioning sets. "
+        "Specify source ('yahoo' for stocks/ETFs/futures, 'fred' for rates/economic indicators). "
+        "Set is_asset=true for assets that go into portfolios, false for conditioning factors. "
+        "After adding, call refresh_feature_data to populate its historical data."
+    ),
+)
+async def add_feature(
+    ticker: Annotated[str, Field(description="Ticker symbol (e.g. 'AAPL', 'DFF', 'CL=F')")],
+    source: Annotated[str, Field(description="Data source: 'yahoo' (stocks, ETFs, futures) or 'fred' (rates, economic)")],
+    display_name: Annotated[str | None, Field(description="Human-readable name (e.g. 'Apple Inc.')", default=None)] = None,
+    description: Annotated[str | None, Field(description="Brief description", default=None)] = None,
+    category: Annotated[str | None, Field(description="Category: equity, rates, fx, commodity, volatility, economic, etc.", default=None)] = None,
+    is_asset: Annotated[bool, Field(description="True for portfolio assets, False for conditioning factors", default=False)] = False,
+    data_type: Annotated[str | None, Field(description="Data type: price, rate, index, level", default=None)] = None,
+    units: Annotated[str | None, Field(description="Units (e.g. 'USD', 'percent', 'index')", default=None)] = None,
+) -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        result = await client.add_feature(
+            ticker=ticker, source=source, display_name=display_name,
+            description=description, category=category, is_asset=is_asset,
+            data_type=data_type, units=units,
+        )
+        return _fmt({
+            "id": result.get("id"),
+            "ticker": result.get("ticker"),
+            "display_name": result.get("display_name"),
+            "source": result.get("source"),
+            "is_asset": result.get("is_asset"),
+            "message": f"Feature '{ticker}' added to catalog. Call refresh_feature_data to populate historical data.",
+        })
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="refresh_feature_data",
+    description=(
+        "Fetch/update historical training data for specific tickers from Yahoo Finance or FRED. "
+        "For new features: full fetch from 2000. For existing: incremental update to today. "
+        "Use this after add_feature, or to force-update stale data."
+    ),
+)
+async def refresh_feature_data(
+    tickers: Annotated[list[str], Field(description="Tickers to refresh (e.g. ['AAPL', 'CL=F', 'DFF'])")],
+) -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        result = await client.refresh_feature_data(tickers)
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="create_derived_feature",
+    description=(
+        "Create a derived feature from an existing base feature using a transformation. "
+        "Examples: 20-day moving average of VIX, spread between 10Y and 2Y rates. "
+        "Use list_transformations to see available transformation types."
+    ),
+)
+async def create_derived_feature(
+    name: Annotated[str, Field(description="Unique name/ticker for the derived feature (e.g. 'VIX_MA20')")],
+    base_feature: Annotated[str, Field(description="Ticker of the base feature to transform (e.g. 'VIX')")],
+    transformation: Annotated[str, Field(description="Transformation type (e.g. 'moving_average', 'spread', 'ratio')")],
+    parameters: Annotated[dict, Field(description="Transformation parameters (e.g. {'window': 20})")],
+    display_name: Annotated[str | None, Field(description="Human-readable name", default=None)] = None,
+    description: Annotated[str | None, Field(description="Description of the derived feature", default=None)] = None,
+) -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        result = await client.create_derived_feature(
+            name=name, base_feature=base_feature,
+            transformation=transformation, parameters=parameters,
+            display_name=display_name, description=description,
+        )
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="list_transformations",
+    description="List available transformation types for creating derived features. Returns names, parameter schemas, and examples.",
+    annotations=ToolAnnotations(readOnlyHint=True),
+)
+async def list_transformations() -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        result = await client.list_transformations()
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+# ══════════════════════════════════════════════════
 # Portfolios
 # ══════════════════════════════════════════════════
 
@@ -511,6 +623,78 @@ async def get_asset_profiles(
     try:
         client = get_client()
         result = await client.get_asset_profiles(portfolio_id)
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="delete_portfolio",
+    description="Delete a portfolio by ID. This is permanent and cannot be undone.",
+)
+async def delete_portfolio(
+    portfolio_id: Annotated[str, Field(description="The portfolio UUID to delete")],
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(portfolio_id, "portfolio_id"):
+        return err
+    try:
+        client = get_client()
+        await client.delete_portfolio(portfolio_id)
+        return _fmt({"message": f"Portfolio {portfolio_id} deleted successfully."})
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="optimize_portfolio",
+    description=(
+        "Find optimal portfolio weights using per-asset simulation data. "
+        "Requires a simulation_batch_id from simulate_betas. "
+        "Objective options: 'max_sharpe', 'min_variance', 'max_return'."
+    ),
+)
+async def optimize_portfolio(
+    portfolio_id: Annotated[str, Field(description="The portfolio UUID")],
+    simulation_batch_id: Annotated[str, Field(description="From simulate_betas or analyze_quantitative")],
+    objective: Annotated[str, Field(description="Optimization objective: 'max_sharpe', 'min_variance', or 'max_return'", default="max_sharpe")] = "max_sharpe",
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(portfolio_id, "portfolio_id"):
+        return err
+    if err := _validate_uuid(simulation_batch_id, "simulation_batch_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.optimize_portfolio(
+            portfolio_id, simulation_batch_id, objective=objective,
+        )
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="get_efficient_frontier",
+    description=(
+        "Calculate the efficient frontier for portfolio assets. "
+        "Returns a curve of optimal risk-return tradeoffs."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True),
+)
+async def get_efficient_frontier(
+    portfolio_id: Annotated[str, Field(description="The portfolio UUID")],
+    n_points: Annotated[int, Field(description="Number of points on the frontier curve (default 20)", default=20)] = 20,
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(portfolio_id, "portfolio_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.get_efficient_frontier(portfolio_id, n_points=n_points)
         return _fmt(result)
     except SablierAPIError as e:
         return _api_error(e)
@@ -772,6 +956,67 @@ async def list_feature_set_templates() -> str:
         return _api_error(e)
 
 
+@server.tool(
+    name="delete_model_group",
+    description="Delete a model group and all its models, simulations, and associated data. This is permanent.",
+)
+async def delete_model_group(
+    model_group_id: Annotated[str, Field(description="UUID of the model group to delete")],
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(model_group_id, "model_group_id"):
+        return err
+    try:
+        client = get_client()
+        await client.delete_model_group(model_group_id)
+        return _fmt({"message": f"Model group {model_group_id} deleted successfully."})
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="get_residual_correlation",
+    description=(
+        "Get the cross-asset residual correlation matrix for a model group. "
+        "Shows how much unexplained co-movement exists between assets after accounting for factor exposures. "
+        "High residual correlations suggest missing common factors."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True),
+)
+async def get_residual_correlation(
+    model_group_id: Annotated[str, Field(description="UUID of the model group")],
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(model_group_id, "model_group_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.get_residual_correlation(model_group_id)
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="list_simulations",
+    description="List all simulations (betas computations) for a model group. Returns simulation IDs, dates, and status.",
+    annotations=ToolAnnotations(readOnlyHint=True),
+)
+async def list_simulations(
+    model_group_id: Annotated[str, Field(description="UUID of the model group")],
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(model_group_id, "model_group_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.list_group_simulations(model_group_id)
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
 
 
 
@@ -1048,6 +1293,102 @@ async def list_scenarios(
         return _api_error(e)
 
 
+@server.tool(
+    name="get_scenario",
+    description="Get detailed information about a saved scenario including its factor specs.",
+    annotations=ToolAnnotations(readOnlyHint=True),
+)
+async def get_scenario(
+    scenario_id: Annotated[str, Field(description="The scenario UUID")],
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(scenario_id, "scenario_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.get_scenario(scenario_id)
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="update_scenario",
+    description=(
+        "Update a saved scenario. Can change name, description, or factor specs. "
+        "Only pass the fields you want to update."
+    ),
+)
+async def update_scenario(
+    scenario_id: Annotated[str, Field(description="The scenario UUID")],
+    name: Annotated[str | None, Field(description="New scenario name", default=None)] = None,
+    description: Annotated[str | None, Field(description="New description", default=None)] = None,
+    specs: Annotated[dict[str, dict] | None, Field(description="New factor specs", default=None)] = None,
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(scenario_id, "scenario_id"):
+        return err
+    fields: dict = {}
+    if name is not None:
+        fields["name"] = name
+    if description is not None:
+        fields["description"] = description
+    if specs is not None:
+        fields["specs"] = specs
+    if not fields:
+        return "Error: provide at least one field to update (name, description, specs)."
+    try:
+        client = get_client()
+        result = await client.update_scenario(scenario_id, **fields)
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="delete_scenario",
+    description="Delete a saved scenario. This is permanent.",
+)
+async def delete_scenario(
+    scenario_id: Annotated[str, Field(description="The scenario UUID to delete")],
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(scenario_id, "scenario_id"):
+        return err
+    try:
+        client = get_client()
+        await client.delete_scenario(scenario_id)
+        return _fmt({"message": f"Scenario {scenario_id} deleted successfully."})
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="clone_scenario",
+    description="Clone an existing scenario (typically a template) to create your own editable copy.",
+)
+async def clone_scenario(
+    scenario_id: Annotated[str, Field(description="UUID of the scenario to clone")],
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(scenario_id, "scenario_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.clone_scenario(scenario_id)
+        return _fmt({
+            "cloned_scenario_id": result.get("id"),
+            "name": result.get("name"),
+            "message": "Scenario cloned. Use update_scenario to customize it.",
+        })
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
 # ══════════════════════════════════════════════════
 # Full Analysis Orchestrator
 # ══════════════════════════════════════════════════
@@ -1158,6 +1499,153 @@ async def analyze_quantitative(
 
 
 # NOTE: sablier_full_analysis was removed — LLM can call analyze_quantitative + analyze_qualitative separately.
+
+
+# ══════════════════════════════════════════════════
+# Flow (Generative Time Series)
+# ══════════════════════════════════════════════════
+
+
+@server.tool(
+    name="flow_train",
+    description=(
+        "Train an OT-CFM flow model for generative time series simulation. "
+        "This learns the joint distribution of assets + factors and can generate realistic multi-step paths. "
+        "Requires a model_group_id with trained Moment models. "
+        "This is an async GPU job — the tool will poll until completion."
+    ),
+)
+async def flow_train(
+    model_group_id: Annotated[str, Field(description="UUID of the model group (must have trained Moment models)")],
+    horizon: Annotated[int, Field(description="Number of future time steps to generate (default 20)", default=20)] = 20,
+    obs_length: Annotated[int, Field(description="Context window length for conditioning (default 60)", default=60)] = 60,
+    max_epochs: Annotated[int, Field(description="Maximum training epochs (default 500)", default=500)] = 500,
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(model_group_id, "model_group_id"):
+        return err
+    try:
+        client = get_client()
+        job = await client.flow_train(
+            model_group_id=model_group_id,
+            horizon=horizon, obs_length=obs_length, max_epochs=max_epochs,
+        )
+        job_id = job.get("job_id")
+        if not job_id:
+            return "Error: Flow training did not return a job_id."
+
+        # Poll until complete
+        result = await client.poll_flow_train(job_id)
+
+        if result.get("status") == "failed":
+            return f"Flow training failed: {result.get('error', 'Unknown error')}"
+
+        if result.get("status") != "completed":
+            return _fmt({
+                "status": result.get("status"),
+                "job_id": job_id,
+                "message": "Training is still running. Check back shortly.",
+            })
+
+        return _fmt({
+            "status": "completed",
+            "job_id": job_id,
+            "model_group_id": model_group_id,
+            "message": (
+                "Flow model trained. Use flow_generate_paths to generate unconditional paths, "
+                "or flow_generate_constrained_paths for paths with inequality constraints."
+            ),
+        })
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="flow_generate_paths",
+    description=(
+        "Generate unconditional multi-step paths from a trained Flow model. "
+        "Produces realistic joint trajectories of assets and factors. "
+        "This is an async GPU job — the tool will poll until completion."
+    ),
+)
+async def flow_generate_paths(
+    model_group_id: Annotated[str, Field(description="UUID of the model group with a trained Flow model")],
+    n_paths: Annotated[int, Field(description="Number of paths to generate (default 100)", default=100)] = 100,
+    horizon: Annotated[int | None, Field(description="Override horizon (defaults to training horizon)", default=None)] = None,
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(model_group_id, "model_group_id"):
+        return err
+    try:
+        client = get_client()
+        job = await client.flow_generate_paths(
+            model_group_id=model_group_id, n_paths=n_paths, horizon=horizon,
+        )
+        job_id = job.get("job_id")
+        if not job_id:
+            return "Error: Path generation did not return a job_id."
+
+        result = await client.poll_flow_job(
+            job_id, status_path=f"/flow/{job_id}/results",
+        )
+
+        if result.get("status") == "failed":
+            return f"Path generation failed: {result.get('error', 'Unknown error')}"
+
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="flow_generate_constrained_paths",
+    description=(
+        "Generate paths with inequality constraints using SMC particle filtering. "
+        "Example: generate paths where gold stays above $3000 and VIX stays below 20. "
+        "Constraints specify bounds on feature levels or returns over time windows. "
+        "This is an async GPU job — the tool will poll until completion."
+    ),
+)
+async def flow_generate_constrained_paths(
+    model_group_id: Annotated[str, Field(description="UUID of the model group with a trained Flow model")],
+    constraints: Annotated[list[dict], Field(
+        description=(
+            "List of inequality constraints. Each constraint: "
+            "{'feature_name': 'GC=F', 'type': 'level', 'lower': 3000, 'upper': null, 't_start': 0, 't_end': 20}. "
+            "Types: 'level' (absolute price), 'return' (cumulative return)."
+        )
+    )],
+    n_paths: Annotated[int, Field(description="Number of paths to generate (default 100)", default=100)] = 100,
+    horizon: Annotated[int | None, Field(description="Override horizon (defaults to training horizon)", default=None)] = None,
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(model_group_id, "model_group_id"):
+        return err
+    try:
+        client = get_client()
+        job = await client.flow_generate_constrained_paths(
+            model_group_id=model_group_id,
+            constraints=constraints,
+            n_paths=n_paths,
+            horizon=horizon,
+        )
+        job_id = job.get("job_id")
+        if not job_id:
+            return "Error: Constrained path generation did not return a job_id."
+
+        result = await client.poll_flow_job(
+            job_id, status_path=f"/flow/{job_id}/results",
+        )
+
+        if result.get("status") == "failed":
+            return f"Constrained path generation failed: {result.get('error', 'Unknown error')}"
+
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
 
 
 # ══════════════════════════════════════════════════
