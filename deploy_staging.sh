@@ -22,15 +22,15 @@ REGION="us-central1"
 PROJECT_NUMBER=$(gcloud projects describe ${PROJECT_ID} --format='value(projectNumber)' 2>/dev/null || echo '215397666394')
 SERVICE_URL="https://${SERVICE_NAME}-${PROJECT_NUMBER}.${REGION}.run.app"
 
-# Staging MCP points at production backend (real data for testing new tools).
-# Override with --staging-backend to use the staging backend instead.
-BACKEND_API_URL="https://sablier-api-${PROJECT_NUMBER}.${REGION}.run.app/api/v1"
+# Staging MCP defaults to staging backend.
+# Override with --production-backend to use the production backend instead.
+BACKEND_API_URL="https://sablier-api-staging-${PROJECT_NUMBER}.${REGION}.run.app/api/v1"
 
 for arg in "$@"; do
     case $arg in
-        --staging-backend)
-            BACKEND_API_URL="https://sablier-api-staging-${PROJECT_NUMBER}.${REGION}.run.app/api/v1"
-            echo "Using STAGING backend API"
+        --production-backend)
+            BACKEND_API_URL="https://sablier-api-${PROJECT_NUMBER}.${REGION}.run.app/api/v1"
+            echo "Using PRODUCTION backend API"
             ;;
     esac
 done
