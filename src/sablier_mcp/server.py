@@ -1535,14 +1535,25 @@ async def flow_train(
         if not job_id:
             return "Error: Flow training did not return a job_id."
 
+        feature_names = job.get("feature_names", [])
+        feature_note = ""
+        if feature_names:
+            feature_note = (
+                f" The model's features are: {feature_names}. "
+                "When using flow_generate_constrained_paths, constraint feature_name "
+                "must be one of these."
+            )
+
         return _fmt({
             "status": "submitted",
             "job_id": job_id,
             "model_group_id": model_group_id,
+            "feature_names": feature_names,
             "message": (
                 "Flow training job submitted. Training typically takes 5-15 minutes. "
                 "Use get_flow_job_status to check progress. "
                 "Once completed, use flow_generate_paths or flow_generate_constrained_paths."
+                + feature_note
             ),
         })
     except SablierAPIError as e:
