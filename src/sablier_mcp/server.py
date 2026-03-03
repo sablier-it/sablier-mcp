@@ -1605,6 +1605,8 @@ async def flow_generate_constrained_paths(
         description=(
             "List of inequality constraints. Each constraint: "
             "{'feature_name': 'GC=F', 'type': 'level', 'lower': 3000, 'upper': null, 't_start': 0, 't_end': 20}. "
+            "feature_name accepts ticker symbols (e.g. 'GC=F', '^VIX', 'VIX') or display names "
+            "(e.g. 'Equity Volatility (VIX)', 'Gold Futures'). "
             "Types: 'level' (absolute price), 'return' (cumulative return)."
         )
     )],
