@@ -1512,8 +1512,7 @@ async def analyze_quantitative(
         "Train an OT-CFM flow model for generative time series simulation. "
         "This learns the joint distribution of assets + factors and can generate realistic multi-step paths. "
         "Requires a model_group_id with trained Moment models. "
-        "This is an async GPU job — the tool will poll for up to 20 minutes. "
-        "If training takes longer, use get_flow_job_status to check progress."
+        "This is an async GPU job — the tool will poll until completion."
     ),
 )
 async def flow_train(
@@ -1536,26 +1535,14 @@ async def flow_train(
         if not job_id:
             return "Error: Flow training did not return a job_id."
 
-        # Poll until complete
-        result = await client.poll_flow_train(job_id)
-
-        if result.get("status") == "failed":
-            return f"Flow training failed: {result.get('error', 'Unknown error')}"
-
-        if result.get("status") != "completed":
-            return _fmt({
-                "status": result.get("status"),
-                "job_id": job_id,
-                "message": "Training is still running. Use get_flow_job_status with this job_id to check progress.",
-            })
-
         return _fmt({
-            "status": "completed",
+            "status": "submitted",
             "job_id": job_id,
             "model_group_id": model_group_id,
             "message": (
-                "Flow model trained. Use flow_generate_paths to generate unconditional paths, "
-                "or flow_generate_constrained_paths for paths with inequality constraints."
+                "Flow training job submitted. Training typically takes 5-15 minutes. "
+                "Use get_flow_job_status to check progress. "
+                "Once completed, use flow_generate_paths or flow_generate_constrained_paths."
             ),
         })
     except SablierAPIError as e:
@@ -1567,7 +1554,8 @@ async def flow_train(
     description=(
         "Generate unconditional multi-step paths from a trained Flow model. "
         "Produces realistic joint trajectories of assets and factors. "
-        "This is an async GPU job — the tool will poll until completion."
+        "This is an async GPU job — returns immediately. "
+        "Use get_flow_job_status with job_type='generate' to check progress and retrieve results."
     ),
 )
 async def flow_generate_paths(
@@ -1588,14 +1576,15 @@ async def flow_generate_paths(
         if not job_id:
             return "Error: Path generation did not return a job_id."
 
-        result = await client.poll_flow_job(
-            job_id, status_path=f"/flow/{job_id}/results",
-        )
-
-        if result.get("status") == "failed":
-            return f"Path generation failed: {result.get('error', 'Unknown error')}"
-
-        return _fmt(result)
+        return _fmt({
+            "status": "submitted",
+            "job_id": job_id,
+            "model_group_id": model_group_id,
+            "message": (
+                "Path generation job submitted. Typically takes 1-3 minutes. "
+                "Use get_flow_job_status with job_type='generate' to check progress and get results."
+            ),
+        })
     except SablierAPIError as e:
         return _api_error(e)
 
@@ -1606,7 +1595,8 @@ async def flow_generate_paths(
         "Generate paths with inequality constraints using SMC particle filtering. "
         "Example: generate paths where gold stays above $3000 and VIX stays below 20. "
         "Constraints specify bounds on feature levels or returns over time windows. "
-        "This is an async GPU job — the tool will poll until completion."
+        "This is an async GPU job — returns immediately. "
+        "Use get_flow_job_status with job_type='generate' to check progress and retrieve results."
     ),
 )
 async def flow_generate_constrained_paths(
@@ -1637,14 +1627,15 @@ async def flow_generate_constrained_paths(
         if not job_id:
             return "Error: Constrained path generation did not return a job_id."
 
-        result = await client.poll_flow_job(
-            job_id, status_path=f"/flow/{job_id}/results",
-        )
-
-        if result.get("status") == "failed":
-            return f"Constrained path generation failed: {result.get('error', 'Unknown error')}"
-
-        return _fmt(result)
+        return _fmt({
+            "status": "submitted",
+            "job_id": job_id,
+            "model_group_id": model_group_id,
+            "message": (
+                "Constrained path generation job submitted. Typically takes 2-5 minutes. "
+                "Use get_flow_job_status with job_type='generate' to check progress and get results."
+            ),
+        })
     except SablierAPIError as e:
         return _api_error(e)
 
@@ -1654,7 +1645,8 @@ async def flow_generate_constrained_paths(
     description=(
         "Check the status of a Flow job (training or generation). "
         "Use this after flow_train, flow_generate_paths, or flow_generate_constrained_paths "
-        "if they timed out before completion. Returns current status and progress info."
+        "to check progress and retrieve results when complete. "
+        "Training typically takes 5-15 minutes; generation takes 1-5 minutes."
     ),
 )
 async def get_flow_job_status(
