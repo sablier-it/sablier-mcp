@@ -690,22 +690,34 @@ async def login_page(request: Request, provider: SablierOAuthProvider) -> HTMLRe
     except Exception:
         return _render_login(session_id, error="Could not reach Sablier. Please try again.", email=email)
 
-    # Step 2: Clean up old MCP API keys, then create a fresh one
+    # Step 2: Reuse existing MCP API key if one exists, otherwise create a new one.
+    # Important: we do NOT delete old keys because Claude may still hold a cached
+    # OAuth token referencing them. Deleting would cause 401s on cached sessions.
     _MCP_KEY_NAME = "Claude Desktop"
     _auth_headers = {"Content-Type": "application/json", "Authorization": f"Bearer {sablier_jwt}"}
+    api_key = ""
     try:
         async with httpx.AsyncClient(timeout=30.0) as http:
-            # Delete any existing MCP keys to avoid accumulation
+            # Check for an existing MCP key we can reuse
             list_resp = await http.get(f"{_SABLIER_API_URL}/api-keys", headers=_auth_headers)
             if list_resp.status_code == 200:
-                for key in list_resp.json().get("api_keys", []):
-                    if key.get("name") == _MCP_KEY_NAME:
-                        key_id = key.get("id")
+                mcp_keys = [k for k in list_resp.json().get("api_keys", []) if k.get("name") == _MCP_KEY_NAME]
+                if len(mcp_keys) > 1:
+                    # Multiple MCP keys — keep the newest, delete the rest
+                    mcp_keys.sort(key=lambda k: k.get("created_at", ""), reverse=True)
+                    for old_key in mcp_keys[1:]:
+                        key_id = old_key.get("id")
                         if key_id:
                             await http.delete(f"{_SABLIER_API_URL}/api-keys/{key_id}", headers=_auth_headers)
-                            logger.info("Deleted old MCP API key: %s", key_id)
+                            logger.info("Deleted duplicate MCP API key: %s", key_id)
 
-            # Create a new key
+                if mcp_keys:
+                    # Reuse the existing key — but we don't have the raw key, only the prefix.
+                    # We must create a new one (the raw key is only returned at creation time).
+                    # Keep the old one alive so cached tokens still work.
+                    logger.info("Existing MCP key found (prefix: %s), creating additional key", mcp_keys[0].get("key_prefix", "?"))
+
+            # Always create a new key (we can't recover the raw value of existing keys)
             resp = await http.post(
                 f"{_SABLIER_API_URL}/api-keys",
                 json={"name": _MCP_KEY_NAME},
