@@ -31,6 +31,7 @@ from sablier_mcp.auth import SablierOAuthProvider, current_sablier_token, login_
 from sablier_mcp.client import SablierClient, SablierAPIError
 from sablier_mcp.widgets import (
     betas_heatmap,
+    flow_fan_chart,
     grain_score_card,
     portfolio_overview,
 )
@@ -1668,7 +1669,7 @@ async def get_flow_job_status(
         description="Type of job: 'train' or 'generate'. Determines which status endpoint to query.",
         default="train",
     )] = "train",
-) -> str:
+) -> str | list:
     if err := _require_auth():
         return err
     if err := _validate_uuid(job_id, "job_id"):
@@ -1677,9 +1678,27 @@ async def get_flow_job_status(
         client = get_client()
         if job_type == "train":
             result = await client.flow_train_status(job_id)
+            return _fmt(result)
         else:
             result = await client.flow_get_results(job_id)
-        return _fmt(result)
+            # Try to generate fan chart widget for completed generation results
+            summary = result.get("summary", {})
+            has_ts = any(
+                isinstance(v, dict) and "timeseries" in v
+                for v in summary.values()
+            )
+            if has_ts:
+                try:
+                    chart_html = flow_fan_chart(
+                        summary,
+                        result.get("horizon", 20),
+                        result.get("constraints"),
+                    )
+                    if chart_html:
+                        return _with_widget(_fmt(result), chart_html)
+                except Exception:
+                    logger.debug("Fan chart generation failed, returning text-only", exc_info=True)
+            return _fmt(result)
     except SablierAPIError as e:
         return _api_error(e)
 
