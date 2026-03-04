@@ -151,26 +151,31 @@ class SablierClient:
         display_name: str | None = None,
         description: str | None = None,
         category: str | None = None,
-        is_asset: bool = False,
+        is_asset: bool | None = None,
         data_type: str | None = None,
         units: str | None = None,
         frequency: str = "daily",
         metadata: dict | None = None,
+        skip_validation: bool = False,
     ) -> dict:
-        """Add a feature to the available_features catalog."""
-        body: dict[str, Any] = {"ticker": ticker, "source": source, "is_asset": is_asset, "frequency": frequency}
+        """Add a feature to the available_features catalog with validation and auto-enrichment."""
+        body: dict[str, Any] = {"ticker": ticker, "source": source, "frequency": frequency}
         if display_name:
             body["display_name"] = display_name
         if description:
             body["description"] = description
         if category:
             body["category"] = category
+        if is_asset is not None:
+            body["is_asset"] = is_asset
         if data_type:
             body["data_type"] = data_type
         if units:
             body["units"] = units
         if metadata:
             body["metadata"] = metadata
+        if skip_validation:
+            body["skip_validation"] = True
         return await self._post("/features/available", json=body)
 
     async def refresh_feature_data(self, tickers: list[str]) -> dict:

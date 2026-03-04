@@ -327,6 +327,8 @@ async def search_features(
     description=(
         "Add a ticker to the feature catalog so it can be used in portfolios or conditioning sets. "
         "Specify source ('yahoo' for stocks/ETFs/futures, 'fred' for rates/economic indicators). "
+        "Validates the ticker exists on the source API and auto-populates metadata "
+        "(display_name, category, units, etc.) from the API response. "
         "Set is_asset=true for assets that go into portfolios, false for conditioning factors. "
         "After adding, call refresh_feature_data to populate its historical data."
     ),
@@ -334,12 +336,13 @@ async def search_features(
 async def add_feature(
     ticker: Annotated[str, Field(description="Ticker symbol (e.g. 'AAPL', 'DFF', 'CL=F')")],
     source: Annotated[str, Field(description="Data source: 'yahoo' (stocks, ETFs, futures) or 'fred' (rates, economic)")],
-    display_name: Annotated[str | None, Field(description="Human-readable name (e.g. 'Apple Inc.')", default=None)] = None,
+    display_name: Annotated[str | None, Field(description="Human-readable name (e.g. 'Apple Inc.'). Auto-detected if omitted.", default=None)] = None,
     description: Annotated[str | None, Field(description="Brief description", default=None)] = None,
-    category: Annotated[str | None, Field(description="Category: equity, rates, fx, commodity, volatility, economic, etc.", default=None)] = None,
-    is_asset: Annotated[bool, Field(description="True for portfolio assets, False for conditioning factors", default=False)] = False,
-    data_type: Annotated[str | None, Field(description="Data type: price, rate, index, level", default=None)] = None,
-    units: Annotated[str | None, Field(description="Units (e.g. 'USD', 'percent', 'index')", default=None)] = None,
+    category: Annotated[str | None, Field(description="Category: equity, rates, fx, commodity, volatility, economic, etc. Auto-detected if omitted.", default=None)] = None,
+    is_asset: Annotated[bool | None, Field(description="True for portfolio assets, False for conditioning factors. Auto-detected if omitted.", default=None)] = None,
+    data_type: Annotated[str | None, Field(description="Data type: price, rate, index, level. Auto-detected if omitted.", default=None)] = None,
+    units: Annotated[str | None, Field(description="Units (e.g. 'USD', 'percent', 'index'). Auto-detected if omitted.", default=None)] = None,
+    skip_validation: Annotated[bool, Field(description="Skip ticker validation against source API", default=False)] = False,
 ) -> str:
     if err := _require_auth():
         return err
@@ -348,14 +351,17 @@ async def add_feature(
         result = await client.add_feature(
             ticker=ticker, source=source, display_name=display_name,
             description=description, category=category, is_asset=is_asset,
-            data_type=data_type, units=units,
+            data_type=data_type, units=units, skip_validation=skip_validation,
         )
         return _fmt({
             "id": result.get("id"),
             "ticker": result.get("ticker"),
             "display_name": result.get("display_name"),
-            "source": result.get("source"),
+            "category": result.get("category"),
             "is_asset": result.get("is_asset"),
+            "data_type": result.get("data_type"),
+            "units": result.get("units"),
+            "source": result.get("source"),
             "message": f"Feature '{ticker}' added to catalog. Call refresh_feature_data to populate historical data.",
         })
     except SablierAPIError as e:
