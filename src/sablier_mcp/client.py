@@ -423,14 +423,17 @@ class SablierClient:
     async def train_batch(
         self,
         model_group_id: str,
+        use_baseline: bool = True,
+        baseline_set_id: str | None = None,
     ) -> dict:
         """Batch train all models in a group. Synchronous — returns results directly."""
-        return await self._post_long(
-            "/moment/train/batch",
-            json={
-                "model_group_id": model_group_id,
-            },
-        )
+        body: dict = {
+            "model_group_id": model_group_id,
+            "use_baseline": use_baseline,
+        }
+        if baseline_set_id:
+            body["baseline_set_id"] = baseline_set_id
+        return await self._post_long("/moment/train/batch", json=body)
 
     # ──────────────────────────────────────────────
     # Simulation — Betas (Moment — synchronous)

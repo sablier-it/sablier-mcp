@@ -204,19 +204,23 @@ def _flatten_betas(results: dict) -> dict:
     stds_list = factor_stats.get("factor_stds", [])
     means_raw_list = factor_stats.get("factor_means_raw", [])
     stds_raw_list = factor_stats.get("factor_stds_raw", [])
+    last_values_list = factor_stats.get("factor_last_values_raw", [])
 
     factor_means = dict(zip(factor_names, means_list)) if means_list else {}
     factor_stds = dict(zip(factor_names, stds_list)) if stds_list else {}
     factor_means_raw = dict(zip(factor_names, means_raw_list)) if means_raw_list else {}
     factor_stds_raw = dict(zip(factor_names, stds_raw_list)) if stds_raw_list else {}
+    factor_last_values_raw = dict(zip(factor_names, last_values_list)) if last_values_list else {}
 
     return {
         "conditioning_features": features,
         "assets": assets,
+        "factor_last_values_raw": factor_last_values_raw,
         "factor_means_raw": factor_means_raw,
         "factor_stds_raw": factor_stds_raw,
         "factor_means": factor_means,
         "factor_stds": factor_stds,
+        "factor_last_date": factor_stats.get("factor_last_date"),
     }
 
 
@@ -1266,8 +1270,8 @@ def _format_validation_results(model_group_id: str, result: dict) -> str:
         "Run a what-if scenario — this is the PRIMARY tool for stress-testing a portfolio. "
         "Requires simulation_batch_id from analyze_quantitative or simulate_betas. "
         "Pass ALL conditioning_features as absolute price levels in the factors dict. "
-        "Use factor_means_raw from the betas output as current baseline, then compute targets "
-        "(e.g. to shock SPY -5% from 633: pass {'US Market': 601.35}). "
+        "Use factor_last_values_raw from the betas output as current baseline, then compute targets "
+        "(e.g. to shock SPY -5% from current 633: pass {'US Market': 601.35}). "
         "Returns per-asset expected returns, VaR, Expected Shortfall, and return distribution."
     ),
     annotations=ToolAnnotations(openWorldHint=True),
@@ -1277,7 +1281,7 @@ async def simulate_returns(
     factors: Annotated[dict[str, float], Field(
         description=(
             "Absolute target price levels for each factor. "
-            "Use factor_means_raw from betas output as current levels, "
+            "Use factor_last_values_raw from betas output as current levels, "
             "then compute target (e.g. US Market -5%: 682.39 * 0.95 = 648.27). "
             "Keys must match conditioning_features exactly."
         )
@@ -1514,16 +1518,19 @@ async def clone_scenario(
     name="analyze_quantitative",
     description=(
         "One-shot quantitative analysis: builds factor models, trains, and computes asset sensitivities to "
-        "market drivers. Pass either portfolio_id or tickers directly (auto-creates portfolio with equal weights). "
-        "Requires conditioning_set_id from list_feature_set_templates or create_feature_set. "
+        "market drivers. Uses a two-layer conditioning architecture: a thematic layer (conditioning_set_id, required) "
+        "and an optional baseline layer (baseline_set_id) that absorbs common market variance before thematic factors. "
+        "Pass either portfolio_id or tickers directly (auto-creates portfolio with equal weights). "
         "Returns factor exposures, simulation_batch_id for use with simulate_returns."
     ),
 )
 async def analyze_quantitative(
-    conditioning_set_id: Annotated[str, Field(description="UUID of the conditioning set (from list_feature_set_templates or create_feature_set)")],
+    conditioning_set_id: Annotated[str, Field(description="UUID of the thematic conditioning set (from list_feature_set_templates or create_feature_set)")],
     portfolio_id: Annotated[str | None, Field(description="UUID of an existing portfolio. If omitted, provide tickers instead.", default=None)] = None,
     tickers: Annotated[list[str] | None, Field(description="Tickers to analyze (e.g. ['AAPL', 'MSFT']). Auto-creates a portfolio if portfolio_id is not given.", default=None)] = None,
     weights: Annotated[list[float] | None, Field(description="Optional weights for tickers (must sum to 1.0). Defaults to equal weights.", default=None)] = None,
+    use_baseline: Annotated[bool, Field(description="Include baseline factors (Market, Value, Growth, etc.) to absorb common variance. Default True.", default=True)] = True,
+    baseline_set_id: Annotated[str | None, Field(description="UUID of a custom baseline conditioning set. If omitted, uses the System default baseline. Only used when use_baseline=True.", default=None)] = None,
 ) -> list | str:
     if err := _require_auth():
         return err
@@ -1565,6 +1572,8 @@ async def analyze_quantitative(
         # Step 2: Train (synchronous — Moment returns results directly)
         train_result = await _retry_api_call(lambda: client.train_batch(
             model_group_id=model_group_id,
+            use_baseline=use_baseline,
+            baseline_set_id=baseline_set_id,
         ))
         if train_result.get("status") == "failed" or train_result.get("failed", 0) == train_result.get("total", 0):
             return _fmt({
@@ -1601,7 +1610,7 @@ async def analyze_quantitative(
                 "To run a what-if scenario, call simulate_returns with simulation_batch_id "
                 f"and a factors dict containing ALL of these at your desired levels: "
                 f"{', '.join(flat.get('conditioning_features', []))}. "
-                "Use factor_means_raw above as current baseline values. "
+                "Use factor_last_values_raw above as current baseline values. "
                 "To save a scenario template for later, use create_scenario."
             ),
         }
