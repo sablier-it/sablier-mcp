@@ -425,11 +425,13 @@ class SablierClient:
         model_group_id: str,
         use_baseline: bool = True,
         baseline_set_id: str | None = None,
+        nonlinear: bool = True,
     ) -> dict:
         """Batch train all models in a group. Synchronous — returns results directly."""
         body: dict = {
             "model_group_id": model_group_id,
             "use_baseline": use_baseline,
+            "nonlinear": nonlinear,
         }
         if baseline_set_id:
             body["baseline_set_id"] = baseline_set_id
