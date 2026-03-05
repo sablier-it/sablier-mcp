@@ -253,10 +253,39 @@ class SablierClient:
         self, portfolio_id: str, simulation_batch_id: str,
         objective: str = "max_sharpe",
     ) -> dict:
-        """Find optimal portfolio weights."""
+        """Find optimal portfolio weights.
+
+        Resolves simulation_batch_id to per-asset beta_simulation_ids,
+        then calls the analytical beta-based optimization endpoint.
+        """
+        # Resolve batch → per-asset simulation IDs
+        batch = await self.get_betas_batch_results(simulation_batch_id)
+        per_asset = batch.get("per_asset_results", {})
+        beta_sim_ids = {}
+        for asset_name, asset_data in per_asset.items():
+            sid = asset_data.get("simulation_id")
+            if sid:
+                beta_sim_ids[asset_name] = sid
+
+        if not beta_sim_ids:
+            raise ValueError(
+                f"No per-asset simulation IDs found in batch {simulation_batch_id}"
+            )
+
+        # Map objective names to analytical variants
+        obj_map = {
+            "max_sharpe": "analytical_max_sharpe",
+            "min_variance": "analytical_min_variance",
+            "max_return": "analytical_mean_variance",
+        }
+        api_objective = obj_map.get(objective, objective)
+
         return await self._post(
             f"/portfolios/{portfolio_id}/optimize",
-            json={"simulation_batch_id": simulation_batch_id, "objective": objective},
+            json={
+                "beta_simulation_ids": beta_sim_ids,
+                "objective": api_objective,
+            },
         )
 
     async def get_efficient_frontier(
