@@ -507,7 +507,7 @@ class SablierClient:
         body: dict[str, Any] = {
             "model_id": model_id,
             "name": name,
-            "specs": specs,
+            "factor_values": specs,
         }
         if description:
             body["description"] = description
@@ -526,6 +526,9 @@ class SablierClient:
 
     async def update_scenario(self, scenario_id: str, **fields: Any) -> dict:
         """Update a scenario. Pass only the fields to change."""
+        # Remap MCP 'specs' to backend 'factor_values'
+        if "specs" in fields:
+            fields["factor_values"] = fields.pop("specs")
         return await self._request("PATCH", f"/scenarios/{scenario_id}", json=fields)
 
     async def delete_scenario(self, scenario_id: str) -> dict:
@@ -533,6 +536,10 @@ class SablierClient:
 
     async def clone_scenario(self, scenario_id: str) -> dict:
         return await self._post(f"/scenarios/{scenario_id}/clone")
+
+    async def run_scenario(self, scenario_id: str) -> dict:
+        """Run a scenario through its pipeline (Moment sync, Flow async)."""
+        return await self._post_long(f"/scenarios/{scenario_id}/run")
 
     # ──────────────────────────────────────────────
     # Validation (Moment — synchronous)

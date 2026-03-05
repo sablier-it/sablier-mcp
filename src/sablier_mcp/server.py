@@ -1587,6 +1587,71 @@ async def clone_scenario(
         return _api_error(e)
 
 
+@server.tool(
+    name="run_scenario",
+    description=(
+        "Run a saved scenario through its pipeline. For Moment scenarios (with factor_values): "
+        "synchronously computes factor exposures and simulates returns under the stressed factors. "
+        "For Flow scenarios (with or without constraints): queues an async GPU job. "
+        "Returns completed results for Moment, or a job_id to poll for Flow."
+    ),
+    annotations=ToolAnnotations(openWorldHint=True),
+)
+async def run_scenario(
+    scenario_id: Annotated[str, Field(description="UUID of the scenario to run")],
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(scenario_id, "scenario_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.run_scenario(scenario_id)
+        run_type = result.get("run_type", "unknown")
+        status = result.get("status", "unknown")
+
+        if run_type == "moment" and status == "completed":
+            # Format Moment results with per-asset risk metrics
+            per_asset = result.get("per_asset_results", {})
+            formatted = {}
+            for asset_id, data in per_asset.items():
+                if data.get("status") != "completed":
+                    formatted[asset_id] = {"status": data.get("status"), "error": data.get("error")}
+                    continue
+                summary = data.get("summary", [{}])
+                s = summary[0] if summary else {}
+                formatted[asset_id] = {
+                    "expected_return": s.get("expected"),
+                    "mean": s.get("mean"),
+                    "std": s.get("std"),
+                    "VaR_95": s.get("VaR_95"),
+                    "ES_95": s.get("ES_95"),
+                }
+            return _fmt({
+                "scenario_id": result["scenario_id"],
+                "run_type": "moment",
+                "status": "completed",
+                "simulation_batch_id": result.get("simulation_batch_id"),
+                "returns_batch_id": result.get("returns_batch_id"),
+                "per_asset_risk": formatted,
+            })
+        elif run_type == "flow":
+            return _fmt({
+                "scenario_id": result["scenario_id"],
+                "run_type": "flow",
+                "status": status,
+                "job_id": result.get("job_id"),
+                "message": (
+                    "Flow scenario job submitted. Use get_flow_job_status with "
+                    "job_type='generate' to check progress and get results."
+                ),
+            })
+        else:
+            return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
 # ══════════════════════════════════════════════════
 # Full Analysis Orchestrator
 # ══════════════════════════════════════════════════
