@@ -151,26 +151,31 @@ class SablierClient:
         display_name: str | None = None,
         description: str | None = None,
         category: str | None = None,
-        is_asset: bool = False,
+        is_asset: bool | None = None,
         data_type: str | None = None,
         units: str | None = None,
         frequency: str = "daily",
         metadata: dict | None = None,
+        skip_validation: bool = False,
     ) -> dict:
-        """Add a feature to the available_features catalog."""
-        body: dict[str, Any] = {"ticker": ticker, "source": source, "is_asset": is_asset, "frequency": frequency}
+        """Add a feature to the available_features catalog with validation and auto-enrichment."""
+        body: dict[str, Any] = {"ticker": ticker, "source": source, "frequency": frequency}
         if display_name:
             body["display_name"] = display_name
         if description:
             body["description"] = description
         if category:
             body["category"] = category
+        if is_asset is not None:
+            body["is_asset"] = is_asset
         if data_type:
             body["data_type"] = data_type
         if units:
             body["units"] = units
         if metadata:
             body["metadata"] = metadata
+        if skip_validation:
+            body["skip_validation"] = True
         return await self._post("/features/available", json=body)
 
     async def refresh_feature_data(self, tickers: list[str]) -> dict:
@@ -248,10 +253,39 @@ class SablierClient:
         self, portfolio_id: str, simulation_batch_id: str,
         objective: str = "max_sharpe",
     ) -> dict:
-        """Find optimal portfolio weights."""
+        """Find optimal portfolio weights.
+
+        Resolves simulation_batch_id to per-asset beta_simulation_ids,
+        then calls the analytical beta-based optimization endpoint.
+        """
+        # Resolve batch → per-asset simulation IDs
+        batch = await self.get_betas_batch_results(simulation_batch_id)
+        per_asset = batch.get("per_asset_results", {})
+        beta_sim_ids = {}
+        for asset_name, asset_data in per_asset.items():
+            sid = asset_data.get("simulation_id")
+            if sid:
+                beta_sim_ids[asset_name] = sid
+
+        if not beta_sim_ids:
+            raise ValueError(
+                f"No per-asset simulation IDs found in batch {simulation_batch_id}"
+            )
+
+        # Map objective names to analytical variants
+        obj_map = {
+            "max_sharpe": "analytical_max_sharpe",
+            "min_variance": "analytical_min_variance",
+            "max_return": "analytical_mean_variance",
+        }
+        api_objective = obj_map.get(objective, objective)
+
         return await self._post(
             f"/portfolios/{portfolio_id}/optimize",
-            json={"simulation_batch_id": simulation_batch_id, "objective": objective},
+            json={
+                "beta_simulation_ids": beta_sim_ids,
+                "objective": api_objective,
+            },
         )
 
     async def get_efficient_frontier(
@@ -381,6 +415,36 @@ class SablierClient:
     async def list_feature_set_templates(self) -> list[dict]:
         return await self._get("/feature-sets/templates")
 
+    async def list_all_feature_sets(self, set_type: str | None = None) -> dict:
+        """List all accessible feature sets (user's own + shared templates)."""
+        params: dict[str, Any] = {}
+        if set_type:
+            params["set_type"] = set_type
+        return await self._get("/feature-sets/all", params=params)
+
+    async def create_feature_set(
+        self,
+        name: str,
+        features: list[dict],
+        description: str = "",
+        set_type: str = "conditioning",
+    ) -> dict:
+        """Create a custom feature set (conditioning or target)."""
+        return await self._post("/feature-sets", json={
+            "name": name,
+            "set_type": set_type,
+            "features": features,
+            "description": description,
+        })
+
+    async def get_feature_set(self, feature_set_id: str) -> dict:
+        """Get details of a specific feature set."""
+        return await self._get(f"/feature-sets/{feature_set_id}")
+
+    async def delete_feature_set(self, feature_set_id: str) -> dict:
+        """Delete a feature set."""
+        return await self._delete(f"/feature-sets/{feature_set_id}")
+
     # ──────────────────────────────────────────────
     # Training (Moment — synchronous, returns results directly)
     # ──────────────────────────────────────────────
@@ -388,14 +452,19 @@ class SablierClient:
     async def train_batch(
         self,
         model_group_id: str,
+        use_baseline: bool = True,
+        baseline_set_id: str | None = None,
+        nonlinear: bool = True,
     ) -> dict:
         """Batch train all models in a group. Synchronous — returns results directly."""
-        return await self._post_long(
-            "/moment/train/batch",
-            json={
-                "model_group_id": model_group_id,
-            },
-        )
+        body: dict = {
+            "model_group_id": model_group_id,
+            "use_baseline": use_baseline,
+            "nonlinear": nonlinear,
+        }
+        if baseline_set_id:
+            body["baseline_set_id"] = baseline_set_id
+        return await self._post_long("/moment/train/batch", json=body)
 
     # ──────────────────────────────────────────────
     # Simulation — Betas (Moment — synchronous)
@@ -467,7 +536,7 @@ class SablierClient:
         body: dict[str, Any] = {
             "model_id": model_id,
             "name": name,
-            "specs": specs,
+            "factor_values": specs,
         }
         if description:
             body["description"] = description
@@ -486,6 +555,9 @@ class SablierClient:
 
     async def update_scenario(self, scenario_id: str, **fields: Any) -> dict:
         """Update a scenario. Pass only the fields to change."""
+        # Remap MCP 'specs' to backend 'factor_values'
+        if "specs" in fields:
+            fields["factor_values"] = fields.pop("specs")
         return await self._request("PATCH", f"/scenarios/{scenario_id}", json=fields)
 
     async def delete_scenario(self, scenario_id: str) -> dict:
@@ -493,6 +565,10 @@ class SablierClient:
 
     async def clone_scenario(self, scenario_id: str) -> dict:
         return await self._post(f"/scenarios/{scenario_id}/clone")
+
+    async def run_scenario(self, scenario_id: str) -> dict:
+        """Run a scenario through its pipeline (Moment sync, Flow async)."""
+        return await self._post_long(f"/scenarios/{scenario_id}/run")
 
     # ──────────────────────────────────────────────
     # Validation (Moment — synchronous)
@@ -616,6 +692,26 @@ class SablierClient:
     async def flow_get_results(self, job_id: str) -> dict:
         return await self._get(f"/flow/{job_id}/results")
 
+    async def flow_validate(
+        self,
+        model_group_id: str,
+        n_paths: int = 500,
+        horizon: int | None = None,
+    ) -> dict:
+        body: dict = {
+            "model_group_id": model_group_id,
+            "n_paths": n_paths,
+        }
+        if horizon is not None:
+            body["horizon"] = horizon
+        return await self._post("/flow/validate", json=body)
+
+    async def flow_validate_status(self, job_id: str) -> dict:
+        return await self._get(f"/flow/validate/{job_id}/status")
+
+    async def flow_validate_results(self, job_id: str) -> dict:
+        return await self._get(f"/flow/validate/{job_id}/results")
+
     async def poll_flow_job(
         self, job_id: str, status_path: str, timeout: float = MAX_POLL_TIME
     ) -> dict:
@@ -629,6 +725,25 @@ class SablierClient:
             await asyncio.sleep(POLL_INTERVAL)
             elapsed += POLL_INTERVAL
         return result
+
+    # ──────────────────────────────────────────────
+    # User API Keys (third-party: FRED, Finnhub)
+    # ──────────────────────────────────────────────
+
+    async def set_user_api_key(self, provider: str, api_key: str, name: str | None = None) -> dict:
+        """Create or update a user's third-party API key."""
+        body: dict = {"provider": provider, "api_key": api_key}
+        if name:
+            body["name"] = name
+        return await self._post("/user-api-keys", json=body)
+
+    async def list_user_api_keys(self) -> dict:
+        """List the user's stored third-party API keys (no secrets returned)."""
+        return await self._get("/user-api-keys")
+
+    async def delete_user_api_key(self, provider: str) -> dict:
+        """Delete a user's third-party API key by provider."""
+        return await self._delete(f"/user-api-keys/{provider}")
 
     # ──────────────────────────────────────────────
     # Tests

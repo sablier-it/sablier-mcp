@@ -31,6 +31,7 @@ from sablier_mcp.auth import SablierOAuthProvider, current_sablier_token, login_
 from sablier_mcp.client import SablierClient, SablierAPIError
 from sablier_mcp.widgets import (
     betas_heatmap,
+    flow_fan_chart,
     grain_score_card,
     portfolio_overview,
 )
@@ -203,20 +204,27 @@ def _flatten_betas(results: dict) -> dict:
     stds_list = factor_stats.get("factor_stds", [])
     means_raw_list = factor_stats.get("factor_means_raw", [])
     stds_raw_list = factor_stats.get("factor_stds_raw", [])
+    last_values_list = factor_stats.get("factor_last_values_raw", [])
 
     factor_means = dict(zip(factor_names, means_list)) if means_list else {}
     factor_stds = dict(zip(factor_names, stds_list)) if stds_list else {}
     factor_means_raw = dict(zip(factor_names, means_raw_list)) if means_raw_list else {}
     factor_stds_raw = dict(zip(factor_names, stds_raw_list)) if stds_raw_list else {}
+    factor_last_values_raw = dict(zip(factor_names, last_values_list)) if last_values_list else {}
 
-    return {
+    out = {
         "conditioning_features": features,
         "assets": assets,
+        "factor_last_values_raw": factor_last_values_raw,
         "factor_means_raw": factor_means_raw,
         "factor_stds_raw": factor_stds_raw,
         "factor_means": factor_means,
         "factor_stds": factor_stds,
+        "factor_last_date": factor_stats.get("factor_last_date"),
     }
+    if results.get("collinear_groups"):
+        out["collinear_groups"] = results["collinear_groups"]
+    return out
 
 
 async def _ensure_portfolio(
@@ -298,7 +306,7 @@ async def search_features(
         return err
     try:
         client = get_client()
-        results = await client.search_features(query, is_asset=is_asset, limit=limit)
+        results = await client.search_features(query, is_asset=is_asset, limit=limit)  # source filter available via client
         summary = []
         for f in results:
             entry = {
@@ -317,6 +325,76 @@ async def search_features(
 
 
 # ══════════════════════════════════════════════════
+# User API Keys (third-party services)
+# ══════════════════════════════════════════════════
+
+
+@server.tool(
+    name="set_api_key",
+    description=(
+        "Store a user's API key for a third-party data provider (FRED, Finnhub). "
+        "Keys are encrypted at rest. Required before using FRED features — "
+        "get a free FRED key at https://fred.stlouisfed.org/docs/api/api_key.html"
+    ),
+)
+async def set_api_key(
+    provider: Annotated[str, Field(description="Provider name: 'fred' or 'finnhub'")],
+    api_key: Annotated[str, Field(description="The API key to store (will be encrypted)")],
+) -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        result = await client.set_user_api_key(provider=provider, api_key=api_key)
+        return _fmt({
+            "status": "success",
+            "provider": provider,
+            "message": f"API key for {provider} stored successfully. You can now use {provider} data sources.",
+        })
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="list_api_keys",
+    description="List the user's stored third-party API keys (providers only, no secrets shown).",
+    annotations=ToolAnnotations(readOnlyHint=True),
+)
+async def list_api_keys() -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        result = await client.list_user_api_keys()
+        keys = result.get("keys", [])
+        if not keys:
+            return _fmt({"message": "No API keys stored. Use set_api_key to add one.", "keys": []})
+        return _fmt({
+            "keys": [{"provider": k["provider"], "name": k.get("name"), "created_at": k.get("created_at")} for k in keys],
+            "total": result.get("total", len(keys)),
+        })
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="delete_api_key",
+    description="Delete a user's stored API key for a third-party provider.",
+)
+async def delete_api_key(
+    provider: Annotated[str, Field(description="Provider to remove: 'fred' or 'finnhub'")],
+) -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        result = await client.delete_user_api_key(provider=provider)
+        return _fmt({"status": "success", "message": f"API key for {provider} deleted."})
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+# ══════════════════════════════════════════════════
 # Feature Catalog Management
 # ══════════════════════════════════════════════════
 
@@ -326,6 +404,8 @@ async def search_features(
     description=(
         "Add a ticker to the feature catalog so it can be used in portfolios or conditioning sets. "
         "Specify source ('yahoo' for stocks/ETFs/futures, 'fred' for rates/economic indicators). "
+        "Validates the ticker exists on the source API and auto-populates metadata "
+        "(display_name, category, units, etc.) from the API response. "
         "Set is_asset=true for assets that go into portfolios, false for conditioning factors. "
         "After adding, call refresh_feature_data to populate its historical data."
     ),
@@ -333,12 +413,13 @@ async def search_features(
 async def add_feature(
     ticker: Annotated[str, Field(description="Ticker symbol (e.g. 'AAPL', 'DFF', 'CL=F')")],
     source: Annotated[str, Field(description="Data source: 'yahoo' (stocks, ETFs, futures) or 'fred' (rates, economic)")],
-    display_name: Annotated[str | None, Field(description="Human-readable name (e.g. 'Apple Inc.')", default=None)] = None,
+    display_name: Annotated[str | None, Field(description="Human-readable name (e.g. 'Apple Inc.'). Auto-detected if omitted.", default=None)] = None,
     description: Annotated[str | None, Field(description="Brief description", default=None)] = None,
-    category: Annotated[str | None, Field(description="Category: equity, rates, fx, commodity, volatility, economic, etc.", default=None)] = None,
-    is_asset: Annotated[bool, Field(description="True for portfolio assets, False for conditioning factors", default=False)] = False,
-    data_type: Annotated[str | None, Field(description="Data type: price, rate, index, level", default=None)] = None,
-    units: Annotated[str | None, Field(description="Units (e.g. 'USD', 'percent', 'index')", default=None)] = None,
+    category: Annotated[str | None, Field(description="Category: equity, rates, fx, commodity, volatility, economic, etc. Auto-detected if omitted.", default=None)] = None,
+    is_asset: Annotated[bool | None, Field(description="True for portfolio assets, False for conditioning factors. Auto-detected if omitted.", default=None)] = None,
+    data_type: Annotated[str | None, Field(description="Data type: price, rate, index, level. Auto-detected if omitted.", default=None)] = None,
+    units: Annotated[str | None, Field(description="Units (e.g. 'USD', 'percent', 'index'). Auto-detected if omitted.", default=None)] = None,
+    skip_validation: Annotated[bool, Field(description="Skip ticker validation against source API", default=False)] = False,
 ) -> str:
     if err := _require_auth():
         return err
@@ -347,14 +428,17 @@ async def add_feature(
         result = await client.add_feature(
             ticker=ticker, source=source, display_name=display_name,
             description=description, category=category, is_asset=is_asset,
-            data_type=data_type, units=units,
+            data_type=data_type, units=units, skip_validation=skip_validation,
         )
         return _fmt({
             "id": result.get("id"),
             "ticker": result.get("ticker"),
             "display_name": result.get("display_name"),
-            "source": result.get("source"),
+            "category": result.get("category"),
             "is_asset": result.get("is_asset"),
+            "data_type": result.get("data_type"),
+            "units": result.get("units"),
+            "source": result.get("source"),
             "message": f"Feature '{ticker}' added to catalog. Call refresh_feature_data to populate historical data.",
         })
     except SablierAPIError as e:
@@ -499,6 +583,9 @@ async def create_portfolio(
         return err
     if len(tickers) != len(weights):
         return "Error: tickers and weights must have the same length"
+    weight_sum = sum(weights)
+    if abs(weight_sum - 1.0) > 0.01:
+        return f"Error: weights must sum to 1.0 (got {weight_sum:.4f})"
 
     try:
         assets = [{"ticker": t, "weight": w} for t, w in zip(tickers, weights)]
@@ -899,6 +986,25 @@ async def get_grain_analysis(
         return _api_error(e)
 
 
+@server.tool(
+    name="delete_grain_analysis",
+    description="Delete a saved GRAIN qualitative analysis by ID. This cannot be undone.",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True),
+)
+async def delete_grain_analysis(
+    analysis_id: Annotated[str, Field(description="The analysis UUID to delete")],
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(analysis_id, "analysis_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.delete_grain_analysis(analysis_id)
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
 
 # ══════════════════════════════════════════════════
 # Models
@@ -952,6 +1058,120 @@ async def list_feature_set_templates() -> str:
         client = get_client()
         templates = await client.list_feature_set_templates()
         return _fmt(templates)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="create_feature_set",
+    description=(
+        "Create a custom conditioning set (or target set) from features in the catalog. "
+        "Use this to build arbitrary factor sets for analyze_quantitative instead of using pre-built templates. "
+        "Each feature needs at minimum a 'ticker' and 'source' ('YAHOO' or 'FRED'). "
+        "The display_name is auto-resolved from available_features if omitted. "
+        "Returns the conditioning_set_id that can be passed to analyze_quantitative."
+    ),
+)
+async def create_feature_set(
+    name: Annotated[str, Field(description="Name for the set (e.g. 'Custom Macro Factors')")],
+    features: Annotated[list[dict], Field(description="List of features. Each needs 'ticker' and 'source' (YAHOO/FRED). Optional: 'display_name'.")],
+    description: Annotated[str, Field(description="Optional description", default="")] = "",
+    set_type: Annotated[str, Field(description="'conditioning' (market drivers) or 'target' (assets to model)", default="conditioning")] = "conditioning",
+) -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        result = await client.create_feature_set(
+            name=name, features=features, description=description, set_type=set_type,
+        )
+        set_id = result.get("id")
+        actual_type = result.get("set_type", set_type)
+        id_key = "conditioning_set_id" if actual_type == "conditioning" else "target_set_id"
+        return _fmt({
+            id_key: set_id,
+            "name": result.get("name"),
+            "set_type": actual_type,
+            "features": [
+                {"display_name": f.get("display_name"), "ticker": f.get("ticker"), "source": f.get("source")}
+                for f in (result.get("features") or [])
+            ],
+            "message": f"Feature set '{name}' created (ID: {set_id}). "
+                       + (f"Use the {id_key} with analyze_quantitative." if actual_type == "conditioning"
+                          else "Use the target_set_id when creating portfolios."),
+        })
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="list_feature_sets",
+    description=(
+        "List all accessible feature sets: your custom sets plus shared templates. "
+        "Filter by set_type ('conditioning' or 'target'). "
+        "Use this to find conditioning_set_id values for analyze_quantitative."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True),
+)
+async def list_feature_sets(
+    set_type: Annotated[str | None, Field(description="Filter: 'conditioning' or 'target'. Omit for all.", default=None)] = None,
+) -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        result = await client.list_all_feature_sets(set_type=set_type)
+        sets = result.get("feature_sets", []) if isinstance(result, dict) else result
+        return _fmt([
+            {
+                "id": s.get("id"),
+                "name": s.get("name"),
+                "set_type": s.get("set_type"),
+                "features_count": len(s.get("features") or []),
+                "features": [f.get("display_name") or f.get("ticker") for f in (s.get("features") or [])],
+                "is_template": bool(s.get("tag")),
+            }
+            for s in sets
+        ])
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="get_feature_set",
+    description="Get detailed information about a specific feature set including all features and their configuration.",
+    annotations=ToolAnnotations(readOnlyHint=True),
+)
+async def get_feature_set(
+    feature_set_id: Annotated[str, Field(description="UUID of the feature set")],
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(feature_set_id, "feature_set_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.get_feature_set(feature_set_id)
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="delete_feature_set",
+    description="Delete a custom feature set. This is permanent and cannot be undone. Cannot delete shared templates.",
+)
+async def delete_feature_set(
+    feature_set_id: Annotated[str, Field(description="UUID of the feature set to delete")],
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(feature_set_id, "feature_set_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.delete_feature_set(feature_set_id)
+        return _fmt(result)
     except SablierAPIError as e:
         return _api_error(e)
 
@@ -1150,8 +1370,8 @@ def _format_validation_results(model_group_id: str, result: dict) -> str:
         "Run a what-if scenario — this is the PRIMARY tool for stress-testing a portfolio. "
         "Requires simulation_batch_id from analyze_quantitative or simulate_betas. "
         "Pass ALL conditioning_features as absolute price levels in the factors dict. "
-        "Use factor_means_raw from the betas output as current baseline, then compute targets "
-        "(e.g. to shock SPY -5% from 633: pass {'US Market': 601.35}). "
+        "Use factor_last_values_raw from the betas output as current baseline, then compute targets "
+        "(e.g. to shock SPY -5% from current 633: pass {'US Market': 601.35}). "
         "Returns per-asset expected returns, VaR, Expected Shortfall, and return distribution."
     ),
     annotations=ToolAnnotations(openWorldHint=True),
@@ -1161,7 +1381,7 @@ async def simulate_returns(
     factors: Annotated[dict[str, float], Field(
         description=(
             "Absolute target price levels for each factor. "
-            "Use factor_means_raw from betas output as current levels, "
+            "Use factor_last_values_raw from betas output as current levels, "
             "then compute target (e.g. US Market -5%: 682.39 * 0.95 = 648.27). "
             "Keys must match conditioning_features exactly."
         )
@@ -1389,6 +1609,71 @@ async def clone_scenario(
         return _api_error(e)
 
 
+@server.tool(
+    name="run_scenario",
+    description=(
+        "Run a saved scenario through its pipeline. For Moment scenarios (with factor_values): "
+        "synchronously computes factor exposures and simulates returns under the stressed factors. "
+        "For Flow scenarios (with or without constraints): queues an async GPU job. "
+        "Returns completed results for Moment, or a job_id to poll for Flow."
+    ),
+    annotations=ToolAnnotations(openWorldHint=True),
+)
+async def run_scenario(
+    scenario_id: Annotated[str, Field(description="UUID of the scenario to run")],
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(scenario_id, "scenario_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.run_scenario(scenario_id)
+        run_type = result.get("run_type", "unknown")
+        status = result.get("status", "unknown")
+
+        if run_type == "moment" and status == "completed":
+            # Format Moment results with per-asset risk metrics
+            per_asset = result.get("per_asset_results", {})
+            formatted = {}
+            for asset_id, data in per_asset.items():
+                if data.get("status") != "completed":
+                    formatted[asset_id] = {"status": data.get("status"), "error": data.get("error")}
+                    continue
+                summary = data.get("summary", [{}])
+                s = summary[0] if summary else {}
+                formatted[asset_id] = {
+                    "expected_return": s.get("expected"),
+                    "mean": s.get("mean"),
+                    "std": s.get("std"),
+                    "VaR_95": s.get("VaR_95"),
+                    "ES_95": s.get("ES_95"),
+                }
+            return _fmt({
+                "scenario_id": result["scenario_id"],
+                "run_type": "moment",
+                "status": "completed",
+                "simulation_batch_id": result.get("simulation_batch_id"),
+                "returns_batch_id": result.get("returns_batch_id"),
+                "per_asset_risk": formatted,
+            })
+        elif run_type == "flow":
+            return _fmt({
+                "scenario_id": result["scenario_id"],
+                "run_type": "flow",
+                "status": status,
+                "job_id": result.get("job_id"),
+                "message": (
+                    "Flow scenario job submitted. Use get_flow_job_status with "
+                    "job_type='generate' to check progress and get results."
+                ),
+            })
+        else:
+            return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
 # ══════════════════════════════════════════════════
 # Full Analysis Orchestrator
 # ══════════════════════════════════════════════════
@@ -1398,16 +1683,20 @@ async def clone_scenario(
     name="analyze_quantitative",
     description=(
         "One-shot quantitative analysis: builds factor models, trains, and computes asset sensitivities to "
-        "market drivers. Pass either portfolio_id or tickers directly (auto-creates portfolio with equal weights). "
-        "Requires conditioning_set_id from list_feature_set_templates. "
+        "market drivers. Uses a two-layer conditioning architecture: a thematic layer (conditioning_set_id, required) "
+        "and an optional baseline layer (baseline_set_id) that absorbs common market variance before thematic factors. "
+        "Pass either portfolio_id or tickers directly (auto-creates portfolio with equal weights). "
         "Returns factor exposures, simulation_batch_id for use with simulate_returns."
     ),
 )
 async def analyze_quantitative(
-    conditioning_set_id: Annotated[str, Field(description="UUID of the conditioning set (from list_feature_set_templates)")],
+    conditioning_set_id: Annotated[str, Field(description="UUID of the thematic conditioning set (from list_feature_set_templates or create_feature_set)")],
     portfolio_id: Annotated[str | None, Field(description="UUID of an existing portfolio. If omitted, provide tickers instead.", default=None)] = None,
     tickers: Annotated[list[str] | None, Field(description="Tickers to analyze (e.g. ['AAPL', 'MSFT']). Auto-creates a portfolio if portfolio_id is not given.", default=None)] = None,
     weights: Annotated[list[float] | None, Field(description="Optional weights for tickers (must sum to 1.0). Defaults to equal weights.", default=None)] = None,
+    use_baseline: Annotated[bool, Field(description="Include baseline factors (Market, Value, Growth, etc.) to absorb common variance. Default True.", default=True)] = True,
+    baseline_set_id: Annotated[str | None, Field(description="UUID of a custom baseline conditioning set. If omitted, uses the System default baseline. Only used when use_baseline=True.", default=None)] = None,
+    nonlinear: Annotated[bool, Field(description="Also fit nonlinear factor exposure model on top of linear betas, producing sensitivity curves. Requires Pro+ tier. Default True (runs if tier allows).", default=True)] = True,
 ) -> list | str:
     if err := _require_auth():
         return err
@@ -1449,6 +1738,9 @@ async def analyze_quantitative(
         # Step 2: Train (synchronous — Moment returns results directly)
         train_result = await _retry_api_call(lambda: client.train_batch(
             model_group_id=model_group_id,
+            use_baseline=use_baseline,
+            baseline_set_id=baseline_set_id,
+            nonlinear=nonlinear,
         ))
         if train_result.get("status") == "failed" or train_result.get("failed", 0) == train_result.get("total", 0):
             return _fmt({
@@ -1485,7 +1777,7 @@ async def analyze_quantitative(
                 "To run a what-if scenario, call simulate_returns with simulation_batch_id "
                 f"and a factors dict containing ALL of these at your desired levels: "
                 f"{', '.join(flat.get('conditioning_features', []))}. "
-                "Use factor_means_raw above as current baseline values. "
+                "Use factor_last_values_raw above as current baseline values. "
                 "To save a scenario template for later, use create_scenario."
             ),
         }
@@ -1652,21 +1944,65 @@ async def flow_generate_constrained_paths(
 
 
 @server.tool(
+    name="flow_validate",
+    description=(
+        "Validate a trained Flow model against real data. "
+        "Generates paths and compares them to historical distributions using "
+        "Wasserstein distance, KS tests, coverage tests, and marginal distribution checks. "
+        "Returns a quality badge (EXCELLENT/GOOD/ACCEPTABLE/POOR) and per-feature metrics. "
+        "Requires a trained Flow model (run flow_train first). "
+        "This is an async GPU job — use get_flow_job_status with job_type='validate' to check progress."
+    ),
+)
+async def flow_validate(
+    model_group_id: Annotated[str, Field(description="UUID of the model group with a trained Flow model")],
+    n_paths: Annotated[int, Field(description="Number of paths to generate for validation (default 500)", default=500)] = 500,
+    horizon: Annotated[int | None, Field(description="Validation horizon (defaults to training horizon)", default=None)] = None,
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(model_group_id, "model_group_id"):
+        return err
+    try:
+        client = get_client()
+        job = await client.flow_validate(
+            model_group_id=model_group_id,
+            n_paths=n_paths,
+            horizon=horizon,
+        )
+        job_id = job.get("job_id")
+        if not job_id:
+            return "Error: Flow validation did not return a job_id."
+
+        return _fmt({
+            "status": "submitted",
+            "job_id": job_id,
+            "model_group_id": model_group_id,
+            "message": (
+                "Flow validation job submitted. Typically takes 2-5 minutes. "
+                "Use get_flow_job_status with job_type='validate' to check progress and get results."
+            ),
+        })
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
     name="get_flow_job_status",
     description=(
-        "Check the status of a Flow job (training or generation). "
-        "Use this after flow_train, flow_generate_paths, or flow_generate_constrained_paths "
-        "to check progress and retrieve results when complete. "
+        "Check the status of a Flow job (training, generation, or validation). "
+        "Use this after flow_train, flow_generate_paths, flow_generate_constrained_paths, "
+        "or flow_validate to check progress and retrieve results when complete. "
         "Training typically takes 5-15 minutes; generation takes 1-5 minutes."
     ),
 )
 async def get_flow_job_status(
-    job_id: Annotated[str, Field(description="The job UUID returned by flow_train or flow_generate_paths")],
+    job_id: Annotated[str, Field(description="The job UUID returned by flow_train, flow_generate_paths, or flow_validate")],
     job_type: Annotated[str, Field(
-        description="Type of job: 'train' or 'generate'. Determines which status endpoint to query.",
+        description="Type of job: 'train', 'generate', or 'validate'. Determines which status endpoint to query.",
         default="train",
     )] = "train",
-) -> str:
+) -> str | list:
     if err := _require_auth():
         return err
     if err := _validate_uuid(job_id, "job_id"):
@@ -1675,9 +2011,33 @@ async def get_flow_job_status(
         client = get_client()
         if job_type == "train":
             result = await client.flow_train_status(job_id)
+            return _fmt(result)
+        elif job_type == "validate":
+            result = await client.flow_validate_results(job_id)
+            return _fmt(result)
         else:
             result = await client.flow_get_results(job_id)
-        return _fmt(result)
+            # Try to generate fan chart widget for completed generation results
+            summary = result.get("summary") or {}
+            has_ts = any(
+                isinstance(v, dict) and "timeseries" in v
+                for v in summary.values()
+            )
+            if has_ts:
+                try:
+                    chart_html = flow_fan_chart(
+                        summary,
+                        result.get("horizon", 20),
+                        result.get("constraints"),
+                    )
+                    if chart_html:
+                        logger.info(f"Fan chart generated ({len(chart_html)} chars), returning with widget")
+                        return _with_widget(_fmt(result), chart_html)
+                    else:
+                        logger.info("Fan chart returned None — no target features with timeseries")
+                except Exception:
+                    logger.warning("Fan chart generation failed, returning text-only", exc_info=True)
+            return _fmt(result)
     except SablierAPIError as e:
         return _api_error(e)
 
@@ -1790,7 +2150,7 @@ async def market_radar() -> str:
 
 
 async def _retry_api_call(coro_fn, max_retries: int = 2, delay: float = 3.0):
-    """Retry an async API call on transient server errors (5xx).
+    """Retry an async API call on transient server errors (5xx) and rate limits (429).
 
     coro_fn must be a zero-arg callable that returns a coroutine, e.g.:
         await _retry_api_call(lambda: client.train_batch(model_group_id=mgid))
@@ -1801,7 +2161,8 @@ async def _retry_api_call(coro_fn, max_retries: int = 2, delay: float = 3.0):
             return await coro_fn()
         except SablierAPIError as e:
             last_exc = e
-            if e.status_code < 500 or attempt == max_retries:
+            retryable = e.status_code >= 500 or e.status_code == 429
+            if not retryable or attempt == max_retries:
                 raise
             logger.warning("Transient %s on attempt %d/%d — retrying in %.0fs", e, attempt + 1, max_retries + 1, delay)
             await asyncio.sleep(delay)

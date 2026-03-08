@@ -486,3 +486,190 @@ def training_progress(data: dict[str, Any]) -> str:
     </div>"""
 
     return _wrap("Training Progress", body)
+
+
+# ── Flow Fan Chart ────────────────────────────────────────────
+
+
+def flow_fan_chart(
+    summary: dict[str, Any],
+    horizon: int,
+    constraints: list[dict] | None = None,
+) -> str | None:
+    """Render inline SVG fan charts for Flow path generation results.
+
+    Shows per-asset percentile bands (p5/p25/p50/p75/p95) as a fan chart.
+    Only displays target assets (not conditioning factors). Returns None if
+    no target features have timeseries data.
+    """
+    # Collect features with timeseries data, preferring target assets
+    all_with_ts: list[tuple[str, dict]] = []
+    targets_only: list[tuple[str, dict]] = []
+    for name, data in summary.items():
+        if not isinstance(data, dict):
+            continue
+        ts = data.get('timeseries')
+        if not ts or 'p50' not in ts:
+            continue
+        all_with_ts.append((name, data))
+        if data.get('feature_type') == 'target':
+            targets_only.append((name, data))
+
+    # Prefer target assets; fall back to all features if none marked as target
+    panels = targets_only if targets_only else all_with_ts
+    if not panels:
+        return None
+
+    # Limit to 6 panels
+    panels = panels[:6]
+
+    # Build constraint lookup: feature_name -> list of {lower, upper}
+    constraint_map: dict[str, list[dict]] = {}
+    for c in (constraints or []):
+        fn = c.get('feature_name', '')
+        constraint_map.setdefault(fn, []).append(c)
+
+    # SVG dimensions
+    svg_w, svg_h = 380, 180
+    pad_l, pad_r, pad_t, pad_b = 55, 15, 30, 25  # left, right, top, bottom
+    plot_w = svg_w - pad_l - pad_r
+    plot_h = svg_h - pad_t - pad_b
+
+    cards_html = []
+    for name, data in panels:
+        ts = data['timeseries']
+        p5 = ts['p5']
+        p25 = ts['p25']
+        p50 = ts['p50']
+        p75 = ts['p75']
+        p95 = ts['p95']
+        last_price = data.get('last_price', 0)
+        mean_ret = data.get('mean_return', 0)
+        n_pts = len(p50)
+
+        # Y range: include all bands + last_price
+        all_vals = p5 + p95 + [last_price]
+        y_min = min(all_vals)
+        y_max = max(all_vals)
+        y_pad = (y_max - y_min) * 0.08 or 1.0
+        y_min -= y_pad
+        y_max += y_pad
+        y_range = y_max - y_min if y_max != y_min else 1.0
+
+        def x(i: int) -> float:
+            return pad_l + (i / max(n_pts - 1, 1)) * plot_w
+
+        def y(v: float) -> float:
+            return pad_t + (1 - (v - y_min) / y_range) * plot_h
+
+        # Build polygon points for bands
+        def band_points(lo: list, hi: list) -> str:
+            fwd = ' '.join(f'{x(i):.1f},{y(hi[i]):.1f}' for i in range(n_pts))
+            rev = ' '.join(f'{x(i):.1f},{y(lo[i]):.1f}' for i in range(n_pts - 1, -1, -1))
+            return f'{fwd} {rev}'
+
+        # Median line points
+        med_pts = ' '.join(f'{x(i):.1f},{y(p50[i]):.1f}' for i in range(n_pts))
+
+        # Return color
+        ret_color = _GREEN if mean_ret >= 0 else _RED
+        ret_str = f'+{mean_ret:.1%}' if mean_ret >= 0 else f'{mean_ret:.1%}'
+
+        # Y-axis labels (3 ticks)
+        y_mid = (y_min + y_max) / 2
+        y_ticks = [
+            (y_max, f'${y_max:,.0f}' if y_max > 10 else f'{y_max:.2f}'),
+            (y_mid, f'${y_mid:,.0f}' if y_mid > 10 else f'{y_mid:.2f}'),
+            (y_min, f'${y_min:,.0f}' if y_min > 10 else f'{y_min:.2f}'),
+        ]
+        y_tick_svg = ''
+        for val, label in y_ticks:
+            yy = y(val)
+            y_tick_svg += (
+                f'<text x="{pad_l - 6}" y="{yy + 3:.1f}" '
+                f'text-anchor="end" fill="{_TEXT_MUTED}" font-size="9">{label}</text>'
+            )
+            # Grid line
+            y_tick_svg += (
+                f'<line x1="{pad_l}" y1="{yy:.1f}" x2="{pad_l + plot_w}" y2="{yy:.1f}" '
+                f'stroke="{_CARD_BORDER}" stroke-width="0.5"/>'
+            )
+
+        # X-axis labels
+        x_tick_svg = (
+            f'<text x="{pad_l}" y="{svg_h - 5}" fill="{_TEXT_MUTED}" font-size="9">Day 0</text>'
+            f'<text x="{pad_l + plot_w}" y="{svg_h - 5}" text-anchor="end" '
+            f'fill="{_TEXT_MUTED}" font-size="9">Day {horizon}</text>'
+        )
+
+        # Last price reference line
+        lp_y = y(last_price)
+        lp_svg = (
+            f'<line x1="{pad_l}" y1="{lp_y:.1f}" x2="{pad_l + plot_w}" y2="{lp_y:.1f}" '
+            f'stroke="{_TEXT_MUTED}" stroke-width="0.8" stroke-dasharray="4,3"/>'
+            f'<text x="{pad_l + plot_w + 2}" y="{lp_y + 3:.1f}" fill="{_TEXT_MUTED}" '
+            f'font-size="8">now</text>'
+        )
+
+        # Constraint bounds (red dashed lines)
+        constraint_svg = ''
+        for c in constraint_map.get(name, []):
+            for bound_key, label in [('lower', 'min'), ('upper', 'max')]:
+                bv = c.get(bound_key)
+                if bv is not None:
+                    by = y(float(bv))
+                    if pad_t <= by <= pad_t + plot_h:
+                        constraint_svg += (
+                            f'<line x1="{pad_l}" y1="{by:.1f}" '
+                            f'x2="{pad_l + plot_w}" y2="{by:.1f}" '
+                            f'stroke="{_RED}" stroke-width="1" stroke-dasharray="5,3"/>'
+                        )
+
+        svg = f'''<svg width="{svg_w}" height="{svg_h}" viewBox="0 0 {svg_w} {svg_h}"
+             xmlns="http://www.w3.org/2000/svg" style="display:block">
+          {y_tick_svg}
+          {x_tick_svg}
+          {lp_svg}
+          <polygon points="{band_points(p5, p95)}"
+                   fill="{_ACCENT}" fill-opacity="0.12" stroke="none"/>
+          <polygon points="{band_points(p25, p75)}"
+                   fill="{_ACCENT}" fill-opacity="0.25" stroke="none"/>
+          <polyline points="{med_pts}"
+                    fill="none" stroke="{_ACCENT}" stroke-width="2"/>
+          {constraint_svg}
+        </svg>'''
+
+        title_html = (
+            f'<div style="font-size:13px;font-weight:600;margin-bottom:4px">'
+            f'{html.escape(name)} '
+            f'<span style="color:{ret_color};font-weight:700">{ret_str}</span>'
+            f'</div>'
+        )
+
+        cards_html.append(f'<div class="card" style="padding:12px">{title_html}{svg}</div>')
+
+    # Legend
+    legend = (
+        f'<div style="display:flex;gap:16px;font-size:10px;color:{_TEXT_MUTED};margin-top:4px;margin-bottom:8px">'
+        f'<span><span style="display:inline-block;width:20px;height:8px;'
+        f'background:{_ACCENT};opacity:0.12;vertical-align:middle;margin-right:4px;border-radius:2px"></span>p5–p95</span>'
+        f'<span><span style="display:inline-block;width:20px;height:8px;'
+        f'background:{_ACCENT};opacity:0.35;vertical-align:middle;margin-right:4px;border-radius:2px"></span>p25–p75</span>'
+        f'<span><span style="display:inline-block;width:20px;height:2px;'
+        f'background:{_ACCENT};vertical-align:middle;margin-right:4px"></span>median</span>'
+        f'<span><span style="display:inline-block;width:20px;height:1px;border-top:1px dashed {_TEXT_MUTED};'
+        f'vertical-align:middle;margin-right:4px"></span>current</span>'
+        f'</div>'
+    )
+
+    # Grid layout: 2 columns
+    ncols = 2 if len(cards_html) > 1 else 1
+    grid = (
+        f'<div style="display:grid;grid-template-columns:repeat({ncols},1fr);gap:10px">'
+        + ''.join(cards_html)
+        + '</div>'
+    )
+
+    body = legend + grid
+    width = 420 * ncols + 20
+    return _wrap("Flow Path Distribution", body, width=width)
