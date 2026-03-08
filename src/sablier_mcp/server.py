@@ -986,6 +986,25 @@ async def get_grain_analysis(
         return _api_error(e)
 
 
+@server.tool(
+    name="delete_grain_analysis",
+    description="Delete a saved GRAIN qualitative analysis by ID. This cannot be undone.",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True),
+)
+async def delete_grain_analysis(
+    analysis_id: Annotated[str, Field(description="The analysis UUID to delete")],
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(analysis_id, "analysis_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.delete_grain_analysis(analysis_id)
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
 
 # ══════════════════════════════════════════════════
 # Models
