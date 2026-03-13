@@ -557,6 +557,16 @@ _LOGIN_PAGE = """<!DOCTYPE html>
     border-radius: 0.5rem;
     font-size: 0.8125rem;
   }
+  .success {
+    background: rgba(34,197,94,0.1);
+    border: 1px solid rgba(34,197,94,0.3);
+    color: #22c55e;
+    padding: 0.75rem 1rem;
+    border-radius: 0.5rem;
+    font-size: 0.8125rem;
+  }
+  .signup-fields { display: none; }
+  .signup-fields.visible { display: contents; }
   .footer {
     display: flex;
     justify-content: space-between;
@@ -570,6 +580,7 @@ _LOGIN_PAGE = """<!DOCTYPE html>
     color: #3B82F6;
     text-decoration: none;
     transition: color 0.2s ease;
+    cursor: pointer;
   }
   .footer a:hover { color: #60A5FA; text-decoration: underline; }
   .image-panel {
@@ -605,22 +616,35 @@ _LOGIN_PAGE = """<!DOCTYPE html>
       <span>Sablier</span>
     </div>
     <div>
-      <h1>Welcome back</h1>
-      <p class="subtitle">Sign in to connect your AI assistant</p>
+      <h1 id="page-title">Welcome back</h1>
+      <p class="subtitle" id="page-subtitle">Sign in to connect your AI assistant</p>
     </div>
     {{ERROR}}
+    {{SUCCESS}}
     <form method="POST" action="/login">
       <input type="hidden" name="session" value="{{SESSION}}">
+      <input type="hidden" name="mode" id="form-mode" value="{{MODE}}">
+      <div class="signup-fields" id="signup-fields">
+        <label>Full name
+          <input type="text" name="name" placeholder="John Doe" value="{{NAME}}">
+        </label>
+        <label>Company
+          <input type="text" name="company" placeholder="Acme Inc." value="{{COMPANY}}">
+        </label>
+        <label>Role
+          <input type="text" name="role" placeholder="Portfolio Manager" value="{{ROLE}}">
+        </label>
+      </div>
       <label>Email
         <input type="email" name="email" required placeholder="you@company.com" value="{{EMAIL}}">
       </label>
       <label>Password
-        <input type="password" name="password" required placeholder="Enter your password">
+        <input type="password" name="password" required placeholder="Enter your password" minlength="8">
       </label>
-      <button type="submit">Sign in</button>
+      <button type="submit" id="submit-btn">Sign in</button>
     </form>
     <div class="footer">
-      <span>Don't have an account? <a href="https://www.sablier-ai.com" target="_blank">Sign up</a></span>
+      <span id="footer-toggle">Don't have an account? <a onclick="toggleMode('signup')">Sign up</a></span>
       <a href="https://www.sablier-ai.com/" target="_blank">Explore Sablier &rarr;</a>
     </div>
   </div>
@@ -628,17 +652,184 @@ _LOGIN_PAGE = """<!DOCTYPE html>
     <img src="https://www.sablier-ai.com/landing-image.jpg" alt="Modern skyscrapers" onerror="this.style.display='none'">
   </div>
 </div>
+<script>
+function toggleMode(mode) {
+  var isSignup = mode === 'signup';
+  document.getElementById('form-mode').value = isSignup ? 'signup' : 'login';
+  document.getElementById('signup-fields').className = isSignup ? 'signup-fields visible' : 'signup-fields';
+  document.getElementById('page-title').textContent = isSignup ? 'Create your account' : 'Welcome back';
+  document.getElementById('page-subtitle').textContent = isSignup
+    ? 'Sign up to connect your AI assistant'
+    : 'Sign in to connect your AI assistant';
+  document.getElementById('submit-btn').textContent = isSignup ? 'Create account' : 'Sign in';
+  document.getElementById('footer-toggle').innerHTML = isSignup
+    ? 'Already have an account? <a onclick="toggleMode(\\'login\\')">Sign in</a>'
+    : 'Don\\'t have an account? <a onclick="toggleMode(\\'signup\\')">Sign up</a>';
+  // Toggle required on signup fields
+  var fields = document.querySelectorAll('#signup-fields input');
+  for (var i = 0; i < fields.length; i++) { fields[i].required = isSignup; }
+}
+// Restore signup mode if server re-rendered with mode=signup
+if ('{{MODE}}' === 'signup') { toggleMode('signup'); }
+</script>
 </body>
 </html>"""
 
 
-def _render_login(session_id: str, error: str = "", email: str = "") -> HTMLResponse:
-    error_html = f'<div class="error">{error}</div>' if error else ""
+def _html_escape(s: str) -> str:
+    """Escape HTML special characters to prevent XSS in attribute values."""
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#39;")
+
+
+def _render_login(
+    session_id: str,
+    error: str = "",
+    success: str = "",
+    email: str = "",
+    mode: str = "login",
+    name: str = "",
+    company: str = "",
+    role: str = "",
+) -> HTMLResponse:
+    error_html = f'<div class="error">{_html_escape(error)}</div>' if error else ""
+    success_html = f'<div class="success">{_html_escape(success)}</div>' if success else ""
     html = (
         _LOGIN_PAGE
-        .replace("{{SESSION}}", session_id)
+        .replace("{{SESSION}}", _html_escape(session_id))
         .replace("{{ERROR}}", error_html)
-        .replace("{{EMAIL}}", email)
+        .replace("{{SUCCESS}}", success_html)
+        .replace("{{EMAIL}}", _html_escape(email))
+        .replace("{{MODE}}", _html_escape(mode))
+        .replace("{{NAME}}", _html_escape(name))
+        .replace("{{COMPANY}}", _html_escape(company))
+        .replace("{{ROLE}}", _html_escape(role))
+    )
+    return HTMLResponse(html)
+
+
+_FRONTEND_URL = "https://www.sablier-ai.com"
+
+
+def _render_success_interstitial(redirect_url: str) -> HTMLResponse:
+    """Render a brief interstitial that opens the Sablier dashboard and then redirects to Claude."""
+    html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connected — Sablier</title>
+<link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    min-height: 100vh;
+    background-color: #0F1115;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2rem;
+    font-family: 'Source Sans 3', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    animation: fadeIn 0.4s ease-out;
+  }
+  .card {
+    max-width: 440px;
+    width: 100%;
+    background-color: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 1rem;
+    padding: 3rem;
+    text-align: center;
+  }
+  .check-icon {
+    width: 64px; height: 64px;
+    background: rgba(34,197,94,0.15);
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin: 0 auto 1.5rem;
+  }
+  .check-icon svg { width: 32px; height: 32px; color: #22c55e; }
+  h1 {
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: #FFFFFF;
+    margin-bottom: 0.5rem;
+  }
+  .msg {
+    font-size: 0.875rem;
+    color: #9CA3AF;
+    margin-bottom: 1.5rem;
+    line-height: 1.5;
+  }
+  .spinner {
+    width: 16px; height: 16px;
+    border: 2px solid rgba(255,255,255,0.15);
+    border-top-color: #9CA3AF;
+    border-radius: 50%;
+    display: inline-block;
+    animation: spin 0.8s linear infinite;
+    vertical-align: middle;
+    margin-left: 6px;
+  }
+  a.dashboard-link {
+    display: inline-block;
+    padding: 0.625rem 1.25rem;
+    border-radius: 0.5rem;
+    border: 1px solid rgba(255,255,255,0.1);
+    color: #FFFFFF;
+    font-size: 0.875rem;
+    font-weight: 500;
+    text-decoration: none;
+    transition: all 0.2s ease;
+    margin-bottom: 1rem;
+  }
+  a.dashboard-link:hover {
+    background-color: rgba(255,255,255,0.05);
+    border-color: rgba(255,255,255,0.15);
+  }
+  a.skip {
+    display: block;
+    font-size: 0.75rem;
+    color: #6B7280;
+    text-decoration: none;
+  }
+  a.skip:hover { color: #9CA3AF; text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="check-icon">
+    <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path>
+    </svg>
+  </div>
+  <h1>Connected!</h1>
+  <p class="msg">Your AI assistant is now linked to Sablier.<br>Returning to Claude<span class="spinner"></span></p>
+  <a class="dashboard-link" href="FRONTEND_URL" target="_blank">Open Sablier Dashboard</a>
+  <a class="skip" href="REDIRECT_URL">Skip &rarr;</a>
+</div>
+<script>
+try { window.open('FRONTEND_URL', '_blank'); } catch(e) {}
+setTimeout(function() { window.location.href = 'REDIRECT_URL'; }, 2000);
+</script>
+</body>
+</html>"""
+    # Escape redirect_url for safe embedding in HTML attributes and JS strings
+    safe_redirect = redirect_url.replace("&", "&amp;").replace("'", "&#39;").replace('"', "&quot;")
+    js_redirect = redirect_url.replace("'", "\\'")
+    html = (
+        html
+        .replace("FRONTEND_URL", _FRONTEND_URL)
+        .replace("REDIRECT_URL", safe_redirect, 1)  # href attribute
+        .replace("REDIRECT_URL", js_redirect, 1)     # JS string
     )
     return HTMLResponse(html)
 
@@ -649,7 +840,7 @@ def _render_login(session_id: str, error: str = "", email: str = "") -> HTMLResp
 
 
 async def login_page(request: Request, provider: SablierOAuthProvider) -> HTMLResponse | RedirectResponse:
-    """Handles GET (show form) and POST (process login) for /login."""
+    """Handles GET (show form) and POST (process login + signup) for /login."""
 
     if request.method == "GET":
         session_id = request.query_params.get("session", "")
@@ -657,15 +848,67 @@ async def login_page(request: Request, provider: SablierOAuthProvider) -> HTMLRe
             return HTMLResponse("<h1>Invalid or expired session</h1>", status_code=400)
         return _render_login(session_id)
 
-    # POST — process login
+    # POST — process login or signup
     form = await request.form()
     session_id = str(form.get("session", ""))
     email = str(form.get("email", ""))
     password = str(form.get("password", ""))
+    mode = str(form.get("mode", "login"))
 
     if not session_id or not provider.get_pending_session(session_id):
         return HTMLResponse("<h1>Invalid or expired session</h1>", status_code=400)
 
+    # ── Sign-up mode ──────────────────────────────
+    if mode == "signup":
+        name = str(form.get("name", "")).strip()
+        company = str(form.get("company", "")).strip()
+        role = str(form.get("role", "")).strip()
+
+        if not email or not password or not name or not company or not role:
+            return _render_login(
+                session_id, error="Please fill in all fields.", email=email,
+                mode="signup", name=name, company=company, role=role,
+            )
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as http:
+                resp = await http.post(
+                    f"{_SABLIER_API_URL}/auth/register",
+                    json={"email": email, "password": password, "name": name, "company": company, "role": role},
+                    headers={"Content-Type": "application/json"},
+                )
+
+            if resp.status_code in (200, 201):
+                return _render_login(
+                    session_id,
+                    success="Account created! Check your email to verify, then sign in here.",
+                    email=email,
+                )
+            if resp.status_code == 409:
+                return _render_login(
+                    session_id, error="An account with this email already exists. Try signing in.",
+                    email=email,
+                )
+            if resp.status_code == 422:
+                detail = resp.json().get("detail", "Invalid input. Please check your fields.")
+                if isinstance(detail, list):
+                    detail = "; ".join(d.get("msg", str(d)) for d in detail)
+                return _render_login(
+                    session_id, error=str(detail), email=email,
+                    mode="signup", name=name, company=company, role=role,
+                )
+            return _render_login(
+                session_id, error="Registration failed. Please try again.", email=email,
+                mode="signup", name=name, company=company, role=role,
+            )
+
+        except Exception:
+            return _render_login(
+                session_id, error="Could not reach Sablier. Please try again.", email=email,
+                mode="signup", name=name, company=company, role=role,
+            )
+
+    # ── Login mode ────────────────────────────────
     if not email or not password:
         return _render_login(session_id, error="Please enter both email and password.", email=email)
 
@@ -752,4 +995,5 @@ async def login_page(request: Request, provider: SablierOAuthProvider) -> HTMLRe
     if err:
         return _render_login(session_id, error=err, email=email)
 
-    return RedirectResponse(url=redirect_url, status_code=302)
+    # Show interstitial page that opens Sablier dashboard + auto-redirects to Claude
+    return _render_success_interstitial(redirect_url)
