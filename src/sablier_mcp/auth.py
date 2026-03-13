@@ -549,21 +549,22 @@ _LOGIN_PAGE = """<!DOCTYPE html>
     background-color: rgba(255,255,255,0.05);
     border-color: rgba(255,255,255,0.15);
   }
+  .error, .success {
+    padding: 0.75rem 1rem;
+    border-radius: 0.5rem;
+    font-size: 0.8125rem;
+    line-height: 1.5;
+    margin-bottom: 0.25rem;
+  }
   .error {
     background: rgba(239,68,68,0.1);
     border: 1px solid rgba(239,68,68,0.3);
     color: #ef4444;
-    padding: 0.75rem 1rem;
-    border-radius: 0.5rem;
-    font-size: 0.8125rem;
   }
   .success {
     background: rgba(34,197,94,0.1);
     border: 1px solid rgba(34,197,94,0.3);
     color: #22c55e;
-    padding: 0.75rem 1rem;
-    border-radius: 0.5rem;
-    font-size: 0.8125rem;
   }
   .signup-fields { display: none; }
   .signup-fields.visible { display: contents; }
