@@ -308,6 +308,30 @@ async def _ensure_portfolio(
     return portfolio, None
 
 
+async def _validate_conditioning_data(conditioning_set_id: str) -> str | None:
+    """Check that all features in a conditioning set have training data.
+
+    Returns an error string if any features are missing data, else None.
+    """
+    client = get_client()
+    feature_set = await client.get_feature_set(conditioning_set_id)
+
+    if feature_set.get("fetched_data_available") is False:
+        features = feature_set.get("features", [])
+        missing = [
+            f.get("ticker") or f.get("display_name")
+            for f in features
+            if isinstance(f, dict) and f.get("type") != "indicator"
+        ]
+        missing = [t for t in missing if t]
+        return (
+            f"Conditioning set has no fetched data. These features need data: {', '.join(missing)}. "
+            f"Call refresh_feature_data for each, or use a pre-built template from list_feature_set_templates."
+        )
+
+    return None
+
+
 _NOT_LOGGED_IN = (
     "Error: Not authenticated. "
     "Set the SABLIER_API_KEY environment variable to your Sablier API key. "
@@ -1774,6 +1798,10 @@ async def analyze_quantitative(
         asset_tickers = _portfolio_tickers(portfolio)
         portfolio_name = portfolio.get("name", "")
 
+        # Pre-flight: ensure conditioning set has fetched data
+        if data_err := await _validate_conditioning_data(conditioning_set_id):
+            return data_err
+
         client = get_client()
 
         # Step 1: Create models (linked to portfolio via parent_target_set_id)
@@ -2054,6 +2082,10 @@ async def generate_synthetic(
             target_set_id = portfolio.get("target_set_id")
             asset_tickers = _portfolio_tickers(portfolio)
             portfolio_name = portfolio.get("name", "")
+
+            # Pre-flight: ensure conditioning set has fetched data
+            if data_err := await _validate_conditioning_data(conditioning_set_id):
+                return data_err
 
             # Step 1: Create models (linked to portfolio via parent_target_set_id)
             create_result = await _retry_api_call(lambda: client.batch_create_models(
