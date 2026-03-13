@@ -290,10 +290,21 @@ async def _ensure_portfolio(
     if len(weights) != len(tickers):
         return {}, "Error: tickers and weights must have the same length."
 
-    # Auto-create portfolio
+    # Auto-create portfolio — reuse existing if name already taken
     name = ", ".join(tickers)
     assets = [{"ticker": t, "weight": w} for t, w in zip(tickers, weights)]
-    portfolio = await client.create_portfolio(name, assets)
+    try:
+        portfolio = await client.create_portfolio(name, assets)
+    except SablierAPIError as e:
+        if e.status_code in (409, 500) and "unique" in str(e).lower():
+            # Duplicate name — find and reuse the existing portfolio
+            all_portfolios = await client.list_portfolios()
+            items = all_portfolios.get("portfolios", all_portfolios) if isinstance(all_portfolios, dict) else all_portfolios
+            match = next((p for p in items if p.get("name") == name), None)
+            if match:
+                portfolio = await client.get_portfolio(match["id"])
+                return portfolio, None
+        raise
     return portfolio, None
 
 
