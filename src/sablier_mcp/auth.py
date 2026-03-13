@@ -884,10 +884,28 @@ async def login_page(request: Request, provider: SablierOAuthProvider) -> HTMLRe
                     success="Account created! Check your email to verify, then sign in here.",
                     email=email,
                 )
-            if resp.status_code == 409:
+            if resp.status_code in (400, 409):
+                detail = resp.json().get("detail", "")
+                if "not verified" in detail.lower():
+                    # User exists but unverified — resend verification email
+                    async with httpx.AsyncClient(timeout=30.0) as http2:
+                        await http2.post(
+                            f"{_SABLIER_API_URL}/auth/resend-verification",
+                            params={"email": email},
+                        )
+                    return _render_login(
+                        session_id,
+                        success="A verification email has been sent! Check your inbox, then sign in here.",
+                        email=email,
+                    )
+                if "already exists" in detail.lower():
+                    return _render_login(
+                        session_id, error="An account with this email already exists. Try signing in.",
+                        email=email,
+                    )
                 return _render_login(
-                    session_id, error="An account with this email already exists. Try signing in.",
-                    email=email,
+                    session_id, error=detail or "Registration failed. Please try again.",
+                    email=email, mode="signup", name=name, company=company, role=role,
                 )
             if resp.status_code == 422:
                 detail = resp.json().get("detail", "Invalid input. Please check your fields.")
