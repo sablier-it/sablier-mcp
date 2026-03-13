@@ -107,11 +107,19 @@ def _decode_stateless_token(token_str: str) -> dict | None:
         return None
 
 
-def _is_localhost_redirect(uri: str) -> bool:
-    """Only allow redirects to localhost — prevents open redirect attacks."""
+_ALLOWED_REDIRECT_HOSTS = {
+    "localhost", "127.0.0.1", "::1",        # Claude Desktop / Claude Code
+    "claude.ai", "claude.com",              # Claude.ai web app
+}
+
+
+def _is_allowed_redirect(uri: str) -> bool:
+    """Allow redirects to localhost (Desktop/Code) and Claude.ai/Claude.com (web)."""
     try:
         parsed = urllib.parse.urlparse(uri)
-        return parsed.scheme == "http" and parsed.hostname in ("localhost", "127.0.0.1", "::1")
+        if parsed.hostname in _ALLOWED_REDIRECT_HOSTS:
+            return True
+        return False
     except Exception:
         return False
 
@@ -166,7 +174,7 @@ class SablierOAuthProvider(
         # Client was registered before a server restart (in-memory state lost).
         # Reconstruct using the redirect_uri from the current /authorize request.
         redirect_uri = _pending_auth_redirect.get()
-        if not redirect_uri or not _is_localhost_redirect(redirect_uri):
+        if not redirect_uri or not _is_allowed_redirect(redirect_uri):
             return None
 
         logger.info(

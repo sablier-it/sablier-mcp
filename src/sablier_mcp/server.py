@@ -337,6 +337,7 @@ async def search_features(
         "Keys are encrypted at rest. Required before using FRED features — "
         "get a free FRED key at https://fred.stlouisfed.org/docs/api/api_key.html"
     ),
+    annotations=ToolAnnotations(destructiveHint=True),
 )
 async def set_api_key(
     provider: Annotated[str, Field(description="Provider name: 'fred' or 'finnhub'")],
@@ -381,6 +382,7 @@ async def list_api_keys() -> str:
 @server.tool(
     name="delete_api_key",
     description="Delete a user's stored API key for a third-party provider.",
+    annotations=ToolAnnotations(destructiveHint=True),
 )
 async def delete_api_key(
     provider: Annotated[str, Field(description="Provider to remove: 'fred' or 'finnhub'")],
@@ -410,6 +412,7 @@ async def delete_api_key(
         "Set is_asset=true for assets that go into portfolios, false for conditioning factors. "
         "After adding, call refresh_feature_data to populate its historical data."
     ),
+    annotations=ToolAnnotations(destructiveHint=True, openWorldHint=True),
 )
 async def add_feature(
     ticker: Annotated[str, Field(description="Ticker symbol (e.g. 'AAPL', 'DFF', 'CL=F')")],
@@ -453,6 +456,7 @@ async def add_feature(
         "For new features: full fetch from 2000. For existing: incremental update to today. "
         "Use this after add_feature, or to force-update stale data."
     ),
+    annotations=ToolAnnotations(destructiveHint=True, openWorldHint=True),
 )
 async def refresh_feature_data(
     tickers: Annotated[list[str], Field(description="Tickers to refresh (e.g. ['AAPL', 'CL=F', 'DFF'])")],
@@ -474,6 +478,7 @@ async def refresh_feature_data(
         "Examples: 20-day moving average of VIX, spread between 10Y and 2Y rates. "
         "Use list_transformations to see available transformation types."
     ),
+    annotations=ToolAnnotations(destructiveHint=True),
 )
 async def create_derived_feature(
     name: Annotated[str, Field(description="Unique name/ticker for the derived feature (e.g. 'VIX_MA20')")],
@@ -572,6 +577,7 @@ async def get_portfolio(
 @server.tool(
     name="create_portfolio",
     description="Create a new portfolio from tickers and weights. Weights must sum to 1.0. For a single asset, use weight 1.0.",
+    annotations=ToolAnnotations(destructiveHint=True),
 )
 async def create_portfolio(
     name: Annotated[str, Field(description="Portfolio name (e.g. 'Tech Portfolio')")],
@@ -617,6 +623,7 @@ async def create_portfolio(
         "Only pass the fields you want to update — omitted fields stay unchanged. "
         "Weights must sum to 1.0 if provided."
     ),
+    annotations=ToolAnnotations(destructiveHint=True),
 )
 async def update_portfolio(
     portfolio_id: Annotated[str, Field(description="The portfolio UUID")],
@@ -719,6 +726,7 @@ async def get_asset_profiles(
 @server.tool(
     name="delete_portfolio",
     description="Delete a portfolio by ID. This is permanent and cannot be undone.",
+    annotations=ToolAnnotations(destructiveHint=True),
 )
 async def delete_portfolio(
     portfolio_id: Annotated[str, Field(description="The portfolio UUID to delete")],
@@ -742,6 +750,7 @@ async def delete_portfolio(
         "Requires a simulation_batch_id from simulate_betas. "
         "Objective options: 'max_sharpe', 'min_variance', 'max_return'."
     ),
+    annotations=ToolAnnotations(openWorldHint=True),
 )
 async def optimize_portfolio(
     portfolio_id: Annotated[str, Field(description="The portfolio UUID")],
@@ -1072,6 +1081,7 @@ async def list_feature_set_templates() -> str:
         "The display_name is auto-resolved from available_features if omitted. "
         "Returns the conditioning_set_id that can be passed to analyze_quantitative."
     ),
+    annotations=ToolAnnotations(destructiveHint=True),
 )
 async def create_feature_set(
     name: Annotated[str, Field(description="Name for the set (e.g. 'Custom Macro Factors')")],
@@ -1161,6 +1171,7 @@ async def get_feature_set(
 @server.tool(
     name="delete_feature_set",
     description="Delete a custom feature set. This is permanent and cannot be undone. Cannot delete shared templates.",
+    annotations=ToolAnnotations(destructiveHint=True),
 )
 async def delete_feature_set(
     feature_set_id: Annotated[str, Field(description="UUID of the feature set to delete")],
@@ -1180,6 +1191,7 @@ async def delete_feature_set(
 @server.tool(
     name="delete_model_group",
     description="Delete a model group and all its models, simulations, and associated data. This is permanent.",
+    annotations=ToolAnnotations(destructiveHint=True),
 )
 async def delete_model_group(
     model_group_id: Annotated[str, Field(description="UUID of the model group to delete")],
@@ -1450,6 +1462,7 @@ async def simulate_returns(
         "Factor spec format: {'VIX': {'type': 'fixed', 'value': 35}}. "
         "Supported types: 'fixed' (exact value), 'percentile' (historical percentile), 'shock' (std dev shift)."
     ),
+    annotations=ToolAnnotations(destructiveHint=True),
 )
 async def create_scenario(
     model_id: Annotated[str, Field(description="UUID of the model this scenario applies to")],
@@ -1540,6 +1553,7 @@ async def get_scenario(
         "Update a saved scenario. Can change name, description, or factor specs. "
         "Only pass the fields you want to update."
     ),
+    annotations=ToolAnnotations(destructiveHint=True),
 )
 async def update_scenario(
     scenario_id: Annotated[str, Field(description="The scenario UUID")],
@@ -1571,6 +1585,7 @@ async def update_scenario(
 @server.tool(
     name="delete_scenario",
     description="Delete a saved scenario. This is permanent.",
+    annotations=ToolAnnotations(destructiveHint=True),
 )
 async def delete_scenario(
     scenario_id: Annotated[str, Field(description="The scenario UUID to delete")],
@@ -1590,6 +1605,7 @@ async def delete_scenario(
 @server.tool(
     name="clone_scenario",
     description="Clone an existing scenario (typically a template) to create your own editable copy.",
+    annotations=ToolAnnotations(destructiveHint=True),
 )
 async def clone_scenario(
     scenario_id: Annotated[str, Field(description="UUID of the scenario to clone")],
@@ -1689,6 +1705,7 @@ async def run_scenario(
         "Pass either portfolio_id or tickers directly (auto-creates portfolio with equal weights). "
         "Returns factor exposures, simulation_batch_id for use with simulate_returns."
     ),
+    annotations=ToolAnnotations(destructiveHint=True, openWorldHint=True),
 )
 async def analyze_quantitative(
     conditioning_set_id: Annotated[str, Field(description="UUID of the thematic conditioning set (from list_feature_set_templates or create_feature_set)")],
@@ -1816,6 +1833,7 @@ async def analyze_quantitative(
         "(simulate_flow_scenario for what-if scenarios, test_flow_risk for portfolio risk metrics). "
         "Training typically takes 5-15 min; path generation takes 1-3 min."
     ),
+    annotations=ToolAnnotations(destructiveHint=True, openWorldHint=True),
 )
 async def generate_synthetic(
     conditioning_set_id: Annotated[str, Field(
@@ -2201,6 +2219,7 @@ async def test_flow_risk(
         "Requires a trained Flow model (run generate_synthetic first). "
         "This is an async GPU job — the tool will poll until completion."
     ),
+    annotations=ToolAnnotations(openWorldHint=True),
 )
 async def flow_validate(
     model_group_id: Annotated[str, Field(description="UUID of the model group with a trained Flow model")],
@@ -2404,6 +2423,7 @@ async def get_billing_usage(
         "Tiers: 'starter' (Pro, $59/mo), 'pro' (Pro+, $199/mo), 'enterprise' ($499/mo per seat). "
         "If already subscribed, returns a portal URL to manage/change your subscription."
     ),
+    annotations=ToolAnnotations(destructiveHint=True),
 )
 async def subscribe(
     tier: Annotated[str, Field(description="Subscription tier: 'starter', 'pro', or 'enterprise'")],
@@ -2427,6 +2447,7 @@ async def subscribe(
         "upgrade, downgrade, cancel, or update payment method. "
         "Returns a portal URL."
     ),
+    annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def manage_subscription() -> str:
     if err := _require_auth():
