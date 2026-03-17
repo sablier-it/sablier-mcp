@@ -251,12 +251,12 @@ Agent: 1. market_radar()
 
 | Tier | Price | Included |
 |------|-------|----------|
-| Free | $0 | 10 quantitative analyses, 2 GRAIN analyses/mo |
-| Pro | $59/mo | 100 quantitative, 20 GRAIN, 10 Flow simulations/mo |
-| Pro+ | $199/mo | Unlimited quantitative, 50 GRAIN, 30 Flow/mo |
-| Enterprise | $499/mo/seat | Unlimited everything |
+| Free | $0 | 10 market radar, 5 factor models, 2 GRAIN analyses/mo |
+| Pro | $79/mo | 100 market radar, 50 factor models, 20 GRAIN, 10 Flow sims/mo |
+| Enterprise | $399/mo/seat | Unlimited everything, priority support |
 
-Portfolio management, market radar, and all read operations are always free.
+Portfolio management, read operations, and scenario management are always free.
+Overages billed per-call beyond included limits.
 
 ## Architecture
 
@@ -289,11 +289,22 @@ npx @modelcontextprotocol/inspector uv --directory . run sablier-mcp
 MCP_TRANSPORT=streamable-http uv run sablier-mcp
 ```
 
+## Privacy Policy
+
+Sablier processes portfolio data and market queries to provide analytics. Full details:
+
+- **Data collected**: Portfolio holdings, factor model parameters, and query metadata for analytics computation
+- **Usage & storage**: Data is processed on Sablier's servers (GCP, US) and stored for your account's analytics history. Portfolios and models persist until you delete them.
+- **Third-party sharing**: Sablier does not sell or share your data. Market data is sourced from public feeds. SEC filings are public records.
+- **Retention**: Account data is retained while your account is active. Deleted portfolios and models are purged within 30 days.
+- **Contact**: [team@sablier.it](mailto:team@sablier.it)
+
+Full privacy policy: [sablier.it/privacy](https://sablier.it/privacy) | Terms of service: [sablier.it/terms](https://sablier.it/terms)
+
 ## Support
 
 - **Email**: [team@sablier.it](mailto:team@sablier.it)
-- **Privacy Policy**: [sablier.it/privacy](https://sablier.it/privacy)
-- **Terms of Service**: [sablier.it/terms](https://sablier.it/terms)
+- **Issues**: [github.com/miradebs98/sablier-mcp/issues](https://github.com/miradebs98/sablier-mcp/issues)
 
 ## Links
 

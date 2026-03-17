@@ -19,6 +19,12 @@
     "Monte-Carlo",
     "optimization"
   ],
+  "privacy_policies": [
+    "https://sablier.it/privacy"
+  ],
+  "contacts": {
+    "email": "team@sablier.it"
+  },
   "installations": {
     "remote": {
       "type": "streamable-http",
