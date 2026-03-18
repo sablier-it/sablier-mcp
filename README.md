@@ -67,7 +67,7 @@ uv sync
 # Register with Claude Code
 claude mcp add sablier -- uv --directory /path/to/sablier-mcp run sablier-mcp
 
-# Set your API key (get one from sablier.it)
+# Set your API key (get one from sablier-ai.com)
 export SABLIER_API_KEY=sk_live_your_key_here
 ```
 
@@ -299,7 +299,7 @@ Sablier processes portfolio data and market queries to provide analytics. Full d
 - **Retention**: Account data is retained while your account is active. Deleted portfolios and models are purged within 30 days.
 - **Contact**: [team@sablier.it](mailto:team@sablier.it)
 
-Full privacy policy: [sablier.it/privacy](https://sablier.it/privacy) | Terms of service: [sablier.it/terms](https://sablier.it/terms)
+Full privacy policy: [sablier-ai.com/privacy](https://sablier-ai.com/privacy) | Terms of service: [sablier-ai.com/terms](https://sablier-ai.com/terms)
 
 ## Support
 
@@ -308,5 +308,5 @@ Full privacy policy: [sablier.it/privacy](https://sablier.it/privacy) | Terms of
 
 ## Links
 
-- **Sablier Platform**: [sablier.it](https://sablier.it)
+- **Sablier Platform**: [sablier-ai.com](https://sablier-ai.com/discover)
 - **MCP Protocol**: [modelcontextprotocol.io](https://modelcontextprotocol.io)
