@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://sablier.it"
+Homepage = "https://sablier-ai.com"
 Repository = "https://github.com/miradebs98/sablier-mcp"
 Issues = "https://github.com/miradebs98/sablier-mcp/issues"
 
