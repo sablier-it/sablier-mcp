@@ -196,6 +196,70 @@ def _portfolio_tickers(portfolio: dict) -> list[str]:
     return [a.get("ticker") for a in assets if a.get("ticker")]
 
 
+def _build_per_asset_output(
+    summary: dict,
+    include_paths: bool = True,
+    baseline_summary: dict | None = None,
+) -> dict:
+    """Build per-asset output from backend summary, optionally including paths.
+
+    For target assets: includes percentile_bands + up to 10 sample paths.
+    For conditioning assets: includes only median_path.
+    If baseline_summary is given, merges baseline scalar stats for comparison.
+    """
+    MAX_SAMPLE_PATHS = 10
+    MAX_TS_POINTS = 60  # downsample longer horizons
+
+    per_asset: dict = {}
+    for name, data in summary.items():
+        if not isinstance(data, dict):
+            continue
+        entry: dict = {
+            "last_price": data.get("last_price"),
+            "mean_return": data.get("mean_return"),
+            "median_terminal": data.get("median_terminal"),
+            "p5": data.get("p5"),
+            "p95": data.get("p95"),
+            "feature_type": data.get("feature_type"),
+        }
+
+        if include_paths:
+            ts = data.get("timeseries") or {}
+            is_target = data.get("feature_type") == "target"
+            if ts and is_target:
+                # Downsample if horizon is long
+                def _maybe_downsample(arr: list) -> list:
+                    if not arr or len(arr) <= MAX_TS_POINTS:
+                        return arr
+                    step = max(1, len(arr) // MAX_TS_POINTS)
+                    return arr[::step]
+
+                entry["percentile_bands"] = {
+                    k: _maybe_downsample(ts[k])
+                    for k in ("p5", "p25", "p50", "p75", "p95")
+                    if k in ts
+                }
+                sample = ts.get("sample_paths") or []
+                if sample:
+                    # Subsample to MAX_SAMPLE_PATHS
+                    step = max(1, len(sample) // MAX_SAMPLE_PATHS)
+                    picked = sample[::step][:MAX_SAMPLE_PATHS]
+                    entry["sample_paths"] = [_maybe_downsample(p) for p in picked]
+            elif ts and not is_target:
+                p50 = ts.get("p50")
+                if p50:
+                    entry["median_path"] = p50
+
+        if baseline_summary:
+            bl = baseline_summary.get(name) or {}
+            if bl:
+                entry["baseline_mean_return"] = bl.get("mean_return")
+                entry["baseline_median_terminal"] = bl.get("median_terminal")
+
+        per_asset[name] = entry
+    return per_asset
+
+
 def _flatten_betas(results: dict) -> dict:
     """Flatten the nested betas API response into a widget-friendly format.
 
@@ -1915,30 +1979,244 @@ async def analyze_quantitative(
 # ══════════════════════════════════════════════════
 
 
+# ── Flow internal helpers ──
+
+async def _train_flow_model_impl(
+    client, conditioning_set_id: str, portfolio_id: str | None,
+    tickers: list[str] | None, weights: list[float] | None, horizon: int,
+) -> tuple[dict | str, str | None, str | None, list]:
+    """Train a Flow model. Returns (output_or_error, model_group_id, portfolio_id, feature_names)."""
+    if err := _validate_uuid(conditioning_set_id, "conditioning_set_id"):
+        return err, None, None, []
+
+    portfolio, err = await _ensure_portfolio(portfolio_id, tickers, weights)
+    if err:
+        return err, None, None, []
+    portfolio_id = portfolio["id"]
+    target_set_id = portfolio.get("target_set_id")
+    asset_tickers = _portfolio_tickers(portfolio)
+    portfolio_name = portfolio.get("name", "")
+
+    if data_err := await _validate_conditioning_data(conditioning_set_id):
+        return data_err, None, None, []
+
+    create_result = await _retry_api_call(lambda: client.batch_create_models(
+        conditioning_set_id=conditioning_set_id,
+        asset_tickers=asset_tickers,
+        parent_target_set_id=target_set_id,
+        group_name=portfolio_name or None,
+    ))
+    model_group_id = create_result.get("model_group_id")
+    if not model_group_id:
+        return "Error: model creation did not return a model_group_id.", None, None, []
+
+    if create_result.get("total_created", 0) == 0:
+        return _fmt({
+            "error": "No models were created.",
+            "total_failed": create_result.get("total_failed", 0),
+            "failed_assets": create_result.get("failed_assets", []),
+        }), None, None, []
+
+    async with _acquire_gpu():
+        train_job = await _retry_gpu_call(lambda: client.flow_train(
+            model_group_id=model_group_id,
+            horizon=horizon,
+        ))
+        train_job_id = train_job.get("job_id")
+        if not train_job_id:
+            return "Error: Flow training did not return a job_id.", None, None, []
+
+        feature_names = train_job.get("feature_names", [])
+        train_result = await client.poll_flow_train(train_job_id)
+        train_status = train_result.get("status", "")
+
+        if train_status == "failed":
+            return _fmt({
+                "error": "Flow training failed.",
+                "model_group_id": model_group_id,
+                "details": train_result.get("error") or train_result,
+            }), None, None, []
+        if train_status != "completed":
+            return _fmt({
+                "error": f"Flow training ended with status '{train_status}'.",
+                "model_group_id": model_group_id,
+            }), None, None, []
+
+        if train_result.get("feature_names"):
+            feature_names = train_result["feature_names"]
+
+    output = {
+        "status": "trained",
+        "model_group_id": model_group_id,
+        "portfolio_id": portfolio_id,
+        "feature_names": feature_names,
+        "next_steps": (
+            f"Model trained. Now call generate_flow_paths(model_group_id='{model_group_id}') "
+            f"to produce simulated price trajectories. Then use simulate_flow_scenario for what-if analysis, "
+            f"test_flow_risk for portfolio risk metrics, or flow_validate for model quality checks."
+        ),
+    }
+    return output, model_group_id, portfolio_id, feature_names
+
+
+async def _generate_flow_paths_impl(
+    client, model_group_id: str, portfolio_id: str | None,
+    horizon: int, n_paths: int,
+) -> list | str:
+    """Generate paths from a trained model. Returns formatted output."""
+    if err := _validate_uuid(model_group_id, "model_group_id"):
+        return err
+
+    feature_names: list = []
+
+    # Resolve portfolio_id from model group if not provided
+    _mg_info = None
+    try:
+        groups = await client.list_model_groups()
+        _mg_info = next((g for g in groups if g.get("id") == model_group_id), None)
+    except Exception:
+        logger.debug("Could not fetch model groups", exc_info=True)
+
+    if not portfolio_id and _mg_info:
+        try:
+            ptsi = _mg_info.get("parent_target_set_id")
+            if ptsi:
+                plist = await client.list_portfolios()
+                items = plist.get("portfolios", plist) if isinstance(plist, dict) else plist
+                match = next((p for p in items if p.get("target_set_id") == ptsi), None)
+                if match:
+                    portfolio_id = match["id"]
+        except Exception:
+            logger.debug("Could not resolve portfolio_id from model group", exc_info=True)
+
+    # Try existing results first
+    try:
+        results = await client.flow_get_latest_results(model_group_id)
+        summary = results.get("summary") or {}
+        feature_names = results.get("feature_names", [])
+        gen_job_id = results.get("job_id", "")
+
+        if summary:
+            per_asset = _build_per_asset_output(summary, include_paths=True)
+            pid_str = f"'{portfolio_id}'" if portfolio_id else "'<find via list_portfolios>'"
+            feat_hint = f" Features for constraints: {', '.join(feature_names[:10])}." if feature_names else ""
+            output = {
+                "status": "completed (existing results)",
+                "model_group_id": model_group_id,
+                "portfolio_id": portfolio_id,
+                "flow_job_id": str(gen_job_id),
+                "horizon": results.get("horizon", horizon),
+                "n_paths": results.get("n_paths", n_paths),
+                "feature_names": feature_names,
+                "per_asset": per_asset,
+                "next_steps": (
+                    f"Available actions: "
+                    f"simulate_flow_scenario(model_group_id='{model_group_id}', portfolio_id={pid_str}, constraints=...) for what-if scenarios | "
+                    f"test_flow_risk(portfolio_id={pid_str}, flow_job_id='{gen_job_id}') for risk metrics | "
+                    f"flow_validate(model_group_id='{model_group_id}') for model quality check | "
+                    f"list_flow_scenarios(model_group_id='{model_group_id}') to see past scenarios.{feat_hint}"
+                ),
+            }
+            try:
+                chart_html = flow_fan_chart(summary, results.get("horizon", horizon))
+                if chart_html:
+                    return _with_widget(_fmt(output), chart_html)
+            except Exception:
+                pass
+            return _fmt(output)
+    except SablierAPIError as e:
+        if e.status_code != 404:
+            raise
+
+    # Check model status
+    try:
+        mg_status = (_mg_info.get("status") or "").lower() if _mg_info else ""
+        if mg_status in ("failed", "error"):
+            return _fmt({
+                "error": f"Model group status is '{mg_status}'. Cannot generate paths from a failed model.",
+                "model_group_id": model_group_id,
+                "hint": "Create a new model with train_flow_model(conditioning_set_id=..., tickers=...).",
+            })
+        if mg_status not in ("trained", "completed", ""):
+            return _fmt({
+                "error": f"Model group status is '{mg_status}'. Training may still be in progress.",
+                "model_group_id": model_group_id,
+                "hint": "Wait for training to complete, or train a new model with train_flow_model.",
+            })
+    except Exception:
+        logger.debug("Could not check model group status", exc_info=True)
+
+    # Generate new paths
+    async with _acquire_gpu():
+        gen_job = await _retry_gpu_call(lambda: client.flow_generate_paths(
+            model_group_id=model_group_id,
+            n_paths=n_paths,
+            horizon=horizon,
+        ))
+        gen_job_id = gen_job.get("job_id")
+        if not gen_job_id:
+            return _fmt({"error": "Path generation did not return a job_id.", "model_group_id": model_group_id})
+
+        gen_result = await client.poll_flow_job(gen_job_id, f"/flow/{gen_job_id}/results")
+
+    if gen_result.get("status", "") == "failed":
+        return _fmt({
+            "error": "Path generation failed.",
+            "model_group_id": model_group_id,
+            "details": gen_result.get("error") or gen_result,
+        })
+
+    results = await client.flow_get_results(gen_job_id)
+    summary = results.get("summary") or {}
+    if results.get("feature_names"):
+        feature_names = results["feature_names"]
+
+    per_asset = _build_per_asset_output(summary, include_paths=True)
+    feat_hint = f" Features for constraints: {', '.join(feature_names[:10])}." if feature_names else ""
+    pid_str = f"'{portfolio_id}'" if portfolio_id else "'<find via list_portfolios>'"
+    output = {
+        "status": "completed",
+        "model_group_id": model_group_id,
+        "portfolio_id": portfolio_id,
+        "flow_job_id": str(gen_job_id),
+        "horizon": horizon,
+        "n_paths": results.get("n_paths", n_paths),
+        "feature_names": feature_names,
+        "per_asset": per_asset,
+        "next_steps": (
+            f"Available actions: "
+            f"simulate_flow_scenario(model_group_id='{model_group_id}', portfolio_id={pid_str}, constraints=...) for what-if scenarios | "
+            f"test_flow_risk(portfolio_id={pid_str}, flow_job_id='{gen_job_id}') for risk metrics | "
+            f"flow_validate(model_group_id='{model_group_id}') for model quality check | "
+            f"list_flow_scenarios(model_group_id='{model_group_id}') to see past scenarios.{feat_hint}"
+        ),
+    }
+    try:
+        chart_html = flow_fan_chart(summary, horizon)
+        if chart_html:
+            return _with_widget(_fmt(output), chart_html)
+    except Exception:
+        logger.warning("Fan chart generation failed, returning text-only", exc_info=True)
+    return _fmt(output)
+
+
+# ── Flow MCP tools ──
+
 @server.tool(
-    name="generate_synthetic",
+    name="train_flow_model",
     description=(
-        "Train a generative Flow model and produce simulated multi-step price trajectories. "
-        "This is the starting point for Flow analysis (the generative alternative to Moment/linear). "
-        "Returns per-asset path distributions, feature_names (needed for simulate_flow_scenario constraints), "
-        "and IDs for follow-up tools (simulate_flow_scenario, test_flow_risk, flow_validate). "
-        "TWO MODES: "
-        "(1) NEW RUN: pass conditioning_set_id + tickers/portfolio_id. Trains on GPU (~5-15 min) then generates paths (~1-3 min). "
-        "(2) RESUME: pass model_group_id (from list_model_groups where model_type='flow_generative') to retrieve "
-        "existing results instantly or generate new paths without retraining. No conditioning_set_id needed. "
-        "Defaults: horizon=20 (~1 month), n_paths=500. Use horizon=60 for quarterly, 120 for 6-month views."
+        "Train a generative Flow model on a portfolio and conditioning set. "
+        "Returns model_group_id needed for generate_flow_paths and other flow tools. "
+        "Requires conditioning_set_id (from list_feature_set_templates or create_feature_set) "
+        "and tickers or portfolio_id. Training takes ~5-15 min on GPU. "
+        "After training, call generate_flow_paths to produce simulated price trajectories."
     ),
-    annotations=ToolAnnotations(title="Generate Synthetic Paths", destructiveHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(title="Train Flow Model", destructiveHint=True, openWorldHint=True),
 )
-async def generate_synthetic(
-    conditioning_set_id: Annotated[str | None, Field(
-        description="UUID of the conditioning set (from list_feature_set_templates or create_feature_set). Required for new runs, not needed when resuming with model_group_id.",
-        default=None,
-    )] = None,
-    model_group_id: Annotated[str | None, Field(
-        description="UUID of an existing Flow model group (from list_model_groups). If provided, skips creation/training and retrieves existing results or generates new paths.",
-        default=None,
-    )] = None,
+async def train_flow_model(
+    conditioning_set_id: Annotated[str, Field(
+        description="UUID of the conditioning set (from list_feature_set_templates or create_feature_set)."
+    )],
     portfolio_id: Annotated[str | None, Field(
         description="UUID of an existing portfolio. If omitted, provide tickers instead.",
         default=None,
@@ -1955,292 +2233,128 @@ async def generate_synthetic(
         description="Forecast horizon in trading days. ~1 month = 20, ~1 quarter = 60, ~6 months = 120. Default 20.",
         default=20,
     )] = 20,
+) -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        result, mgid, pid, fnames = await _train_flow_model_impl(
+            client, conditioning_set_id, portfolio_id, tickers, weights, horizon,
+        )
+        if isinstance(result, str):
+            return result
+        return _fmt(result)
+    except _FlowGPUBusy as e:
+        return str(e)
+    except SablierAPIError as e:
+        return _api_error(e)
+    except Exception as e:
+        logger.error("train_flow_model failed: %s", e, exc_info=True)
+        return "Flow training failed unexpectedly. Please try again."
+
+
+@server.tool(
+    name="generate_flow_paths",
+    description=(
+        "Generate simulated multi-step price trajectories from a trained Flow model. "
+        "Returns per-asset percentile bands (p5/p25/p50/p75/p95 per timestep), "
+        "sample paths per target asset, and scalar terminal statistics. "
+        "Requires model_group_id from train_flow_model or list_model_groups. "
+        "If paths already exist, returns cached results instantly. "
+        "Path generation takes ~1-3 min on GPU. "
+        "Defaults: horizon=20 (~1 month), n_paths=500."
+    ),
+    annotations=ToolAnnotations(title="Generate Flow Paths", destructiveHint=True, openWorldHint=True),
+)
+async def generate_flow_paths(
+    model_group_id: Annotated[str, Field(
+        description="UUID of a trained Flow model group (from train_flow_model or list_model_groups)."
+    )],
+    portfolio_id: Annotated[str | None, Field(
+        description="UUID of the portfolio. Resolved automatically if omitted.",
+        default=None,
+    )] = None,
+    horizon: Annotated[int, Field(
+        description="Forecast horizon in trading days. Default 20.",
+        default=20,
+    )] = 20,
     n_paths: Annotated[int, Field(
-        description="Number of paths to generate. More = better statistics but slower. 500 default, 1000+ for high-confidence.",
+        description="Number of paths to generate. 500 default, 1000+ for high-confidence.",
         default=500,
     )] = 500,
 ) -> list | str:
     if err := _require_auth():
         return err
-
     try:
         client = get_client()
-        feature_names = []
+        return await _generate_flow_paths_impl(client, model_group_id, portfolio_id, horizon, n_paths)
+    except _FlowGPUBusy as e:
+        return str(e)
+    except SablierAPIError as e:
+        return _api_error(e)
+    except Exception as e:
+        logger.error("generate_flow_paths failed: %s", e, exc_info=True)
+        return "Flow path generation failed unexpectedly. Please try again."
 
-        # ── Resume path: model_group_id provided → skip creation/training ──
+
+@server.tool(
+    name="generate_synthetic",
+    description=(
+        "Train a Flow model AND generate paths in one call. "
+        "Convenience wrapper: equivalent to train_flow_model then generate_flow_paths. "
+        "TWO MODES: "
+        "(1) NEW RUN: pass conditioning_set_id + tickers/portfolio_id. Trains then generates (~5-18 min). "
+        "(2) RESUME: pass model_group_id to retrieve existing results or generate new paths without retraining. "
+        "Prefer the separate train_flow_model + generate_flow_paths tools for more control."
+    ),
+    annotations=ToolAnnotations(title="Generate Synthetic Paths", destructiveHint=True, openWorldHint=True),
+)
+async def generate_synthetic(
+    conditioning_set_id: Annotated[str | None, Field(
+        description="UUID of the conditioning set. Required for new runs.",
+        default=None,
+    )] = None,
+    model_group_id: Annotated[str | None, Field(
+        description="UUID of an existing Flow model group. Skips training if provided.",
+        default=None,
+    )] = None,
+    portfolio_id: Annotated[str | None, Field(
+        description="UUID of an existing portfolio. If omitted, provide tickers.",
+        default=None,
+    )] = None,
+    tickers: Annotated[list[str] | None, Field(
+        description="Tickers to analyze. Auto-creates a portfolio if portfolio_id is not given.",
+        default=None,
+    )] = None,
+    weights: Annotated[list[float] | None, Field(
+        description="Optional weights (must sum to 1.0). Defaults to equal weights.",
+        default=None,
+    )] = None,
+    horizon: Annotated[int, Field(description="Forecast horizon in trading days. Default 20.", default=20)] = 20,
+    n_paths: Annotated[int, Field(description="Number of paths to generate. Default 500.", default=500)] = 500,
+) -> list | str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+
+        # Resume mode: skip training
         if model_group_id:
-            if err := _validate_uuid(model_group_id, "model_group_id"):
-                return err
+            return await _generate_flow_paths_impl(client, model_group_id, portfolio_id, horizon, n_paths)
 
-            # Fetch model group info (needed for status check + portfolio resolution)
-            _mg_info = None
-            try:
-                groups = await client.list_model_groups()
-                _mg_info = next((g for g in groups if g.get("id") == model_group_id), None)
-            except Exception:
-                logger.debug("Could not fetch model groups", exc_info=True)
+        # New run: train then generate
+        if not conditioning_set_id:
+            return "Error: conditioning_set_id is required for new runs. Use list_feature_set_templates to find one, or pass model_group_id to resume."
 
-            # Resolve portfolio_id from model group if not provided
-            if not portfolio_id and _mg_info:
-                try:
-                    ptsi = _mg_info.get("parent_target_set_id")
-                    if ptsi:
-                        plist = await client.list_portfolios()
-                        items = plist.get("portfolios", plist) if isinstance(plist, dict) else plist
-                        match = next((p for p in items if p.get("target_set_id") == ptsi), None)
-                        if match:
-                            portfolio_id = match["id"]
-                except Exception:
-                    logger.debug("Could not resolve portfolio_id from model group", exc_info=True)
+        result, mgid, pid, fnames = await _train_flow_model_impl(
+            client, conditioning_set_id, portfolio_id, tickers, weights, horizon,
+        )
+        if isinstance(result, str):
+            return result  # error
+        if not mgid:
+            return _fmt(result)  # training output without model_group_id (shouldn't happen)
 
-            # Try to fetch existing completed results first
-            try:
-                results = await client.flow_get_latest_results(model_group_id)
-                summary = results.get("summary") or {}
-                feature_names = results.get("feature_names", [])
-                gen_job_id = results.get("job_id", "")
-
-                if summary:
-                    # Results already exist — return them immediately
-                    per_asset = {}
-                    for name, data in summary.items():
-                        if not isinstance(data, dict):
-                            continue
-                        per_asset[name] = {
-                            "last_price": data.get("last_price"),
-                            "mean_return": data.get("mean_return"),
-                            "median_terminal": data.get("median_terminal"),
-                            "p5": data.get("p5"),
-                            "p95": data.get("p95"),
-                            "feature_type": data.get("feature_type"),
-                        }
-
-                    pid_str = f"'{portfolio_id}'" if portfolio_id else "'<find via list_portfolios>'"
-                    feat_hint = f" Features for constraints: {', '.join(feature_names[:10])}." if feature_names else ""
-                    output = {
-                        "status": "completed (existing results)",
-                        "model_group_id": model_group_id,
-                        "portfolio_id": portfolio_id,
-                        "flow_job_id": str(gen_job_id),
-                        "horizon": results.get("horizon", horizon),
-                        "n_paths": results.get("n_paths", n_paths),
-                        "feature_names": feature_names,
-                        "per_asset": per_asset,
-                        "next_steps": (
-                            f"Available actions: "
-                            f"simulate_flow_scenario(model_group_id='{model_group_id}', portfolio_id={pid_str}, constraints=...) for what-if scenarios | "
-                            f"test_flow_risk(portfolio_id={pid_str}, flow_job_id='{gen_job_id}') for risk metrics | "
-                            f"flow_validate(model_group_id='{model_group_id}') for model quality check | "
-                            f"list_flow_scenarios(model_group_id='{model_group_id}') to see past scenarios.{feat_hint}"
-                        ),
-                    }
-
-                    try:
-                        chart_html = flow_fan_chart(summary, results.get("horizon", horizon))
-                        if chart_html:
-                            return _with_widget(_fmt(output), chart_html)
-                    except Exception:
-                        pass
-                    return _fmt(output)
-            except SablierAPIError as e:
-                if e.status_code != 404:
-                    raise
-                # 404 = no existing results, fall through to generate new paths
-
-            # Check model status before generating — avoid retrying for 5 min on untrained/failed models
-            try:
-                mg_status = (_mg_info.get("status") or "").lower() if _mg_info else ""
-                if mg_status in ("failed", "error"):
-                    return _fmt({
-                        "error": f"Model group status is '{mg_status}'. Cannot generate paths from a failed model.",
-                        "model_group_id": model_group_id,
-                        "hint": "Create a new model with generate_synthetic(conditioning_set_id=..., tickers=...).",
-                    })
-                if mg_status not in ("trained", "completed", ""):
-                    return _fmt({
-                        "error": f"Model group status is '{mg_status}'. Training may still be in progress or was never started.",
-                        "model_group_id": model_group_id,
-                        "hint": "Wait for training to complete, or create a new model with generate_synthetic(conditioning_set_id=..., tickers=...).",
-                    })
-            except Exception:
-                logger.debug("Could not check model group status", exc_info=True)
-
-            # Model is trained — generate paths (hold GPU lock for full duration)
-            async with _acquire_gpu():
-                gen_job = await _retry_gpu_call(lambda: client.flow_generate_paths(
-                    model_group_id=model_group_id,
-                    n_paths=n_paths,
-                    horizon=horizon,
-                ))
-                gen_job_id = gen_job.get("job_id")
-                if not gen_job_id:
-                    return _fmt({
-                        "error": "Path generation did not return a job_id.",
-                        "model_group_id": model_group_id,
-                    })
-
-                gen_result = await client.poll_flow_job(
-                    gen_job_id, f"/flow/{gen_job_id}/results",
-                )
-
-            gen_status = gen_result.get("status", "")
-            if gen_status == "failed":
-                return _fmt({
-                    "error": "Path generation failed.",
-                    "model_group_id": model_group_id,
-                    "details": gen_result.get("error") or gen_result,
-                })
-
-            results = await client.flow_get_results(gen_job_id)
-            summary = results.get("summary") or {}
-            if results.get("feature_names"):
-                feature_names = results["feature_names"]
-
-        # ── New run path: create models, train, generate ──
-        else:
-            if not conditioning_set_id:
-                return "Error: conditioning_set_id is required for new runs. Use list_feature_set_templates to find one, or pass model_group_id to resume an existing model."
-            if err := _validate_uuid(conditioning_set_id, "conditioning_set_id"):
-                return err
-
-            # Step 0: Resolve or auto-create portfolio
-            portfolio, err = await _ensure_portfolio(portfolio_id, tickers, weights)
-            if err:
-                return err
-            portfolio_id = portfolio["id"]
-            target_set_id = portfolio.get("target_set_id")
-            asset_tickers = _portfolio_tickers(portfolio)
-            portfolio_name = portfolio.get("name", "")
-
-            # Pre-flight: ensure conditioning set has fetched data
-            if data_err := await _validate_conditioning_data(conditioning_set_id):
-                return data_err
-
-            # Step 1: Create models (linked to portfolio via parent_target_set_id)
-            create_result = await _retry_api_call(lambda: client.batch_create_models(
-                conditioning_set_id=conditioning_set_id,
-                asset_tickers=asset_tickers,
-                parent_target_set_id=target_set_id,
-                group_name=portfolio_name or None,
-            ))
-            model_group_id = create_result.get("model_group_id")
-            if not model_group_id:
-                return "Error: model creation did not return a model_group_id."
-
-            total_created = create_result.get("total_created", 0)
-            if total_created == 0:
-                return _fmt({
-                    "error": "No models were created.",
-                    "total_failed": create_result.get("total_failed", 0),
-                    "failed_assets": create_result.get("failed_assets", []),
-                })
-
-            # Steps 2-3: Train + Generate (hold GPU lock for full duration)
-            async with _acquire_gpu():
-                # Step 2: Train Flow model
-                train_job = await _retry_gpu_call(lambda: client.flow_train(
-                    model_group_id=model_group_id,
-                    horizon=horizon,
-                ))
-                train_job_id = train_job.get("job_id")
-                if not train_job_id:
-                    return "Error: Flow training did not return a job_id."
-
-                feature_names = train_job.get("feature_names", [])
-
-                # Poll training until completion
-                train_result = await client.poll_flow_train(train_job_id)
-                train_status = train_result.get("status", "")
-                if train_status == "failed":
-                    return _fmt({
-                        "error": "Flow training failed.",
-                        "model_group_id": model_group_id,
-                        "details": train_result.get("error") or train_result,
-                    })
-                if train_status != "completed":
-                    return _fmt({
-                        "error": f"Flow training ended with status '{train_status}'. Try again or check logs.",
-                        "model_group_id": model_group_id,
-                    })
-
-                # Update feature_names from training result if available
-                if train_result.get("feature_names"):
-                    feature_names = train_result["feature_names"]
-
-                # Step 3: Generate baseline paths
-                gen_job = await _retry_gpu_call(lambda: client.flow_generate_paths(
-                    model_group_id=model_group_id,
-                    n_paths=n_paths,
-                    horizon=horizon,
-                ))
-                gen_job_id = gen_job.get("job_id")
-                if not gen_job_id:
-                    return _fmt({
-                        "error": "Path generation did not return a job_id.",
-                        "model_group_id": model_group_id,
-                        "note": "Training succeeded. You can retry with model_group_id to skip training.",
-                    })
-
-                # Poll generation until completion
-                gen_result = await client.poll_flow_job(
-                    gen_job_id, f"/flow/{gen_job_id}/results",
-                )
-
-            gen_status = gen_result.get("status", "")
-            if gen_status == "failed":
-                return _fmt({
-                    "error": "Path generation failed.",
-                    "model_group_id": model_group_id,
-                    "details": gen_result.get("error") or gen_result,
-                })
-
-            # Fetch full results
-            results = await client.flow_get_results(gen_job_id)
-            summary = results.get("summary") or {}
-            if results.get("feature_names"):
-                feature_names = results["feature_names"]
-
-        # Build per-asset stats from summary
-        per_asset = {}
-        for name, data in summary.items():
-            if not isinstance(data, dict):
-                continue
-            per_asset[name] = {
-                "last_price": data.get("last_price"),
-                "mean_return": data.get("mean_return"),
-                "median_terminal": data.get("median_terminal"),
-                "p5": data.get("p5"),
-                "p95": data.get("p95"),
-                "feature_type": data.get("feature_type"),
-            }
-
-        feat_hint = f" Features for constraints: {', '.join(feature_names[:10])}." if feature_names else ""
-        output = {
-            "status": "completed",
-            "model_group_id": model_group_id,
-            "portfolio_id": portfolio_id,
-            "flow_job_id": str(gen_job_id),
-            "horizon": horizon,
-            "n_paths": results.get("n_paths", n_paths),
-            "feature_names": feature_names,
-            "per_asset": per_asset,
-            "next_steps": (
-                f"Available actions: "
-                f"simulate_flow_scenario(model_group_id='{model_group_id}', portfolio_id='{portfolio_id}', constraints=...) for what-if scenarios | "
-                f"test_flow_risk(portfolio_id='{portfolio_id}', flow_job_id='{gen_job_id}') for risk metrics | "
-                f"flow_validate(model_group_id='{model_group_id}') for model quality check | "
-                f"list_flow_scenarios(model_group_id='{model_group_id}') to see past scenarios.{feat_hint}"
-            ),
-        }
-
-        try:
-            chart_html = flow_fan_chart(summary, horizon)
-            if chart_html:
-                return _with_widget(_fmt(output), chart_html)
-        except Exception:
-            logger.warning("Fan chart generation failed, returning text-only", exc_info=True)
-
-        return _fmt(output)
+        return await _generate_flow_paths_impl(client, mgid, pid, horizon, n_paths)
     except _FlowGPUBusy as e:
         return str(e)
     except SablierAPIError as e:
@@ -2254,11 +2368,11 @@ async def generate_synthetic(
     name="simulate_flow_scenario",
     description=(
         "Generate constrained what-if scenarios from a trained Flow model. "
-        "Requires model_group_id and feature_names from generate_synthetic. "
-        "IMPORTANT: feature_name in constraints must be the DISPLAY NAME from generate_synthetic's feature_names "
+        "Requires model_group_id and feature_names from train_flow_model or generate_synthetic. "
+        "IMPORTANT: feature_name in constraints must be the DISPLAY NAME from the training output's feature_names "
         "(e.g. 'Apple Inc.', 'NVIDIA Corporation', 'SPDR S&P 500 ETF Trust'), NOT ticker symbols. "
         "Constraint types: 'level' (absolute price bounds), 'return' (per-step return bounds). "
-        "Returns constrained paths + paired unconstrained baseline + satisfaction_rate (0-1). "
+        "Returns constrained paths (percentile bands + sample paths) + paired unconstrained baseline + satisfaction_rate (0-1). "
         "Pass portfolio_id through so test_flow_risk can be called directly on results. "
         "Run multiple scenarios and compare via test_flow_risk on each flow_job_id."
     ),
@@ -2266,18 +2380,18 @@ async def generate_synthetic(
 )
 async def simulate_flow_scenario(
     model_group_id: Annotated[str, Field(
-        description="UUID of the model group with a trained Flow model (from generate_synthetic)"
+        description="UUID of the model group with a trained Flow model (from train_flow_model or generate_synthetic)"
     )],
     constraints: Annotated[list[dict], Field(
         description=(
             "List of constraints. Each: "
             "{'feature_name': 'Apple Inc.', 'type': 'level', 'lower': 200, 'upper': null, 't_start': 0, 't_end': 20}. "
             "Types: 'level' (absolute price bounds), 'return' (per-step return bounds). "
-            "feature_name must be from generate_synthetic's feature_names list."
+            "feature_name must be from the training output's feature_names list."
         )
     )],
     portfolio_id: Annotated[str | None, Field(
-        description="UUID of the portfolio (from generate_synthetic). Pass it through so test_flow_risk can be called directly on the results.",
+        description="UUID of the portfolio (from train_flow_model or generate_synthetic). Pass it through so test_flow_risk can be called directly on the results.",
         default=None,
     )] = None,
     n_paths: Annotated[int, Field(
@@ -2328,24 +2442,8 @@ async def simulate_flow_scenario(
         satisfaction_rate = results.get("satisfaction_rate")
         result_horizon = results.get("horizon", horizon or 20)
 
-        # Build per-asset stats
-        per_asset = {}
-        for name, data in summary.items():
-            if not isinstance(data, dict):
-                continue
-            entry = {
-                "last_price": data.get("last_price"),
-                "mean_return": data.get("mean_return"),
-                "median_terminal": data.get("median_terminal"),
-                "p5": data.get("p5"),
-                "p95": data.get("p95"),
-            }
-            # Add baseline comparison if available
-            bl = baseline_summary.get(name) or {}
-            if bl:
-                entry["baseline_mean_return"] = bl.get("mean_return")
-                entry["baseline_median_terminal"] = bl.get("median_terminal")
-            per_asset[name] = entry
+        # Build per-asset stats with percentile bands, sample paths, and baseline comparison
+        per_asset = _build_per_asset_output(summary, include_paths=True, baseline_summary=baseline_summary)
 
         pid_str = f"'{portfolio_id}'" if portfolio_id else "'<from generate_synthetic>'"
         output = {
@@ -2388,7 +2486,7 @@ async def simulate_flow_scenario(
         "Run portfolio risk analytics on Flow-generated paths. "
         "Computes expected return, volatility, Sharpe ratio, Sortino ratio, Calmar ratio, "
         "VaR 95%, CVaR 95%, max drawdown, profitability rate, and return distribution percentiles. "
-        "Requires portfolio_id and flow_job_id from generate_synthetic or simulate_flow_scenario. "
+        "Requires portfolio_id and flow_job_id from generate_flow_paths, generate_synthetic, or simulate_flow_scenario. "
         "TIP: Call this on multiple flow_job_ids (baseline + different scenarios) to build a "
         "side-by-side comparison of risk metrics across scenarios."
     ),
@@ -2396,10 +2494,10 @@ async def simulate_flow_scenario(
 )
 async def test_flow_risk(
     portfolio_id: Annotated[str, Field(
-        description="UUID of the portfolio (from generate_synthetic or list_portfolios)"
+        description="UUID of the portfolio (from generate_flow_paths, generate_synthetic, or list_portfolios)"
     )],
     flow_job_id: Annotated[str, Field(
-        description="Flow generation job ID (from generate_synthetic or simulate_flow_scenario)"
+        description="Flow generation job ID (from generate_flow_paths, generate_synthetic, or simulate_flow_scenario)"
     )],
 ) -> list | str:
     if err := _require_auth():
@@ -2472,7 +2570,7 @@ async def test_flow_risk(
 )
 async def list_flow_scenarios(
     model_group_id: Annotated[str, Field(
-        description="UUID of the Flow model group (from generate_synthetic or list_model_groups)"
+        description="UUID of the Flow model group (from train_flow_model, generate_synthetic, or list_model_groups)"
     )],
 ) -> str:
     if err := _require_auth():
@@ -2500,7 +2598,7 @@ async def list_flow_scenarios(
         "Generates paths and compares them to historical distributions using "
         "Wasserstein distance, KS tests, coverage tests, and marginal distribution checks. "
         "Returns a quality badge (EXCELLENT/GOOD/ACCEPTABLE/POOR) and per-feature metrics. "
-        "Requires a trained Flow model (run generate_synthetic first). "
+        "Requires a trained Flow model (run train_flow_model or generate_synthetic first). "
         "This is an async GPU job — the tool will poll until completion."
     ),
     annotations=ToolAnnotations(title="Validate Flow Model", readOnlyHint=True, openWorldHint=True),
