@@ -345,7 +345,7 @@ async def _validate_conditioning_data(conditioning_set_id: str) -> str | None:
 _NOT_LOGGED_IN = (
     "Error: Not authenticated. "
     "Set the SABLIER_API_KEY environment variable to your Sablier API key. "
-    "You can create one at https://app.sablier.co/settings/api-keys."
+    "You can create one at https://sablier-ai.com."
 )
 
 

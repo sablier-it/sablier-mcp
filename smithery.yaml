@@ -7,7 +7,7 @@ startCommand:
     properties:
       sablierApiKey:
         type: string
-        description: "Sablier API key. Get one at https://app.sablier.co/settings/api-keys"
+        description: "Sablier API key. Get one at https://sablier-ai.com"
   commandFunction: |-
     (config) => ({
       command: "uvx",
