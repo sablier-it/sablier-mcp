@@ -726,6 +726,21 @@ class SablierClient:
             elapsed += POLL_INTERVAL
         return result
 
+    async def flow_get_latest_results(self, model_group_id: str) -> dict:
+        """Get latest completed baseline generation results for a flow model group."""
+        return await self._get(f"/flow/model-group/{model_group_id}/latest-results")
+
+    async def flow_list_scenarios(self, model_group_id: str) -> dict:
+        """List completed constrained scenarios for a flow model group."""
+        return await self._get(f"/flow/model-group/{model_group_id}/scenarios")
+
+    async def flow_portfolio_test(self, portfolio_id: str, flow_job_id: str) -> dict:
+        """Run portfolio risk analytics on flow-generated paths."""
+        return await self._post(
+            "/flow/portfolio-test",
+            json={"portfolio_id": portfolio_id, "flow_job_id": flow_job_id},
+        )
+
     # ──────────────────────────────────────────────
     # User API Keys (third-party: FRED, Finnhub)
     # ──────────────────────────────────────────────
@@ -744,6 +759,37 @@ class SablierClient:
     async def delete_user_api_key(self, provider: str) -> dict:
         """Delete a user's third-party API key by provider."""
         return await self._delete(f"/user-api-keys/{provider}")
+
+    # ──────────────────────────────────────────────
+    # Billing
+    # ──────────────────────────────────────────────
+
+    async def create_checkout_session(self, tier: str, success_url: str | None = None, cancel_url: str | None = None) -> dict:
+        """Create a Stripe Checkout Session for subscribing to a tier."""
+        body: dict = {"tier": tier}
+        if success_url:
+            body["success_url"] = success_url
+        if cancel_url:
+            body["cancel_url"] = cancel_url
+        return await self._post("/billing/checkout", json=body)
+
+    async def create_portal_session(self, return_url: str | None = None) -> dict:
+        """Create a Stripe Customer Portal session to manage subscription."""
+        body: dict = {}
+        if return_url:
+            body["return_url"] = return_url
+        return await self._post("/billing/portal", json=body)
+
+    async def get_billing_info(self) -> dict:
+        """Get billing info: tier, usage, limits, overage rates."""
+        return await self._get("/billing/info")
+
+    async def get_billing_usage(self, month: str | None = None) -> dict:
+        """Get usage breakdown for current or specified month."""
+        params = {}
+        if month:
+            params["month"] = month
+        return await self._get("/billing/usage", params=params)
 
     # ──────────────────────────────────────────────
     # Tests

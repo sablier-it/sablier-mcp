@@ -10,6 +10,7 @@ Remote mode uses OAuth 2.0 — Claude Desktop opens a browser for login.
 """
 
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import logging
 import os
@@ -32,6 +33,7 @@ from sablier_mcp.client import SablierClient, SablierAPIError
 from sablier_mcp.widgets import (
     betas_heatmap,
     flow_fan_chart,
+    flow_risk_card,
     grain_score_card,
     portfolio_overview,
 )
@@ -84,6 +86,35 @@ if _oauth_provider is not None:
 
 _stdio_client: SablierClient | None = None
 _token_clients: dict[str, SablierClient] = {}
+
+# Global lock for Flow GPU jobs — the worker handles one job at a time.
+# Prevents the MCP from submitting concurrent train/generate/validate jobs.
+_flow_gpu_lock = asyncio.Lock()
+
+
+class _FlowGPUBusy(Exception):
+    """Raised when the GPU lock cannot be acquired (another Flow job is running)."""
+    pass
+
+
+@asynccontextmanager
+async def _acquire_gpu(timeout: float = 30.0):
+    """Acquire the Flow GPU lock with a timeout.
+
+    If another Flow job is already running, waits up to `timeout` seconds.
+    Raises _FlowGPUBusy if the lock isn't acquired in time.
+    """
+    try:
+        await asyncio.wait_for(_flow_gpu_lock.acquire(), timeout=timeout)
+    except asyncio.TimeoutError:
+        raise _FlowGPUBusy(
+            "Another Flow GPU job is already running. "
+            "Please wait for it to finish before starting a new one."
+        )
+    try:
+        yield
+    finally:
+        _flow_gpu_lock.release()
 
 
 def get_client() -> SablierClient:
@@ -259,11 +290,56 @@ async def _ensure_portfolio(
     if len(weights) != len(tickers):
         return {}, "Error: tickers and weights must have the same length."
 
-    # Auto-create portfolio
+    # Auto-create portfolio — reuse existing if name already taken
     name = ", ".join(tickers)
     assets = [{"ticker": t, "weight": w} for t, w in zip(tickers, weights)]
-    portfolio = await client.create_portfolio(name, assets)
+    try:
+        portfolio = await client.create_portfolio(name, assets)
+    except SablierAPIError as e:
+        if e.status_code in (409, 500) and "unique" in str(e).lower():
+            # Duplicate name — find and reuse the existing portfolio
+            all_portfolios = await client.list_portfolios()
+            items = all_portfolios.get("portfolios", all_portfolios) if isinstance(all_portfolios, dict) else all_portfolios
+            match = next((p for p in items if p.get("name") == name), None)
+            if match:
+                portfolio = await client.get_portfolio(match["id"])
+                return portfolio, None
+        raise
     return portfolio, None
+
+
+async def _validate_conditioning_data(conditioning_set_id: str) -> str | None:
+    """Ensure features in a conditioning set have training data.
+
+    If fetched_data_available is false, auto-refreshes the tickers.
+    Never blocks — if refresh fails, logs a warning and lets training
+    decide whether data is sufficient.
+    """
+    client = get_client()
+    feature_set = await client.get_feature_set(conditioning_set_id)
+
+    if feature_set.get("fetched_data_available") is not False:
+        return None  # Flag is true or absent — proceed
+
+    # Collect tickers that need data (skip computed indicators)
+    features = feature_set.get("features", [])
+    tickers = [
+        f.get("ticker")
+        for f in features
+        if isinstance(f, dict) and f.get("type") != "indicator" and f.get("ticker")
+    ]
+
+    if not tickers:
+        return None
+
+    # Auto-refresh so training has the best chance of succeeding
+    try:
+        logger.info("Auto-refreshing %d features for conditioning set %s", len(tickers), conditioning_set_id)
+        await client.refresh_feature_data(tickers)
+    except Exception:
+        logger.warning("Auto-refresh failed for conditioning set %s — proceeding anyway", conditioning_set_id, exc_info=True)
+
+    return None  # Never block — let training validate data sufficiency
 
 
 _NOT_LOGGED_IN = (
@@ -295,7 +371,7 @@ def _require_auth() -> str | None:
 @server.tool(
     name="search_features",
     description="Search for tickers (stocks, ETFs) and market indicators (VIX, DXY, rates). Returns matching symbols with descriptions. Use this to validate tickers before creating a portfolio.",
-    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(title="Search Features", readOnlyHint=True, openWorldHint=True),
 )
 async def search_features(
     query: Annotated[str, Field(description="Search term (e.g. 'AAPL', 'technology', 'volatility', 'gold')")],
@@ -336,6 +412,7 @@ async def search_features(
         "Keys are encrypted at rest. Required before using FRED features — "
         "get a free FRED key at https://fred.stlouisfed.org/docs/api/api_key.html"
     ),
+    annotations=ToolAnnotations(title="Set API Key", destructiveHint=True),
 )
 async def set_api_key(
     provider: Annotated[str, Field(description="Provider name: 'fred' or 'finnhub'")],
@@ -358,7 +435,7 @@ async def set_api_key(
 @server.tool(
     name="list_api_keys",
     description="List the user's stored third-party API keys (providers only, no secrets shown).",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(title="List API Keys", readOnlyHint=True),
 )
 async def list_api_keys() -> str:
     if err := _require_auth():
@@ -380,6 +457,7 @@ async def list_api_keys() -> str:
 @server.tool(
     name="delete_api_key",
     description="Delete a user's stored API key for a third-party provider.",
+    annotations=ToolAnnotations(title="Delete API Key", destructiveHint=True),
 )
 async def delete_api_key(
     provider: Annotated[str, Field(description="Provider to remove: 'fred' or 'finnhub'")],
@@ -409,6 +487,7 @@ async def delete_api_key(
         "Set is_asset=true for assets that go into portfolios, false for conditioning factors. "
         "After adding, call refresh_feature_data to populate its historical data."
     ),
+    annotations=ToolAnnotations(title="Add Feature", destructiveHint=True, openWorldHint=True),
 )
 async def add_feature(
     ticker: Annotated[str, Field(description="Ticker symbol (e.g. 'AAPL', 'DFF', 'CL=F')")],
@@ -452,6 +531,7 @@ async def add_feature(
         "For new features: full fetch from 2000. For existing: incremental update to today. "
         "Use this after add_feature, or to force-update stale data."
     ),
+    annotations=ToolAnnotations(title="Refresh Feature Data", destructiveHint=True, openWorldHint=True),
 )
 async def refresh_feature_data(
     tickers: Annotated[list[str], Field(description="Tickers to refresh (e.g. ['AAPL', 'CL=F', 'DFF'])")],
@@ -473,6 +553,7 @@ async def refresh_feature_data(
         "Examples: 20-day moving average of VIX, spread between 10Y and 2Y rates. "
         "Use list_transformations to see available transformation types."
     ),
+    annotations=ToolAnnotations(title="Create Derived Feature", destructiveHint=True),
 )
 async def create_derived_feature(
     name: Annotated[str, Field(description="Unique name/ticker for the derived feature (e.g. 'VIX_MA20')")],
@@ -499,7 +580,7 @@ async def create_derived_feature(
 @server.tool(
     name="list_transformations",
     description="List available transformation types for creating derived features. Returns names, parameter schemas, and examples.",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(title="List Transformations", readOnlyHint=True),
 )
 async def list_transformations() -> str:
     if err := _require_auth():
@@ -520,7 +601,7 @@ async def list_transformations() -> str:
 @server.tool(
     name="list_portfolios",
     description="List the user's existing portfolios with names, IDs, asset compositions, and status.",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(title="List Portfolios", readOnlyHint=True),
 )
 async def list_portfolios(
     limit: Annotated[int, Field(description="Max portfolios to return", default=50)] = 50,
@@ -551,7 +632,7 @@ async def list_portfolios(
 @server.tool(
     name="get_portfolio",
     description="Get detailed information about a specific portfolio including assets, weights, and associated feature sets. Use the portfolio ID from list_portfolios.",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(title="Get Portfolio", readOnlyHint=True),
 )
 async def get_portfolio(
     portfolio_id: Annotated[str, Field(description="The portfolio UUID")],
@@ -571,6 +652,7 @@ async def get_portfolio(
 @server.tool(
     name="create_portfolio",
     description="Create a new portfolio from tickers and weights. Weights must sum to 1.0. For a single asset, use weight 1.0.",
+    annotations=ToolAnnotations(title="Create Portfolio", destructiveHint=True),
 )
 async def create_portfolio(
     name: Annotated[str, Field(description="Portfolio name (e.g. 'Tech Portfolio')")],
@@ -616,6 +698,7 @@ async def create_portfolio(
         "Only pass the fields you want to update — omitted fields stay unchanged. "
         "Weights must sum to 1.0 if provided."
     ),
+    annotations=ToolAnnotations(title="Update Portfolio", destructiveHint=True),
 )
 async def update_portfolio(
     portfolio_id: Annotated[str, Field(description="The portfolio UUID")],
@@ -657,7 +740,7 @@ async def update_portfolio(
 @server.tool(
     name="get_portfolio_value",
     description="Get the current live value of a portfolio: total value, P&L, and per-position breakdown.",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(title="Get Portfolio Value", readOnlyHint=True),
 )
 async def get_portfolio_value(
     portfolio_id: Annotated[str, Field(description="The portfolio UUID")],
@@ -676,8 +759,8 @@ async def get_portfolio_value(
 
 @server.tool(
     name="get_portfolio_analytics",
-    description="Get portfolio analytics: Sharpe ratio, volatility, expected return, max drawdown, and beta. Supports timeframes: 1W, 1M, 1Y, 2Y, 5Y.",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    description="Get historical portfolio analytics: Sharpe ratio, volatility, expected return, max drawdown, and market beta (benchmarked vs SPY). Supports timeframes: 1W, 1M, 1Y, 2Y, 5Y. This is backward-looking — for forward-looking risk, use simulate_returns or test_flow_risk.",
+    annotations=ToolAnnotations(title="Get Portfolio Analytics", readOnlyHint=True),
 )
 async def get_portfolio_analytics(
     portfolio_id: Annotated[str, Field(description="The portfolio UUID")],
@@ -698,7 +781,7 @@ async def get_portfolio_analytics(
 @server.tool(
     name="get_asset_profiles",
     description="Get asset classification for a portfolio: sector, industry, country, exchange, and asset type per holding.",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(title="Get Asset Profiles", readOnlyHint=True),
 )
 async def get_asset_profiles(
     portfolio_id: Annotated[str, Field(description="The portfolio UUID")],
@@ -718,6 +801,7 @@ async def get_asset_profiles(
 @server.tool(
     name="delete_portfolio",
     description="Delete a portfolio by ID. This is permanent and cannot be undone.",
+    annotations=ToolAnnotations(title="Delete Portfolio", destructiveHint=True),
 )
 async def delete_portfolio(
     portfolio_id: Annotated[str, Field(description="The portfolio UUID to delete")],
@@ -737,10 +821,17 @@ async def delete_portfolio(
 @server.tool(
     name="optimize_portfolio",
     description=(
-        "Find optimal portfolio weights using per-asset simulation data. "
-        "Requires a simulation_batch_id from simulate_betas. "
-        "Objective options: 'max_sharpe', 'min_variance', 'max_return'."
+        "Find optimal portfolio weights using per-asset factor exposures from simulate_betas or analyze_quantitative. "
+        "Requires simulation_batch_id (from their output). "
+        "Objectives: 'max_sharpe' (maximize risk-adjusted return), 'min_variance' (minimize portfolio volatility), "
+        "'max_return' (maximize expected return for given risk). "
+        "Advanced objectives (pass the string directly): 'analytical_risk_parity' (equalize risk contributions), "
+        "'mean_cvar' (minimize CVaR, requires simulation_ids not beta_simulation_ids), "
+        "'expected_utility' (maximize CRRA utility), 'risk_parity' (CVaR-based equal risk), "
+        "'exposure_target' (match target factor exposures — set target_exposures on the API). "
+        "Default: 'max_sharpe'. Long-only constraint applied by default."
     ),
+    annotations=ToolAnnotations(title="Optimize Portfolio", readOnlyHint=True, openWorldHint=True),
 )
 async def optimize_portfolio(
     portfolio_id: Annotated[str, Field(description="The portfolio UUID")],
@@ -766,10 +857,12 @@ async def optimize_portfolio(
 @server.tool(
     name="get_efficient_frontier",
     description=(
-        "Calculate the efficient frontier for portfolio assets. "
-        "Returns a curve of optimal risk-return tradeoffs."
+        "Calculate the mean-variance efficient frontier for portfolio assets using historical returns. "
+        "Returns a curve of optimal risk-return tradeoffs with long-only constraints (no shorting). "
+        "Each point includes optimal weights, expected return, and volatility. "
+        "This is a historical analysis — for forward-looking optimization, use optimize_portfolio with simulation data."
     ),
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(title="Get Efficient Frontier", readOnlyHint=True),
 )
 async def get_efficient_frontier(
     portfolio_id: Annotated[str, Field(description="The portfolio UUID")],
@@ -799,7 +892,7 @@ async def get_efficient_frontier(
         "to themes (0-100). Supports predefined themes ('AI exposure') or custom themes. "
         "Pass either portfolio_id or tickers directly."
     ),
-    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(title="Analyze Qualitative", readOnlyHint=True, openWorldHint=True),
 )
 async def analyze_qualitative(
     themes: Annotated[list[str], Field(description="Themes to score (e.g. ['AI exposure', 'Saudi Arabia risk', 'debt levels'])")],
@@ -924,7 +1017,7 @@ async def analyze_qualitative(
 @server.tool(
     name="list_themes",
     description="Browse the GRAIN theme library. Returns predefined themes with names, descriptions, keywords, and categories.",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(title="List Themes", readOnlyHint=True),
 )
 async def list_themes() -> str:
     if err := _require_auth():
@@ -949,7 +1042,7 @@ async def list_themes() -> str:
 @server.tool(
     name="list_grain_analyses",
     description="List past qualitative (GRAIN) analyses. Optionally filter by portfolio_id.",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(title="List GRAIN Analyses", readOnlyHint=True),
 )
 async def list_grain_analyses(
     portfolio_id: Annotated[str | None, Field(description="Optional: filter by portfolio UUID", default=None)] = None,
@@ -969,7 +1062,7 @@ async def list_grain_analyses(
 @server.tool(
     name="get_grain_analysis",
     description="Load a saved GRAIN analysis with full results: theme scores, per-ticker breakdown, and evidence passages.",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(title="Get GRAIN Analysis", readOnlyHint=True),
 )
 async def get_grain_analysis(
     analysis_id: Annotated[str, Field(description="The analysis UUID from list_grain_analyses")],
@@ -989,7 +1082,7 @@ async def get_grain_analysis(
 @server.tool(
     name="delete_grain_analysis",
     description="Delete a saved GRAIN qualitative analysis by ID. This cannot be undone.",
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True),
+    annotations=ToolAnnotations(title="Delete GRAIN Analysis", readOnlyHint=False, destructiveHint=True),
 )
 async def delete_grain_analysis(
     analysis_id: Annotated[str, Field(description="The analysis UUID to delete")],
@@ -1013,8 +1106,8 @@ async def delete_grain_analysis(
 
 @server.tool(
     name="list_model_groups",
-    description="List all existing analyses. Each analysis ties a portfolio to a set of market drivers and contains per-asset models. Use this to find previous work, check if training is done, or retrieve simulation results for risk testing and scenarios.",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    description="List all model groups (each created by analyze_quantitative or generate_synthetic). A model group ties a portfolio to a conditioning set and contains per-asset models. Check model_type: null/absent = Moment (linear), 'flow_generative' = Flow. Use this to find model_group_ids for simulate_betas, simulate_returns, generate_synthetic (resume), or run_model_validation.",
+    annotations=ToolAnnotations(title="List Model Groups", readOnlyHint=True),
 )
 async def list_model_groups() -> str:
     if err := _require_auth():
@@ -1030,6 +1123,7 @@ async def list_model_groups() -> str:
                 "name": g.get("name"),
                 "conditioning_set": g.get("conditioning_set_name"),
                 "status": g.get("status"),
+                "model_type": g.get("model_type"),  # 'flow_generative' or None (Moment)
                 "model_count": len(models),
                 "models": [
                     {
@@ -1049,7 +1143,7 @@ async def list_model_groups() -> str:
 @server.tool(
     name="list_feature_set_templates",
     description="Browse pre-built sets of market drivers (e.g. interest rates, volatility, commodities). Returns template names, factors, and conditioning_set_id needed by analyze_quantitative.",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(title="List Feature Set Templates", readOnlyHint=True),
 )
 async def list_feature_set_templates() -> str:
     if err := _require_auth():
@@ -1071,6 +1165,7 @@ async def list_feature_set_templates() -> str:
         "The display_name is auto-resolved from available_features if omitted. "
         "Returns the conditioning_set_id that can be passed to analyze_quantitative."
     ),
+    annotations=ToolAnnotations(title="Create Feature Set", destructiveHint=True),
 )
 async def create_feature_set(
     name: Annotated[str, Field(description="Name for the set (e.g. 'Custom Macro Factors')")],
@@ -1111,7 +1206,7 @@ async def create_feature_set(
         "Filter by set_type ('conditioning' or 'target'). "
         "Use this to find conditioning_set_id values for analyze_quantitative."
     ),
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(title="List Feature Sets", readOnlyHint=True),
 )
 async def list_feature_sets(
     set_type: Annotated[str | None, Field(description="Filter: 'conditioning' or 'target'. Omit for all.", default=None)] = None,
@@ -1140,7 +1235,7 @@ async def list_feature_sets(
 @server.tool(
     name="get_feature_set",
     description="Get detailed information about a specific feature set including all features and their configuration.",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(title="Get Feature Set", readOnlyHint=True),
 )
 async def get_feature_set(
     feature_set_id: Annotated[str, Field(description="UUID of the feature set")],
@@ -1160,6 +1255,7 @@ async def get_feature_set(
 @server.tool(
     name="delete_feature_set",
     description="Delete a custom feature set. This is permanent and cannot be undone. Cannot delete shared templates.",
+    annotations=ToolAnnotations(title="Delete Feature Set", destructiveHint=True),
 )
 async def delete_feature_set(
     feature_set_id: Annotated[str, Field(description="UUID of the feature set to delete")],
@@ -1179,6 +1275,7 @@ async def delete_feature_set(
 @server.tool(
     name="delete_model_group",
     description="Delete a model group and all its models, simulations, and associated data. This is permanent.",
+    annotations=ToolAnnotations(title="Delete Model Group", destructiveHint=True),
 )
 async def delete_model_group(
     model_group_id: Annotated[str, Field(description="UUID of the model group to delete")],
@@ -1202,7 +1299,7 @@ async def delete_model_group(
         "Shows how much unexplained co-movement exists between assets after accounting for factor exposures. "
         "High residual correlations suggest missing common factors."
     ),
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(title="Get Residual Correlation", readOnlyHint=True),
 )
 async def get_residual_correlation(
     model_group_id: Annotated[str, Field(description="UUID of the model group")],
@@ -1221,8 +1318,8 @@ async def get_residual_correlation(
 
 @server.tool(
     name="list_simulations",
-    description="List all simulations (betas computations) for a model group. Returns simulation IDs, dates, and status.",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    description="List past beta computation runs for a Moment model group. Each entry is a simulate_betas invocation with its simulation_batch_id, date, and status. Use this to find older simulation_batch_ids for simulate_returns. NOT for Flow models — use list_flow_scenarios for those.",
+    annotations=ToolAnnotations(title="List Simulations", readOnlyHint=True),
 )
 async def list_simulations(
     model_group_id: Annotated[str, Field(description="UUID of the model group")],
@@ -1244,11 +1341,13 @@ async def list_simulations(
 @server.tool(
     name="simulate_betas",
     description=(
-        "Compute how each asset in a trained model group responds to the chosen market drivers. "
-        "Requires model_group_id (status must be 'trained'). "
-        "Returns per-asset factor exposures, simulation_batch_id, and current factor levels (factor_means)."
+        "Re-compute factor exposures (betas) for an already-trained model group. "
+        "Use this when you already have a trained model_group_id (from analyze_quantitative or list_model_groups) "
+        "and want to refresh betas with a different lookback window, or get a new simulation_batch_id. "
+        "You do NOT need this if you just ran analyze_quantitative — it already includes this step. "
+        "Returns per-asset factor exposures, simulation_batch_id (for simulate_returns), and factor_last_values_raw."
     ),
-    annotations=ToolAnnotations(openWorldHint=True),
+    annotations=ToolAnnotations(title="Simulate Betas", readOnlyHint=True, openWorldHint=True),
 )
 async def simulate_betas(
     model_group_id: Annotated[str, Field(description="UUID of the trained model group (from analyze_quantitative or list_model_groups)")],
@@ -1289,7 +1388,7 @@ async def simulate_betas(
         "Use this after analyze_quantitative to assess model reliability before running scenarios. "
         "For cached results from a previous run, use get_model_validation instead."
     ),
-    annotations=ToolAnnotations(openWorldHint=True),
+    annotations=ToolAnnotations(title="Run Model Validation", readOnlyHint=True, openWorldHint=True),
 )
 async def run_model_validation(
     model_group_id: Annotated[str, Field(description="UUID of the model group (from analyze_quantitative or list_model_groups)")],
@@ -1320,7 +1419,7 @@ async def run_model_validation(
         "Returns per-asset model quality: R², autocorrelation, regime sensitivity, pass rate, "
         "and quality badge. To trigger a fresh validation, use run_model_validation instead."
     ),
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(title="Get Model Validation", readOnlyHint=True),
 )
 async def get_model_validation(
     model_group_id: Annotated[str, Field(description="UUID of the model group (from analyze_quantitative or list_model_groups)")],
@@ -1367,14 +1466,16 @@ def _format_validation_results(model_group_id: str, result: dict) -> str:
 @server.tool(
     name="simulate_returns",
     description=(
-        "Run a what-if scenario — this is the PRIMARY tool for stress-testing a portfolio. "
+        "Run an ad-hoc what-if stress test on a Moment (linear) model — the PRIMARY tool for quick scenario analysis. "
         "Requires simulation_batch_id from analyze_quantitative or simulate_betas. "
         "Pass ALL conditioning_features as absolute price levels in the factors dict. "
         "Use factor_last_values_raw from the betas output as current baseline, then compute targets "
         "(e.g. to shock SPY -5% from current 633: pass {'US Market': 601.35}). "
-        "Returns per-asset expected returns, VaR, Expected Shortfall, and return distribution."
+        "Returns per-asset expected returns, VaR, Expected Shortfall, and return distribution. "
+        "For saved/reusable scenarios, use create_scenario + run_scenario instead. "
+        "For Flow (generative) models, use simulate_flow_scenario instead."
     ),
-    annotations=ToolAnnotations(openWorldHint=True),
+    annotations=ToolAnnotations(title="Simulate Returns", readOnlyHint=True, openWorldHint=True),
 )
 async def simulate_returns(
     simulation_batch_id: Annotated[str, Field(description="From analyze_quantitative or simulate_betas results")],
@@ -1443,12 +1544,14 @@ async def simulate_returns(
 @server.tool(
     name="create_scenario",
     description=(
-        "Save a named scenario template to the database for later reuse. "
-        "This does NOT run a simulation — use simulate_returns to actually run what-if scenarios. "
-        "Requires model_id (an individual model UUID, NOT model_group_id). "
+        "Save a named Moment scenario template for later reuse with run_scenario. "
+        "This does NOT run a simulation — use run_scenario to execute it, or simulate_returns for ad-hoc tests. "
+        "IMPORTANT: requires model_id — this is an individual per-asset model UUID from list_model_groups → models[].model_id, "
+        "NOT the model_group_id. Each scenario is tied to one asset's model. "
         "Factor spec format: {'VIX': {'type': 'fixed', 'value': 35}}. "
         "Supported types: 'fixed' (exact value), 'percentile' (historical percentile), 'shock' (std dev shift)."
     ),
+    annotations=ToolAnnotations(title="Create Scenario", destructiveHint=True),
 )
 async def create_scenario(
     model_id: Annotated[str, Field(description="UUID of the model this scenario applies to")],
@@ -1481,10 +1584,12 @@ async def create_scenario(
 @server.tool(
     name="list_scenarios",
     description=(
-        "List saved scenario templates. These are stored factor specs — "
-        "to actually run a scenario, use simulate_returns with the factor values."
+        "List saved Moment scenario templates (created via create_scenario or clone_scenario). "
+        "These are stored factor specs tied to individual model_ids — "
+        "to execute one, use run_scenario. For ad-hoc tests, use simulate_returns directly. "
+        "NOT for Flow scenarios — use list_flow_scenarios for those."
     ),
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(title="List Scenarios", readOnlyHint=True),
 )
 async def list_scenarios(
     model_id: Annotated[str | None, Field(description="Optional model UUID to filter by", default=None)] = None,
@@ -1516,7 +1621,7 @@ async def list_scenarios(
 @server.tool(
     name="get_scenario",
     description="Get detailed information about a saved scenario including its factor specs.",
-    annotations=ToolAnnotations(readOnlyHint=True),
+    annotations=ToolAnnotations(title="Get Scenario", readOnlyHint=True),
 )
 async def get_scenario(
     scenario_id: Annotated[str, Field(description="The scenario UUID")],
@@ -1539,6 +1644,7 @@ async def get_scenario(
         "Update a saved scenario. Can change name, description, or factor specs. "
         "Only pass the fields you want to update."
     ),
+    annotations=ToolAnnotations(title="Update Scenario", destructiveHint=True),
 )
 async def update_scenario(
     scenario_id: Annotated[str, Field(description="The scenario UUID")],
@@ -1570,6 +1676,7 @@ async def update_scenario(
 @server.tool(
     name="delete_scenario",
     description="Delete a saved scenario. This is permanent.",
+    annotations=ToolAnnotations(title="Delete Scenario", destructiveHint=True),
 )
 async def delete_scenario(
     scenario_id: Annotated[str, Field(description="The scenario UUID to delete")],
@@ -1588,7 +1695,8 @@ async def delete_scenario(
 
 @server.tool(
     name="clone_scenario",
-    description="Clone an existing scenario (typically a template) to create your own editable copy.",
+    description="Clone an existing Moment scenario (typically a shared template) to create your own editable copy. After cloning, use update_scenario to customize factor specs, then run_scenario to execute it.",
+    annotations=ToolAnnotations(title="Clone Scenario", destructiveHint=True),
 )
 async def clone_scenario(
     scenario_id: Annotated[str, Field(description="UUID of the scenario to clone")],
@@ -1612,12 +1720,13 @@ async def clone_scenario(
 @server.tool(
     name="run_scenario",
     description=(
-        "Run a saved scenario through its pipeline. For Moment scenarios (with factor_values): "
-        "synchronously computes factor exposures and simulates returns under the stressed factors. "
-        "For Flow scenarios (with or without constraints): queues an async GPU job. "
-        "Returns completed results for Moment, or a job_id to poll for Flow."
+        "Run a previously saved scenario template (from create_scenario or clone_scenario). "
+        "For Moment scenarios: synchronously computes betas + simulates returns under the saved factor specs. "
+        "For Flow scenarios: queues an async GPU job. "
+        "Use simulate_returns for ad-hoc what-if tests without saving a scenario first. "
+        "Use simulate_flow_scenario for ad-hoc Flow what-if tests with constraints."
     ),
-    annotations=ToolAnnotations(openWorldHint=True),
+    annotations=ToolAnnotations(title="Run Scenario", readOnlyHint=True, openWorldHint=True),
 )
 async def run_scenario(
     scenario_id: Annotated[str, Field(description="UUID of the scenario to run")],
@@ -1664,8 +1773,8 @@ async def run_scenario(
                 "status": status,
                 "job_id": result.get("job_id"),
                 "message": (
-                    "Flow scenario job submitted. Use get_flow_job_status with "
-                    "job_type='generate' to check progress and get results."
+                    "Flow scenario job submitted. The job is running asynchronously. "
+                    "Use simulate_flow_scenario for new constrained scenarios instead."
                 ),
             })
         else:
@@ -1682,12 +1791,16 @@ async def run_scenario(
 @server.tool(
     name="analyze_quantitative",
     description=(
-        "One-shot quantitative analysis: builds factor models, trains, and computes asset sensitivities to "
-        "market drivers. Uses a two-layer conditioning architecture: a thematic layer (conditioning_set_id, required) "
-        "and an optional baseline layer (baseline_set_id) that absorbs common market variance before thematic factors. "
+        "Build and train linear factor models for a portfolio in one step (creates models → trains → computes betas). "
+        "This is the starting point for Moment (linear) analysis. "
+        "Requires conditioning_set_id (the market drivers — get one from list_feature_set_templates or create_feature_set). "
+        "Uses a two-layer architecture: thematic factors (conditioning_set_id) + optional baseline factors "
+        "(use_baseline=True absorbs market/value/growth variance before thematic factors). "
         "Pass either portfolio_id or tickers directly (auto-creates portfolio with equal weights). "
-        "Returns factor exposures, simulation_batch_id for use with simulate_returns."
+        "Returns: factor exposures (betas), simulation_batch_id, and factor_last_values_raw. "
+        "Next step: call simulate_returns with the simulation_batch_id to run what-if stress tests."
     ),
+    annotations=ToolAnnotations(title="Analyze Quantitative", destructiveHint=True, openWorldHint=True),
 )
 async def analyze_quantitative(
     conditioning_set_id: Annotated[str, Field(description="UUID of the thematic conditioning set (from list_feature_set_templates or create_feature_set)")],
@@ -1712,6 +1825,10 @@ async def analyze_quantitative(
         target_set_id = portfolio.get("target_set_id")
         asset_tickers = _portfolio_tickers(portfolio)
         portfolio_name = portfolio.get("name", "")
+
+        # Pre-flight: ensure conditioning set has fetched data
+        if data_err := await _validate_conditioning_data(conditioning_set_id):
+            return data_err
 
         client = get_client()
 
@@ -1799,120 +1916,564 @@ async def analyze_quantitative(
 
 
 @server.tool(
-    name="flow_train",
+    name="generate_synthetic",
     description=(
-        "Train an OT-CFM flow model for generative time series simulation. "
-        "This learns the joint distribution of assets + factors and can generate realistic multi-step paths. "
-        "Requires a model_group_id with trained Moment models. "
-        "This is an async GPU job — the tool will poll until completion."
+        "Train a generative Flow model and produce simulated multi-step price trajectories. "
+        "This is the starting point for Flow analysis (the generative alternative to Moment/linear). "
+        "Returns per-asset path distributions, feature_names (needed for simulate_flow_scenario constraints), "
+        "and IDs for follow-up tools (simulate_flow_scenario, test_flow_risk, flow_validate). "
+        "TWO MODES: "
+        "(1) NEW RUN: pass conditioning_set_id + tickers/portfolio_id. Trains on GPU (~5-15 min) then generates paths (~1-3 min). "
+        "(2) RESUME: pass model_group_id (from list_model_groups where model_type='flow_generative') to retrieve "
+        "existing results instantly or generate new paths without retraining. No conditioning_set_id needed. "
+        "Defaults: horizon=20 (~1 month), n_paths=500. Use horizon=60 for quarterly, 120 for 6-month views."
     ),
+    annotations=ToolAnnotations(title="Generate Synthetic Paths", destructiveHint=True, openWorldHint=True),
 )
-async def flow_train(
-    model_group_id: Annotated[str, Field(description="UUID of the model group (must have trained Moment models)")],
-    horizon: Annotated[int, Field(description="Number of future time steps to generate (default 20)", default=20)] = 20,
-    obs_length: Annotated[int, Field(description="Context window length for conditioning (default 60)", default=60)] = 60,
-    max_epochs: Annotated[int, Field(description="Maximum training epochs (default 500)", default=500)] = 500,
-) -> str:
+async def generate_synthetic(
+    conditioning_set_id: Annotated[str | None, Field(
+        description="UUID of the conditioning set (from list_feature_set_templates or create_feature_set). Required for new runs, not needed when resuming with model_group_id.",
+        default=None,
+    )] = None,
+    model_group_id: Annotated[str | None, Field(
+        description="UUID of an existing Flow model group (from list_model_groups). If provided, skips creation/training and retrieves existing results or generates new paths.",
+        default=None,
+    )] = None,
+    portfolio_id: Annotated[str | None, Field(
+        description="UUID of an existing portfolio. If omitted, provide tickers instead.",
+        default=None,
+    )] = None,
+    tickers: Annotated[list[str] | None, Field(
+        description="Tickers to analyze (e.g. ['AAPL', 'MSFT']). Auto-creates a portfolio if portfolio_id is not given.",
+        default=None,
+    )] = None,
+    weights: Annotated[list[float] | None, Field(
+        description="Optional weights (must sum to 1.0). Defaults to equal weights.",
+        default=None,
+    )] = None,
+    horizon: Annotated[int, Field(
+        description="Forecast horizon in trading days. ~1 month = 20, ~1 quarter = 60, ~6 months = 120. Default 20.",
+        default=20,
+    )] = 20,
+    n_paths: Annotated[int, Field(
+        description="Number of paths to generate. More = better statistics but slower. 500 default, 1000+ for high-confidence.",
+        default=500,
+    )] = 500,
+) -> list | str:
     if err := _require_auth():
         return err
-    if err := _validate_uuid(model_group_id, "model_group_id"):
-        return err
+
     try:
         client = get_client()
-        job = await client.flow_train(
-            model_group_id=model_group_id,
-            horizon=horizon, obs_length=obs_length, max_epochs=max_epochs,
-        )
-        job_id = job.get("job_id")
-        if not job_id:
-            return "Error: Flow training did not return a job_id."
+        feature_names = []
 
-        feature_names = job.get("feature_names", [])
-        feature_note = ""
-        if feature_names:
-            feature_note = (
-                f" The model's features are: {feature_names}. "
-                "When using flow_generate_constrained_paths, constraint feature_name "
-                "must be one of these."
-            )
+        # ── Resume path: model_group_id provided → skip creation/training ──
+        if model_group_id:
+            if err := _validate_uuid(model_group_id, "model_group_id"):
+                return err
 
-        return _fmt({
-            "status": "submitted",
-            "job_id": job_id,
+            # Fetch model group info (needed for status check + portfolio resolution)
+            _mg_info = None
+            try:
+                groups = await client.list_model_groups()
+                _mg_info = next((g for g in groups if g.get("id") == model_group_id), None)
+            except Exception:
+                logger.debug("Could not fetch model groups", exc_info=True)
+
+            # Resolve portfolio_id from model group if not provided
+            if not portfolio_id and _mg_info:
+                try:
+                    ptsi = _mg_info.get("parent_target_set_id")
+                    if ptsi:
+                        plist = await client.list_portfolios()
+                        items = plist.get("portfolios", plist) if isinstance(plist, dict) else plist
+                        match = next((p for p in items if p.get("target_set_id") == ptsi), None)
+                        if match:
+                            portfolio_id = match["id"]
+                except Exception:
+                    logger.debug("Could not resolve portfolio_id from model group", exc_info=True)
+
+            # Try to fetch existing completed results first
+            try:
+                results = await client.flow_get_latest_results(model_group_id)
+                summary = results.get("summary") or {}
+                feature_names = results.get("feature_names", [])
+                gen_job_id = results.get("job_id", "")
+
+                if summary:
+                    # Results already exist — return them immediately
+                    per_asset = {}
+                    for name, data in summary.items():
+                        if not isinstance(data, dict):
+                            continue
+                        per_asset[name] = {
+                            "last_price": data.get("last_price"),
+                            "mean_return": data.get("mean_return"),
+                            "median_terminal": data.get("median_terminal"),
+                            "p5": data.get("p5"),
+                            "p95": data.get("p95"),
+                            "feature_type": data.get("feature_type"),
+                        }
+
+                    pid_str = f"'{portfolio_id}'" if portfolio_id else "'<find via list_portfolios>'"
+                    feat_hint = f" Features for constraints: {', '.join(feature_names[:10])}." if feature_names else ""
+                    output = {
+                        "status": "completed (existing results)",
+                        "model_group_id": model_group_id,
+                        "portfolio_id": portfolio_id,
+                        "flow_job_id": str(gen_job_id),
+                        "horizon": results.get("horizon", horizon),
+                        "n_paths": results.get("n_paths", n_paths),
+                        "feature_names": feature_names,
+                        "per_asset": per_asset,
+                        "next_steps": (
+                            f"Available actions: "
+                            f"simulate_flow_scenario(model_group_id='{model_group_id}', portfolio_id={pid_str}, constraints=...) for what-if scenarios | "
+                            f"test_flow_risk(portfolio_id={pid_str}, flow_job_id='{gen_job_id}') for risk metrics | "
+                            f"flow_validate(model_group_id='{model_group_id}') for model quality check | "
+                            f"list_flow_scenarios(model_group_id='{model_group_id}') to see past scenarios.{feat_hint}"
+                        ),
+                    }
+
+                    try:
+                        chart_html = flow_fan_chart(summary, results.get("horizon", horizon))
+                        if chart_html:
+                            return _with_widget(_fmt(output), chart_html)
+                    except Exception:
+                        pass
+                    return _fmt(output)
+            except SablierAPIError as e:
+                if e.status_code != 404:
+                    raise
+                # 404 = no existing results, fall through to generate new paths
+
+            # Check model status before generating — avoid retrying for 5 min on untrained/failed models
+            try:
+                mg_status = (_mg_info.get("status") or "").lower() if _mg_info else ""
+                if mg_status in ("failed", "error"):
+                    return _fmt({
+                        "error": f"Model group status is '{mg_status}'. Cannot generate paths from a failed model.",
+                        "model_group_id": model_group_id,
+                        "hint": "Create a new model with generate_synthetic(conditioning_set_id=..., tickers=...).",
+                    })
+                if mg_status not in ("trained", "completed", ""):
+                    return _fmt({
+                        "error": f"Model group status is '{mg_status}'. Training may still be in progress or was never started.",
+                        "model_group_id": model_group_id,
+                        "hint": "Wait for training to complete, or create a new model with generate_synthetic(conditioning_set_id=..., tickers=...).",
+                    })
+            except Exception:
+                logger.debug("Could not check model group status", exc_info=True)
+
+            # Model is trained — generate paths (hold GPU lock for full duration)
+            async with _acquire_gpu():
+                gen_job = await _retry_gpu_call(lambda: client.flow_generate_paths(
+                    model_group_id=model_group_id,
+                    n_paths=n_paths,
+                    horizon=horizon,
+                ))
+                gen_job_id = gen_job.get("job_id")
+                if not gen_job_id:
+                    return _fmt({
+                        "error": "Path generation did not return a job_id.",
+                        "model_group_id": model_group_id,
+                    })
+
+                gen_result = await client.poll_flow_job(
+                    gen_job_id, f"/flow/{gen_job_id}/results",
+                )
+
+            gen_status = gen_result.get("status", "")
+            if gen_status == "failed":
+                return _fmt({
+                    "error": "Path generation failed.",
+                    "model_group_id": model_group_id,
+                    "details": gen_result.get("error") or gen_result,
+                })
+
+            results = await client.flow_get_results(gen_job_id)
+            summary = results.get("summary") or {}
+            if results.get("feature_names"):
+                feature_names = results["feature_names"]
+
+        # ── New run path: create models, train, generate ──
+        else:
+            if not conditioning_set_id:
+                return "Error: conditioning_set_id is required for new runs. Use list_feature_set_templates to find one, or pass model_group_id to resume an existing model."
+            if err := _validate_uuid(conditioning_set_id, "conditioning_set_id"):
+                return err
+
+            # Step 0: Resolve or auto-create portfolio
+            portfolio, err = await _ensure_portfolio(portfolio_id, tickers, weights)
+            if err:
+                return err
+            portfolio_id = portfolio["id"]
+            target_set_id = portfolio.get("target_set_id")
+            asset_tickers = _portfolio_tickers(portfolio)
+            portfolio_name = portfolio.get("name", "")
+
+            # Pre-flight: ensure conditioning set has fetched data
+            if data_err := await _validate_conditioning_data(conditioning_set_id):
+                return data_err
+
+            # Step 1: Create models (linked to portfolio via parent_target_set_id)
+            create_result = await _retry_api_call(lambda: client.batch_create_models(
+                conditioning_set_id=conditioning_set_id,
+                asset_tickers=asset_tickers,
+                parent_target_set_id=target_set_id,
+                group_name=portfolio_name or None,
+            ))
+            model_group_id = create_result.get("model_group_id")
+            if not model_group_id:
+                return "Error: model creation did not return a model_group_id."
+
+            total_created = create_result.get("total_created", 0)
+            if total_created == 0:
+                return _fmt({
+                    "error": "No models were created.",
+                    "total_failed": create_result.get("total_failed", 0),
+                    "failed_assets": create_result.get("failed_assets", []),
+                })
+
+            # Steps 2-3: Train + Generate (hold GPU lock for full duration)
+            async with _acquire_gpu():
+                # Step 2: Train Flow model
+                train_job = await _retry_gpu_call(lambda: client.flow_train(
+                    model_group_id=model_group_id,
+                    horizon=horizon,
+                ))
+                train_job_id = train_job.get("job_id")
+                if not train_job_id:
+                    return "Error: Flow training did not return a job_id."
+
+                feature_names = train_job.get("feature_names", [])
+
+                # Poll training until completion
+                train_result = await client.poll_flow_train(train_job_id)
+                train_status = train_result.get("status", "")
+                if train_status == "failed":
+                    return _fmt({
+                        "error": "Flow training failed.",
+                        "model_group_id": model_group_id,
+                        "details": train_result.get("error") or train_result,
+                    })
+                if train_status != "completed":
+                    return _fmt({
+                        "error": f"Flow training ended with status '{train_status}'. Try again or check logs.",
+                        "model_group_id": model_group_id,
+                    })
+
+                # Update feature_names from training result if available
+                if train_result.get("feature_names"):
+                    feature_names = train_result["feature_names"]
+
+                # Step 3: Generate baseline paths
+                gen_job = await _retry_gpu_call(lambda: client.flow_generate_paths(
+                    model_group_id=model_group_id,
+                    n_paths=n_paths,
+                    horizon=horizon,
+                ))
+                gen_job_id = gen_job.get("job_id")
+                if not gen_job_id:
+                    return _fmt({
+                        "error": "Path generation did not return a job_id.",
+                        "model_group_id": model_group_id,
+                        "note": "Training succeeded. You can retry with model_group_id to skip training.",
+                    })
+
+                # Poll generation until completion
+                gen_result = await client.poll_flow_job(
+                    gen_job_id, f"/flow/{gen_job_id}/results",
+                )
+
+            gen_status = gen_result.get("status", "")
+            if gen_status == "failed":
+                return _fmt({
+                    "error": "Path generation failed.",
+                    "model_group_id": model_group_id,
+                    "details": gen_result.get("error") or gen_result,
+                })
+
+            # Fetch full results
+            results = await client.flow_get_results(gen_job_id)
+            summary = results.get("summary") or {}
+            if results.get("feature_names"):
+                feature_names = results["feature_names"]
+
+        # Build per-asset stats from summary
+        per_asset = {}
+        for name, data in summary.items():
+            if not isinstance(data, dict):
+                continue
+            per_asset[name] = {
+                "last_price": data.get("last_price"),
+                "mean_return": data.get("mean_return"),
+                "median_terminal": data.get("median_terminal"),
+                "p5": data.get("p5"),
+                "p95": data.get("p95"),
+                "feature_type": data.get("feature_type"),
+            }
+
+        feat_hint = f" Features for constraints: {', '.join(feature_names[:10])}." if feature_names else ""
+        output = {
+            "status": "completed",
             "model_group_id": model_group_id,
+            "portfolio_id": portfolio_id,
+            "flow_job_id": str(gen_job_id),
+            "horizon": horizon,
+            "n_paths": results.get("n_paths", n_paths),
             "feature_names": feature_names,
-            "message": (
-                "Flow training job submitted. Training typically takes 5-15 minutes. "
-                "Use get_flow_job_status to check progress. "
-                "Once completed, use flow_generate_paths or flow_generate_constrained_paths."
-                + feature_note
+            "per_asset": per_asset,
+            "next_steps": (
+                f"Available actions: "
+                f"simulate_flow_scenario(model_group_id='{model_group_id}', portfolio_id='{portfolio_id}', constraints=...) for what-if scenarios | "
+                f"test_flow_risk(portfolio_id='{portfolio_id}', flow_job_id='{gen_job_id}') for risk metrics | "
+                f"flow_validate(model_group_id='{model_group_id}') for model quality check | "
+                f"list_flow_scenarios(model_group_id='{model_group_id}') to see past scenarios.{feat_hint}"
             ),
-        })
+        }
+
+        try:
+            chart_html = flow_fan_chart(summary, horizon)
+            if chart_html:
+                return _with_widget(_fmt(output), chart_html)
+        except Exception:
+            logger.warning("Fan chart generation failed, returning text-only", exc_info=True)
+
+        return _fmt(output)
+    except _FlowGPUBusy as e:
+        return str(e)
     except SablierAPIError as e:
         return _api_error(e)
+    except Exception as e:
+        logger.error("generate_synthetic failed: %s", e, exc_info=True)
+        return "Flow analysis failed unexpectedly. Please try again."
 
 
 @server.tool(
-    name="flow_generate_paths",
+    name="simulate_flow_scenario",
     description=(
-        "Generate unconditional multi-step paths from a trained Flow model. "
-        "Produces realistic joint trajectories of assets and factors. "
-        "This is an async GPU job — returns immediately. "
-        "Use get_flow_job_status with job_type='generate' to check progress and retrieve results."
+        "Generate constrained what-if scenarios from a trained Flow model. "
+        "Requires model_group_id and feature_names from generate_synthetic. "
+        "IMPORTANT: feature_name in constraints must be the DISPLAY NAME from generate_synthetic's feature_names "
+        "(e.g. 'Apple Inc.', 'NVIDIA Corporation', 'SPDR S&P 500 ETF Trust'), NOT ticker symbols. "
+        "Constraint types: 'level' (absolute price bounds), 'return' (per-step return bounds). "
+        "Returns constrained paths + paired unconstrained baseline + satisfaction_rate (0-1). "
+        "Pass portfolio_id through so test_flow_risk can be called directly on results. "
+        "Run multiple scenarios and compare via test_flow_risk on each flow_job_id."
     ),
+    annotations=ToolAnnotations(title="Simulate Flow Scenario", readOnlyHint=True, openWorldHint=True),
 )
-async def flow_generate_paths(
-    model_group_id: Annotated[str, Field(description="UUID of the model group with a trained Flow model")],
-    n_paths: Annotated[int, Field(description="Number of paths to generate (default 100)", default=100)] = 100,
-    horizon: Annotated[int | None, Field(description="Override horizon (defaults to training horizon)", default=None)] = None,
-) -> str:
-    if err := _require_auth():
-        return err
-    if err := _validate_uuid(model_group_id, "model_group_id"):
-        return err
-    try:
-        client = get_client()
-        job = await client.flow_generate_paths(
-            model_group_id=model_group_id, n_paths=n_paths, horizon=horizon,
-        )
-        job_id = job.get("job_id")
-        if not job_id:
-            return "Error: Path generation did not return a job_id."
-
-        return _fmt({
-            "status": "submitted",
-            "job_id": job_id,
-            "model_group_id": model_group_id,
-            "message": (
-                "Path generation job submitted. Typically takes 1-3 minutes. "
-                "Use get_flow_job_status with job_type='generate' to check progress and get results."
-            ),
-        })
-    except SablierAPIError as e:
-        return _api_error(e)
-
-
-@server.tool(
-    name="flow_generate_constrained_paths",
-    description=(
-        "Generate paths with inequality constraints using SMC particle filtering. "
-        "Example: generate paths where gold stays above $3000 and VIX stays below 20. "
-        "Constraints specify bounds on feature levels or returns over time windows. "
-        "This is an async GPU job — returns immediately. "
-        "Use get_flow_job_status with job_type='generate' to check progress and retrieve results."
-    ),
-)
-async def flow_generate_constrained_paths(
-    model_group_id: Annotated[str, Field(description="UUID of the model group with a trained Flow model")],
+async def simulate_flow_scenario(
+    model_group_id: Annotated[str, Field(
+        description="UUID of the model group with a trained Flow model (from generate_synthetic)"
+    )],
     constraints: Annotated[list[dict], Field(
         description=(
-            "List of inequality constraints. Each constraint: "
-            "{'feature_name': 'GC=F', 'type': 'level', 'lower': 3000, 'upper': null, 't_start': 0, 't_end': 20}. "
-            "Types: 'level' (absolute price), 'return' (cumulative return)."
+            "List of constraints. Each: "
+            "{'feature_name': 'Apple Inc.', 'type': 'level', 'lower': 200, 'upper': null, 't_start': 0, 't_end': 20}. "
+            "Types: 'level' (absolute price bounds), 'return' (per-step return bounds). "
+            "feature_name must be from generate_synthetic's feature_names list."
         )
     )],
-    n_paths: Annotated[int, Field(description="Number of paths to generate (default 100)", default=100)] = 100,
-    horizon: Annotated[int | None, Field(description="Override horizon (defaults to training horizon)", default=None)] = None,
+    portfolio_id: Annotated[str | None, Field(
+        description="UUID of the portfolio (from generate_synthetic). Pass it through so test_flow_risk can be called directly on the results.",
+        default=None,
+    )] = None,
+    n_paths: Annotated[int, Field(
+        description="Number of paths to generate. More = better diversity. 500 default, 1000+ for high-confidence.",
+        default=500,
+    )] = 500,
+    horizon: Annotated[int | None, Field(
+        description="Override horizon (defaults to training horizon).",
+        default=None,
+    )] = None,
+) -> list | str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(model_group_id, "model_group_id"):
+        return err
+    try:
+        client = get_client()
+
+        # Constrained generation (hold GPU lock for full duration)
+        async with _acquire_gpu():
+            job = await _retry_gpu_call(lambda: client.flow_generate_constrained_paths(
+                model_group_id=model_group_id,
+                constraints=constraints,
+                n_paths=n_paths,
+                horizon=horizon,
+            ))
+            job_id = job.get("job_id")
+            if not job_id:
+                return "Error: Constrained generation did not return a job_id."
+
+            # Poll until completion
+            poll_result = await client.poll_flow_job(
+                job_id, f"/flow/{job_id}/results",
+            )
+
+        poll_status = poll_result.get("status", "")
+        if poll_status == "failed":
+            return _fmt({
+                "error": "Constrained generation failed.",
+                "model_group_id": model_group_id,
+                "details": poll_result.get("error") or poll_result,
+            })
+
+        # Fetch full results
+        results = await client.flow_get_results(job_id)
+        summary = results.get("summary") or {}
+        baseline_summary = results.get("baseline_summary") or {}
+        satisfaction_rate = results.get("satisfaction_rate")
+        result_horizon = results.get("horizon", horizon or 20)
+
+        # Build per-asset stats
+        per_asset = {}
+        for name, data in summary.items():
+            if not isinstance(data, dict):
+                continue
+            entry = {
+                "last_price": data.get("last_price"),
+                "mean_return": data.get("mean_return"),
+                "median_terminal": data.get("median_terminal"),
+                "p5": data.get("p5"),
+                "p95": data.get("p95"),
+            }
+            # Add baseline comparison if available
+            bl = baseline_summary.get(name) or {}
+            if bl:
+                entry["baseline_mean_return"] = bl.get("mean_return")
+                entry["baseline_median_terminal"] = bl.get("median_terminal")
+            per_asset[name] = entry
+
+        pid_str = f"'{portfolio_id}'" if portfolio_id else "'<from generate_synthetic>'"
+        output = {
+            "status": "completed",
+            "model_group_id": model_group_id,
+            "portfolio_id": portfolio_id,
+            "flow_job_id": str(job_id),
+            "satisfaction_rate": satisfaction_rate,
+            "constraints": constraints,
+            "horizon": result_horizon,
+            "n_paths": results.get("n_paths", n_paths),
+            "per_asset": per_asset,
+            "next_steps": (
+                f"Call test_flow_risk(portfolio_id={pid_str}, flow_job_id='{job_id}') for risk metrics. "
+                f"Run more scenarios with simulate_flow_scenario and compare via test_flow_risk on each. "
+                f"Use list_flow_scenarios(model_group_id='{model_group_id}') to see all past scenarios."
+            ),
+        }
+
+        try:
+            chart_html = flow_fan_chart(summary, result_horizon, constraints)
+            if chart_html:
+                return _with_widget(_fmt(output), chart_html)
+        except Exception:
+            logger.warning("Fan chart generation failed, returning text-only", exc_info=True)
+
+        return _fmt(output)
+    except _FlowGPUBusy as e:
+        return str(e)
+    except SablierAPIError as e:
+        return _api_error(e)
+    except Exception as e:
+        logger.error("simulate_flow_scenario failed: %s", e, exc_info=True)
+        return "Constrained scenario generation failed unexpectedly. Please try again."
+
+
+@server.tool(
+    name="test_flow_risk",
+    description=(
+        "Run portfolio risk analytics on Flow-generated paths. "
+        "Computes expected return, volatility, Sharpe ratio, Sortino ratio, Calmar ratio, "
+        "VaR 95%, CVaR 95%, max drawdown, profitability rate, and return distribution percentiles. "
+        "Requires portfolio_id and flow_job_id from generate_synthetic or simulate_flow_scenario. "
+        "TIP: Call this on multiple flow_job_ids (baseline + different scenarios) to build a "
+        "side-by-side comparison of risk metrics across scenarios."
+    ),
+    annotations=ToolAnnotations(title="Test Flow Risk", readOnlyHint=True, openWorldHint=True),
+)
+async def test_flow_risk(
+    portfolio_id: Annotated[str, Field(
+        description="UUID of the portfolio (from generate_synthetic or list_portfolios)"
+    )],
+    flow_job_id: Annotated[str, Field(
+        description="Flow generation job ID (from generate_synthetic or simulate_flow_scenario)"
+    )],
+) -> list | str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(portfolio_id, "portfolio_id"):
+        return err
+    if err := _validate_uuid(flow_job_id, "flow_job_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.flow_portfolio_test(portfolio_id, flow_job_id)
+
+        agg = result.get("aggregated_results") or {}
+        stats = result.get("summary_stats") or {}
+        samples = result.get("sample_results") or []
+
+        # Compute profitability
+        profitable = sum(1 for s in samples if (s.get("final_return") or 0) > 0)
+        profit_rate = profitable / len(samples) if samples else None
+
+        output = {
+            "status": "completed",
+            "portfolio_id": portfolio_id,
+            "flow_job_id": flow_job_id,
+            "n_days": result.get("n_days"),
+            "risk_metrics": {
+                "expected_return": agg.get("expected_return"),
+                "volatility": agg.get("volatility"),
+                "sharpe_ratio": agg.get("sharpe_ratio"),
+                "sortino_ratio": agg.get("sortino_ratio"),
+                "calmar_ratio": agg.get("calmar_ratio"),
+                "var_95": agg.get("var_95"),
+                "cvar_95": agg.get("cvar_95"),
+                "max_drawdown": agg.get("max_drawdown"),
+                "profitability_rate": profit_rate,
+            },
+            "return_distribution": {
+                "mean": stats.get("mean_return"),
+                "median": stats.get("median_return"),
+                "std": stats.get("std_return"),
+                "skewness": stats.get("skewness"),
+                "kurtosis": stats.get("kurtosis"),
+            },
+        }
+
+        try:
+            card_html = flow_risk_card(result)
+            if card_html:
+                return _with_widget(_fmt(output), card_html)
+        except Exception:
+            logger.warning("Flow risk card generation failed, returning text-only", exc_info=True)
+
+        return _fmt(output)
+    except SablierAPIError as e:
+        return _api_error(e)
+    except Exception as e:
+        logger.error("test_flow_risk failed: %s", e, exc_info=True)
+        return "Flow portfolio risk test failed unexpectedly. Please try again."
+
+
+@server.tool(
+    name="list_flow_scenarios",
+    description=(
+        "List completed constrained scenarios for a Flow model group. "
+        "Returns job IDs, constraints used, satisfaction rates, and timestamps. "
+        "Use this to find previous scenario results without re-running them — "
+        "pass any flow_job_id to test_flow_risk for risk metrics."
+    ),
+    annotations=ToolAnnotations(title="List Flow Scenarios", readOnlyHint=True),
+)
+async def list_flow_scenarios(
+    model_group_id: Annotated[str, Field(
+        description="UUID of the Flow model group (from generate_synthetic or list_model_groups)"
+    )],
 ) -> str:
     if err := _require_auth():
         return err
@@ -1920,25 +2481,14 @@ async def flow_generate_constrained_paths(
         return err
     try:
         client = get_client()
-        job = await client.flow_generate_constrained_paths(
-            model_group_id=model_group_id,
-            constraints=constraints,
-            n_paths=n_paths,
-            horizon=horizon,
-        )
-        job_id = job.get("job_id")
-        if not job_id:
-            return "Error: Constrained path generation did not return a job_id."
-
-        return _fmt({
-            "status": "submitted",
-            "job_id": job_id,
-            "model_group_id": model_group_id,
-            "message": (
-                "Constrained path generation job submitted. Typically takes 2-5 minutes. "
-                "Use get_flow_job_status with job_type='generate' to check progress and get results."
-            ),
-        })
+        result = await client.flow_list_scenarios(model_group_id)
+        if isinstance(result, list):
+            scenarios = result
+        elif isinstance(result, dict):
+            scenarios = result.get("scenarios", [result])
+        else:
+            scenarios = [result]
+        return _fmt(scenarios)
     except SablierAPIError as e:
         return _api_error(e)
 
@@ -1950,9 +2500,10 @@ async def flow_generate_constrained_paths(
         "Generates paths and compares them to historical distributions using "
         "Wasserstein distance, KS tests, coverage tests, and marginal distribution checks. "
         "Returns a quality badge (EXCELLENT/GOOD/ACCEPTABLE/POOR) and per-feature metrics. "
-        "Requires a trained Flow model (run flow_train first). "
-        "This is an async GPU job — use get_flow_job_status with job_type='validate' to check progress."
+        "Requires a trained Flow model (run generate_synthetic first). "
+        "This is an async GPU job — the tool will poll until completion."
     ),
+    annotations=ToolAnnotations(title="Validate Flow Model", readOnlyHint=True, openWorldHint=True),
 )
 async def flow_validate(
     model_group_id: Annotated[str, Field(description="UUID of the model group with a trained Flow model")],
@@ -1965,79 +2516,35 @@ async def flow_validate(
         return err
     try:
         client = get_client()
-        job = await client.flow_validate(
-            model_group_id=model_group_id,
-            n_paths=n_paths,
-            horizon=horizon,
-        )
-        job_id = job.get("job_id")
-        if not job_id:
-            return "Error: Flow validation did not return a job_id."
 
-        return _fmt({
-            "status": "submitted",
-            "job_id": job_id,
-            "model_group_id": model_group_id,
-            "message": (
-                "Flow validation job submitted. Typically takes 2-5 minutes. "
-                "Use get_flow_job_status with job_type='validate' to check progress and get results."
-            ),
-        })
-    except SablierAPIError as e:
-        return _api_error(e)
+        # Hold GPU lock for full validation duration
+        async with _acquire_gpu():
+            job = await _retry_gpu_call(lambda: client.flow_validate(
+                model_group_id=model_group_id,
+                n_paths=n_paths,
+                horizon=horizon,
+            ))
+            job_id = job.get("job_id")
+            if not job_id:
+                return "Error: Flow validation did not return a job_id."
 
-
-@server.tool(
-    name="get_flow_job_status",
-    description=(
-        "Check the status of a Flow job (training, generation, or validation). "
-        "Use this after flow_train, flow_generate_paths, flow_generate_constrained_paths, "
-        "or flow_validate to check progress and retrieve results when complete. "
-        "Training typically takes 5-15 minutes; generation takes 1-5 minutes."
-    ),
-)
-async def get_flow_job_status(
-    job_id: Annotated[str, Field(description="The job UUID returned by flow_train, flow_generate_paths, or flow_validate")],
-    job_type: Annotated[str, Field(
-        description="Type of job: 'train', 'generate', or 'validate'. Determines which status endpoint to query.",
-        default="train",
-    )] = "train",
-) -> str | list:
-    if err := _require_auth():
-        return err
-    if err := _validate_uuid(job_id, "job_id"):
-        return err
-    try:
-        client = get_client()
-        if job_type == "train":
-            result = await client.flow_train_status(job_id)
-            return _fmt(result)
-        elif job_type == "validate":
-            result = await client.flow_validate_results(job_id)
-            return _fmt(result)
-        else:
-            result = await client.flow_get_results(job_id)
-            # Try to generate fan chart widget for completed generation results
-            summary = result.get("summary") or {}
-            has_ts = any(
-                isinstance(v, dict) and "timeseries" in v
-                for v in summary.values()
+            # Poll until completion via status endpoint
+            status_result = await client.poll_flow_job(
+                job_id, f"/flow/validate/{job_id}/status",
             )
-            if has_ts:
-                try:
-                    chart_html = flow_fan_chart(
-                        summary,
-                        result.get("horizon", 20),
-                        result.get("constraints"),
-                    )
-                    if chart_html:
-                        logger.info(f"Fan chart generated ({len(chart_html)} chars), returning with widget")
-                        return _with_widget(_fmt(result), chart_html)
-                    else:
-                        logger.info("Fan chart returned None — no target features with timeseries")
-                except Exception:
-                    logger.warning("Fan chart generation failed, returning text-only", exc_info=True)
-            return _fmt(result)
+
+        if status_result.get("status") == "failed":
+            return _fmt({
+                "error": "Flow validation failed.",
+                "model_group_id": model_group_id,
+                "details": status_result.get("error_message") or status_result,
+            })
+
+        # Fetch full validation results
+        result = await client.flow_validate_results(job_id)
+        return _fmt(result)
+    except _FlowGPUBusy as e:
+        return str(e)
     except SablierAPIError as e:
         return _api_error(e)
 
@@ -2058,7 +2565,7 @@ async def get_flow_job_status(
         "Flags significant moves (|z-score| > 2) as content opportunities. "
         "Use this to understand the current market environment and decide what Sablier analyses to run."
     ),
-    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(title="Market Radar", readOnlyHint=True, openWorldHint=True),
 )
 async def market_radar() -> str:
     if err := _require_auth():
@@ -2149,6 +2656,101 @@ async def market_radar() -> str:
         return f"Market radar failed: {e}"
 
 
+# ══════════════════════════════════════════════════
+# Billing
+# ══════════════════════════════════════════════════
+
+@server.tool(
+    name="get_billing_info",
+    description=(
+        "Get your current billing info: subscription tier, included limits, "
+        "overage rates, and usage for the current month. Use this to check "
+        "what operations are available and what they cost."
+    ),
+    annotations=ToolAnnotations(title="Get Billing Info", readOnlyHint=True),
+)
+async def get_billing_info() -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        data = await client.get_billing_info()
+        return _fmt(data)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="get_billing_usage",
+    description=(
+        "Get detailed usage breakdown for the current or a specific billing month. "
+        "Shows per-operation counts, included limits, overage counts, and costs. "
+        "Month format: YYYY-MM (e.g. '2026-03')."
+    ),
+    annotations=ToolAnnotations(title="Get Billing Usage", readOnlyHint=True),
+)
+async def get_billing_usage(
+    month: Annotated[str | None, Field(
+        description="Billing month in YYYY-MM format. Defaults to current month.",
+        default=None,
+    )] = None,
+) -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        data = await client.get_billing_usage(month)
+        return _fmt(data)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="subscribe",
+    description=(
+        "Subscribe to a Sablier plan (new subscription). Returns a Stripe Checkout URL to complete payment. "
+        "Tiers: 'pro' (Pro, $79/mo — 100 Moment fits, 100 GRAIN, 20 Flow trains), "
+        "'enterprise' (Enterprise, $399/mo per seat — unlimited everything). "
+        "To manage an existing subscription (upgrade, downgrade, cancel, update payment), "
+        "use manage_subscription instead."
+    ),
+    annotations=ToolAnnotations(title="Subscribe", destructiveHint=True),
+)
+async def subscribe(
+    tier: Annotated[str, Field(description="Subscription tier: 'pro' ($79/mo) or 'enterprise' ($399/mo per seat)")],
+) -> str:
+    if err := _require_auth():
+        return err
+    if tier not in ('pro', 'enterprise'):
+        return "Invalid tier. Choose: 'pro' (Pro, $79/mo) or 'enterprise' (Enterprise, $399/mo per seat)"
+    try:
+        client = get_client()
+        data = await client.create_checkout_session(tier)
+        return _fmt(data)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="manage_subscription",
+    description=(
+        "Open the Stripe Customer Portal to manage an EXISTING subscription: "
+        "upgrade, downgrade, cancel, or update payment method. "
+        "Returns a portal URL. For new subscriptions, use subscribe instead."
+    ),
+    annotations=ToolAnnotations(title="Manage Subscription", readOnlyHint=True),
+)
+async def manage_subscription() -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        data = await client.create_portal_session()
+        return _fmt(data)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
 async def _retry_api_call(coro_fn, max_retries: int = 2, delay: float = 3.0):
     """Retry an async API call on transient server errors (5xx) and rate limits (429).
 
@@ -2168,6 +2770,34 @@ async def _retry_api_call(coro_fn, max_retries: int = 2, delay: float = 3.0):
             await asyncio.sleep(delay)
             delay *= 2  # exponential backoff
     raise last_exc  # unreachable, but keeps type checker happy
+
+
+async def _retry_gpu_call(coro_fn, max_wait: float = 300.0, initial_delay: float = 15.0):
+    """Retry a GPU worker call that may fail with 'Worker busy'.
+
+    GPU jobs (flow_train, flow_generate) use a single worker that can only process
+    one job at a time. This retries with exponential backoff up to max_wait seconds.
+    """
+    last_exc = None
+    delay = initial_delay
+    elapsed = 0.0
+    attempt = 0
+    while elapsed < max_wait:
+        try:
+            return await coro_fn()
+        except SablierAPIError as e:
+            last_exc = e
+            is_busy = e.status_code >= 500 and "busy" in str(e).lower()
+            if not is_busy:
+                raise  # not a worker-busy error, propagate immediately
+            attempt += 1
+            if elapsed + delay >= max_wait:
+                raise
+            logger.warning("GPU worker busy (attempt %d) — retrying in %.0fs", attempt, delay)
+            await asyncio.sleep(delay)
+            elapsed += delay
+            delay = min(delay * 1.5, 60.0)  # cap at 60s between retries
+    raise last_exc  # unreachable
 
 
 # ══════════════════════════════════════════════════

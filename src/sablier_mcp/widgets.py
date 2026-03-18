@@ -673,3 +673,119 @@ def flow_fan_chart(
     body = legend + grid
     width = 420 * ncols + 20
     return _wrap("Flow Path Distribution", body, width=width)
+
+
+# ═══════════════════════════════════════════════════════
+# 7. Flow Risk Card
+# ═══════════════════════════════════════════════════════
+
+
+def flow_risk_card(data: dict[str, Any]) -> str:
+    """Render Flow portfolio risk metrics as a visual dashboard.
+
+    Expects the parsed portfolio test dict with:
+      aggregated_results: { expected_return, volatility, sharpe_ratio,
+          sortino_ratio, calmar_ratio, var_95, cvar_95, max_drawdown }
+      summary_stats: { mean_return, median_return, std_return, skewness, kurtosis }
+      n_days: int
+      and optionally sample_results for profitability rate
+    """
+    agg = data.get("aggregated_results") or {}
+    stats = data.get("summary_stats") or {}
+    n_days = data.get("n_days")
+    samples = data.get("sample_results") or []
+
+    exp_ret = agg.get("expected_return")
+    vol = agg.get("volatility")
+    sharpe = agg.get("sharpe_ratio")
+    sortino = agg.get("sortino_ratio")
+    var95 = agg.get("var_95")
+    cvar95 = agg.get("cvar_95")
+    max_dd = agg.get("max_drawdown")
+    calmar = agg.get("calmar_ratio")
+
+    # Profitability from sample results
+    if samples:
+        profitable = sum(1 for s in samples if (s.get("final_return") or 0) > 0)
+        profit_rate = profitable / len(samples) if samples else 0
+    else:
+        profit_rate = None
+
+    # KPI helper
+    def kpi(label: str, value: str, color: str = _TEXT) -> str:
+        return f"""<div style="flex:1;min-width:90px;text-align:center">
+            <div style="font-size:20px;font-weight:800;color:{color};font-variant-numeric:tabular-nums">{value}</div>
+            <div style="font-size:10px;color:{_TEXT_MUTED};text-transform:uppercase;letter-spacing:0.06em;margin-top:2px">{label}</div>
+        </div>"""
+
+    ret_color = _GREEN if exp_ret is not None and exp_ret > 0 else _RED
+    var_color = _RED if var95 is not None and var95 < -0.05 else _YELLOW if var95 is not None and var95 < -0.02 else _GREEN
+    dd_color = _RED if max_dd is not None and max_dd < -0.10 else _YELLOW if max_dd is not None and max_dd < -0.05 else _GREEN
+
+    kpis = f"""<div class="card" style="display:flex;flex-wrap:wrap;gap:8px">
+        {kpi("Expected Return", _pct(exp_ret), ret_color)}
+        {kpi("Sharpe", _num(sharpe, 2) if sharpe is not None else "N/A", _GREEN if sharpe is not None and sharpe > 0.5 else _YELLOW if sharpe is not None and sharpe > 0 else _RED)}
+        {kpi("VaR 95%", _pct(var95), var_color)}
+        {kpi("CVaR 95%", _pct(cvar95), _RED if cvar95 is not None and cvar95 < 0 else _TEXT)}
+        {kpi("Max Drawdown", _pct(max_dd), dd_color)}
+    </div>"""
+
+    # Secondary metrics row
+    secondary = f"""<div class="card" style="display:flex;flex-wrap:wrap;gap:8px">
+        {kpi("Volatility", _pct(vol), _TEXT)}
+        {kpi("Sortino", _num(sortino, 2) if sortino is not None else "N/A", _TEXT)}
+        {kpi("Calmar", _num(calmar, 2) if calmar is not None else "N/A", _TEXT)}
+    </div>"""
+
+    # Profitability gauge
+    gauge = ""
+    if profit_rate is not None:
+        pct = profit_rate * 100
+        gauge_color = _GREEN if profit_rate > 0.6 else _YELLOW if profit_rate > 0.4 else _RED
+        gauge = f"""<div class="card">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+                <span style="font-size:12px;font-weight:600">Profitability Rate</span>
+                <span style="font-size:14px;font-weight:700;color:{gauge_color}">{pct:.0f}%</span>
+            </div>
+            <div style="height:8px;background:{_CARD_BORDER};border-radius:4px;overflow:hidden">
+                <div style="height:100%;width:{pct:.0f}%;background:{gauge_color};border-radius:4px"></div>
+            </div>
+            <div style="display:flex;justify-content:space-between;font-size:10px;color:{_TEXT_MUTED};margin-top:3px">
+                <span>Loss</span><span>Profit</span>
+            </div>
+        </div>"""
+
+    # Return distribution bars
+    dist = ""
+    mean_r = stats.get("mean_return")
+    med_r = stats.get("median_return")
+    std_r = stats.get("std_return")
+    skew = stats.get("skewness")
+    kurt = stats.get("kurtosis")
+    if any(v is not None for v in [mean_r, med_r, std_r, skew]):
+        rows = ""
+        for label, val, fmt in [
+            ("Mean Return", mean_r, "pct"),
+            ("Median Return", med_r, "pct"),
+            ("Std Dev", std_r, "pct"),
+            ("Skewness", skew, "num"),
+            ("Kurtosis", kurt, "num"),
+        ]:
+            if val is None:
+                continue
+            display = _pct(val) if fmt == "pct" else _num(val, 2)
+            rows += f"""<div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid {_CARD_BORDER}">
+                <span style="font-size:12px;color:{_TEXT_MUTED}">{label}</span>
+                <span style="font-size:12px;font-weight:600;font-variant-numeric:tabular-nums">{display}</span>
+            </div>"""
+        dist = f"""<div class="card">
+            <div style="font-size:12px;font-weight:600;margin-bottom:8px">Distribution Statistics</div>
+            {rows}
+        </div>"""
+
+    # Footer
+    footer = ""
+    if n_days is not None:
+        footer = f'<div style="font-size:11px;color:{_TEXT_MUTED};text-align:center;margin-top:4px">{n_days}-day horizon</div>'
+
+    return _wrap("Flow Portfolio Risk", kpis + secondary + gauge + dist + footer)

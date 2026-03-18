@@ -1,0 +1,45 @@
+{
+  "$schema": "https://registry.modelcontextprotocol.io/schemas/server.json",
+  "name": "sablier",
+  "display_name": "Sablier",
+  "description": "Wall Street-grade portfolio analytics, stress-testing, and SEC filing intelligence for AI assistants. Factor models, Monte Carlo simulations, generative market paths, and GRAIN thematic analysis — in under 2 minutes.",
+  "homepage": "https://sablier.it",
+  "repository": "https://github.com/miradebs98/sablier-mcp",
+  "license": "MIT",
+  "is_official": true,
+  "category": "finance",
+  "tags": [
+    "finance",
+    "portfolio",
+    "risk",
+    "stress-testing",
+    "factor-model",
+    "SEC",
+    "market-data",
+    "Monte-Carlo",
+    "optimization"
+  ],
+  "privacy_policies": [
+    "https://sablier.it/privacy"
+  ],
+  "contacts": {
+    "email": "team@sablier.it"
+  },
+  "installations": {
+    "remote": {
+      "type": "streamable-http",
+      "url": "https://sablier-mcp-215397666394.us-central1.run.app/mcp/",
+      "auth": {
+        "type": "oauth2"
+      }
+    },
+    "local": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["sablier-mcp"],
+      "env": {
+        "SABLIER_API_KEY": "{SABLIER_API_KEY}"
+      }
+    }
+  }
+}

@@ -1,0 +1,18 @@
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    required:
+      - sablierApiKey
+    properties:
+      sablierApiKey:
+        type: string
+        description: "Sablier API key. Get one at https://app.sablier.co/settings/api-keys"
+  commandFunction: |-
+    (config) => ({
+      command: "uvx",
+      args: ["sablier-mcp"],
+      env: {
+        SABLIER_API_KEY: config.sablierApiKey
+      }
+    })
