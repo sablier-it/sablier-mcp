@@ -50,7 +50,7 @@ _transport = os.getenv("MCP_TRANSPORT", "streamable-http")
 _oauth_provider: SablierOAuthProvider | None = None
 
 _ICONS = [
-    Icon(src="https://sablier-ai.com/logo.svg", mimeType="image/svg+xml"),
+    Icon(src="https://sablier-ai.com/logo-mcp.svg", mimeType="image/svg+xml"),
 ]
 
 if _transport != "stdio":
