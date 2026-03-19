@@ -2255,9 +2255,11 @@ async def train_flow_model(
     name="check_flow_job",
     description=(
         "Check the status of an async Flow job (training, generation, or validation). "
-        "Returns the current status ('running', 'completed', 'failed') and progress details. "
-        "Use this to monitor train_flow_model jobs. For training jobs, also returns "
-        "the current epoch and loss when available."
+        "Returns the current status ('running', 'completed', 'failed') and progress details "
+        "including current epoch/max_epochs for training jobs. "
+        "IMPORTANT: Do NOT call this in a loop. Call it ONCE, report the status to the user, "
+        "then ask if they want to do something else while waiting or check again later. "
+        "Training takes 5-15 min, validation 3-5 min."
     ),
     annotations=ToolAnnotations(title="Check Flow Job", readOnlyHint=True),
 )
@@ -2303,12 +2305,19 @@ async def check_flow_job(
         elif status == "failed":
             output["error"] = result.get("error") or result.get("error_message") or "Unknown error"
         else:
-            # Still running
-            if result.get("epoch"):
-                output["epoch"] = result["epoch"]
-            if result.get("loss"):
-                output["loss"] = result["loss"]
-            output["hint"] = "Still running. Check again in a minute or continue with other work."
+            # Still running — surface progress info
+            current_epoch = result.get("current_epoch") or result.get("epoch")
+            max_epochs = result.get("max_epochs")
+            if current_epoch is not None:
+                output["current_epoch"] = current_epoch
+            if max_epochs is not None:
+                output["max_epochs"] = max_epochs
+            if current_epoch and max_epochs:
+                output["progress"] = f"{current_epoch}/{max_epochs} epochs"
+            output["hint"] = (
+                "Job is still running. Tell the user the current progress and ask if they'd like to "
+                "do something else in the meantime, or check back later. Do NOT call this tool again automatically."
+            )
 
         return _fmt(output)
     except SablierAPIError as e:
