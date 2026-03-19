@@ -531,6 +531,7 @@ class SablierClient:
         model_id: str,
         name: str,
         specs: dict[str, dict],
+        model_group_id: str | None = None,
         description: str | None = None,
     ) -> dict:
         body: dict[str, Any] = {
@@ -538,6 +539,8 @@ class SablierClient:
             "name": name,
             "factor_values": specs,
         }
+        if model_group_id:
+            body["model_group_id"] = model_group_id
         if description:
             body["description"] = description
         return await self._post("/scenarios", json=body)

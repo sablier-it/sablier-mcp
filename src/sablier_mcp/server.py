@@ -1631,18 +1631,23 @@ async def create_scenario(
     model_id: Annotated[str, Field(description="UUID of the model this scenario applies to")],
     name: Annotated[str, Field(description="Scenario name (e.g. 'Recession', 'Tech Bubble')")],
     factor_values: Annotated[dict[str, dict], Field(description="Factor specs (e.g. {'VIX': {'type': 'fixed', 'value': 35}})")],
+    model_group_id: Annotated[str | None, Field(description="Model group UUID (required to run_scenario later)", default=None)] = None,
     description: Annotated[str, Field(description="Optional description", default="")] = "",
 ) -> str:
     if err := _require_auth():
         return err
     if err := _validate_uuid(model_id, "model_id"):
         return err
+    if model_group_id:
+        if err := _validate_uuid(model_group_id, "model_group_id"):
+            return err
     try:
         client = get_client()
         result = await client.create_scenario(
             model_id=model_id,
             name=name,
             specs=factor_values,
+            model_group_id=model_group_id,
             description=description or None,
         )
         return _fmt({
@@ -2583,11 +2588,6 @@ async def test_flow_risk(
 
         agg = result.get("aggregated_results") or {}
         stats = result.get("summary_stats") or {}
-        samples = result.get("sample_results") or []
-
-        # Compute profitability
-        profitable = sum(1 for s in samples if (s.get("final_return") or 0) > 0)
-        profit_rate = profitable / len(samples) if samples else None
 
         output = {
             "status": "completed",
@@ -2595,22 +2595,22 @@ async def test_flow_risk(
             "flow_job_id": flow_job_id,
             "n_days": result.get("n_days"),
             "risk_metrics": {
-                "expected_return": agg.get("expected_return"),
-                "volatility": agg.get("volatility"),
+                "expected_return": agg.get("mean_return"),
+                "volatility": agg.get("std_return"),
                 "sharpe_ratio": agg.get("sharpe_ratio"),
                 "sortino_ratio": agg.get("sortino_ratio"),
                 "calmar_ratio": agg.get("calmar_ratio"),
                 "var_95": agg.get("var_95"),
                 "cvar_95": agg.get("cvar_95"),
                 "max_drawdown": agg.get("max_drawdown"),
-                "profitability_rate": profit_rate,
+                "profitability_rate": agg.get("profitability_rate"),
             },
             "return_distribution": {
                 "mean": stats.get("mean_return"),
                 "median": stats.get("median_return"),
-                "std": stats.get("std_return"),
-                "skewness": stats.get("skewness"),
-                "kurtosis": stats.get("kurtosis"),
+                "std": stats.get("mean_volatility") or agg.get("std_return"),
+                "skewness": agg.get("skewness"),
+                "kurtosis": agg.get("kurtosis"),
             },
         }
 
