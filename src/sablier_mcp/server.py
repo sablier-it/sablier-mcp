@@ -22,6 +22,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.types import (
     EmbeddedResource,
+    Icon,
     TextContent,
     TextResourceContents,
     ToolAnnotations,
@@ -48,6 +49,10 @@ logger = logging.getLogger("sablier-mcp")
 _transport = os.getenv("MCP_TRANSPORT", "streamable-http")
 _oauth_provider: SablierOAuthProvider | None = None
 
+_ICONS = [
+    Icon(src="https://sablier-ai.com/logo.svg", mimeType="image/svg+xml"),
+]
+
 if _transport != "stdio":
     # Remote mode: enable OAuth
     _oauth_provider = SablierOAuthProvider()
@@ -55,6 +60,7 @@ if _transport != "stdio":
     _issuer_url = os.getenv("MCP_ISSUER_URL", f"http://localhost:{_port}")
     server = FastMCP(
         name="Sablier",
+        icons=_ICONS,
         host="0.0.0.0",
         port=_port,
         auth_server_provider=_oauth_provider,
@@ -67,7 +73,7 @@ if _transport != "stdio":
     )
 else:
     # Local/stdio mode: no auth (uses SABLIER_API_KEY from env)
-    server = FastMCP(name="Sablier")
+    server = FastMCP(name="Sablier", icons=_ICONS)
 
 
 # ── Custom routes (remote mode only) ─────────────

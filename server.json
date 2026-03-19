@@ -19,6 +19,12 @@
     "Monte-Carlo",
     "optimization"
   ],
+  "icons": [
+    {
+      "src": "https://sablier-ai.com/logo.svg",
+      "mimeType": "image/svg+xml"
+    }
+  ],
   "privacy_policies": [
     "https://sablier-ai.com/privacy"
   ],
@@ -28,7 +34,7 @@
   "installations": {
     "remote": {
       "type": "streamable-http",
-      "url": "https://sablier-mcp-215397666394.us-central1.run.app/mcp/",
+      "url": "https://mcp.sablier-ai.com/mcp/",
       "auth": {
         "type": "oauth2"
       }
