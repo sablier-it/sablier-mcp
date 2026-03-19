@@ -2291,6 +2291,13 @@ async def check_flow_job(
                     f"Training complete! Call generate_flow_paths(model_group_id='{mgid}') "
                     f"to produce simulated price trajectories."
                 )
+            elif job_type == "validate":
+                # Fetch full validation results
+                try:
+                    full_results = await client.flow_validate_results(job_id)
+                    output.update(full_results)
+                except Exception:
+                    output["next_steps"] = "Validation completed. Use get_model_validation to see results."
             else:
                 output["next_steps"] = "Job completed. Results are ready."
         elif status == "failed":
@@ -2652,11 +2659,11 @@ async def list_flow_scenarios(
         "Validate a trained Flow model against real data. "
         "Generates paths and compares them to historical distributions using "
         "Wasserstein distance, KS tests, coverage tests, and marginal distribution checks. "
-        "Returns a quality badge (EXCELLENT/GOOD/ACCEPTABLE/POOR) and per-feature metrics. "
-        "Requires a trained Flow model (run train_flow_model or generate_synthetic first). "
-        "This is an async GPU job — the tool will poll until completion."
+        "Returns immediately with a job_id — validation runs asynchronously (~3-5 min). "
+        "Use check_flow_job(job_id=..., job_type='validate') to monitor progress. "
+        "Requires a trained Flow model (run train_flow_model or generate_synthetic first)."
     ),
-    annotations=ToolAnnotations(title="Validate Flow Model", readOnlyHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(title="Validate Flow Model", destructiveHint=True, openWorldHint=True),
 )
 async def flow_validate(
     model_group_id: Annotated[str, Field(description="UUID of the model group with a trained Flow model")],
@@ -2670,32 +2677,25 @@ async def flow_validate(
     try:
         client = get_client()
 
-        # Hold GPU lock for full validation duration
-        async with _acquire_gpu():
-            job = await _retry_gpu_call(lambda: client.flow_validate(
-                model_group_id=model_group_id,
-                n_paths=n_paths,
-                horizon=horizon,
-            ))
-            job_id = job.get("job_id")
-            if not job_id:
-                return "Error: Flow validation did not return a job_id."
+        job = await _retry_gpu_call(lambda: client.flow_validate(
+            model_group_id=model_group_id,
+            n_paths=n_paths,
+            horizon=horizon,
+        ))
+        job_id = job.get("job_id")
+        if not job_id:
+            return "Error: Flow validation did not return a job_id."
 
-            # Poll until completion via status endpoint
-            status_result = await client.poll_flow_job(
-                job_id, f"/flow/validate/{job_id}/status",
-            )
-
-        if status_result.get("status") == "failed":
-            return _fmt({
-                "error": "Flow validation failed.",
-                "model_group_id": model_group_id,
-                "details": status_result.get("error_message") or status_result,
-            })
-
-        # Fetch full validation results
-        result = await client.flow_validate_results(job_id)
-        return _fmt(result)
+        return _fmt({
+            "status": "validating",
+            "job_id": job_id,
+            "model_group_id": model_group_id,
+            "next_steps": (
+                f"Validation started (job_id='{job_id}'). It typically takes 3-5 minutes. "
+                f"Use check_flow_job(job_id='{job_id}', job_type='validate') to check progress. "
+                f"Once completed, results include a quality badge and per-feature metrics."
+            ),
+        })
     except _FlowGPUBusy as e:
         return str(e)
     except SablierAPIError as e:
