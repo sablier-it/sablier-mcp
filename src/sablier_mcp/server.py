@@ -2949,7 +2949,7 @@ async def _retry_gpu_call(coro_fn, max_wait: float = 300.0, initial_delay: float
             return await coro_fn()
         except SablierAPIError as e:
             last_exc = e
-            is_busy = e.status_code >= 500 and "busy" in str(e).lower()
+            is_busy = e.status_code in (503, 429) or (e.status_code >= 500 and "busy" in str(e).lower())
             if not is_busy:
                 raise  # not a worker-busy error, propagate immediately
             attempt += 1
