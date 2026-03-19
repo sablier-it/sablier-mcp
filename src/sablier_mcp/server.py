@@ -2027,43 +2027,30 @@ async def _train_flow_model_impl(
             "failed_assets": create_result.get("failed_assets", []),
         }), None, None, []
 
-    async with _acquire_gpu():
-        train_job = await _retry_gpu_call(lambda: client.flow_train(
-            model_group_id=model_group_id,
-            horizon=horizon,
-        ))
-        train_job_id = train_job.get("job_id")
-        if not train_job_id:
-            return "Error: Flow training did not return a job_id.", None, None, []
+    # Start training without holding GPU lock during polling — the backend
+    # manages its own GPU resources.  Return immediately so Claude can keep
+    # working while the job runs.
+    train_job = await _retry_gpu_call(lambda: client.flow_train(
+        model_group_id=model_group_id,
+        horizon=horizon,
+    ))
+    train_job_id = train_job.get("job_id")
+    if not train_job_id:
+        return "Error: Flow training did not return a job_id.", None, None, []
 
-        feature_names = train_job.get("feature_names", [])
-        train_result = await client.poll_flow_train(train_job_id)
-        train_status = train_result.get("status", "")
-
-        if train_status == "failed":
-            return _fmt({
-                "error": "Flow training failed.",
-                "model_group_id": model_group_id,
-                "details": train_result.get("error") or train_result,
-            }), None, None, []
-        if train_status != "completed":
-            return _fmt({
-                "error": f"Flow training ended with status '{train_status}'.",
-                "model_group_id": model_group_id,
-            }), None, None, []
-
-        if train_result.get("feature_names"):
-            feature_names = train_result["feature_names"]
+    feature_names = train_job.get("feature_names", [])
 
     output = {
-        "status": "trained",
+        "status": "training",
         "model_group_id": model_group_id,
         "portfolio_id": portfolio_id,
+        "job_id": train_job_id,
         "feature_names": feature_names,
         "next_steps": (
-            f"Model trained. Now call generate_flow_paths(model_group_id='{model_group_id}') "
-            f"to produce simulated price trajectories. Then use simulate_flow_scenario for what-if analysis, "
-            f"test_flow_risk for portfolio risk metrics, or flow_validate for model quality checks."
+            f"Training started (job_id='{train_job_id}'). It typically takes 5-15 minutes. "
+            f"Use check_flow_job(job_id='{train_job_id}') to check progress. "
+            f"Once completed, call generate_flow_paths(model_group_id='{model_group_id}') "
+            f"to produce simulated price trajectories."
         ),
     }
     return output, model_group_id, portfolio_id, feature_names
@@ -2216,10 +2203,11 @@ async def _generate_flow_paths_impl(
     name="train_flow_model",
     description=(
         "Train a generative Flow model on a portfolio and conditioning set. "
-        "Returns model_group_id needed for generate_flow_paths and other flow tools. "
+        "Returns immediately with a job_id — training runs asynchronously (~5-15 min). "
+        "Use check_flow_job(job_id=...) to monitor progress. "
         "Requires conditioning_set_id (from list_feature_set_templates or create_feature_set) "
-        "and tickers or portfolio_id. Training takes ~5-15 min on GPU. "
-        "After training, call generate_flow_paths to produce simulated price trajectories."
+        "and tickers or portfolio_id. "
+        "After training completes, call generate_flow_paths to produce simulated price trajectories."
     ),
     annotations=ToolAnnotations(title="Train Flow Model", destructiveHint=True, openWorldHint=True),
 )
@@ -2261,6 +2249,63 @@ async def train_flow_model(
     except Exception as e:
         logger.error("train_flow_model failed: %s", e, exc_info=True)
         return "Flow training failed unexpectedly. Please try again."
+
+
+@server.tool(
+    name="check_flow_job",
+    description=(
+        "Check the status of an async Flow job (training, generation, or validation). "
+        "Returns the current status ('running', 'completed', 'failed') and progress details. "
+        "Use this to monitor train_flow_model jobs. For training jobs, also returns "
+        "the current epoch and loss when available."
+    ),
+    annotations=ToolAnnotations(title="Check Flow Job", readOnlyHint=True),
+)
+async def check_flow_job(
+    job_id: Annotated[str, Field(description="Job ID returned by train_flow_model or other flow tools")],
+    job_type: Annotated[str, Field(
+        description="Type of job: 'train' (default), 'generate', or 'validate'.",
+        default="train",
+    )] = "train",
+) -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        if job_type == "train":
+            result = await client.flow_train_status(job_id)
+        elif job_type == "validate":
+            result = await client._get(f"/flow/validate/{job_id}/status")
+        else:
+            result = await client._get(f"/flow/{job_id}/results")
+
+        status = result.get("status", "unknown")
+        output: dict = {"job_id": job_id, "status": status}
+
+        if status == "completed":
+            if job_type == "train":
+                mgid = result.get("model_group_id", "")
+                output["model_group_id"] = mgid
+                output["feature_names"] = result.get("feature_names", [])
+                output["next_steps"] = (
+                    f"Training complete! Call generate_flow_paths(model_group_id='{mgid}') "
+                    f"to produce simulated price trajectories."
+                )
+            else:
+                output["next_steps"] = "Job completed. Results are ready."
+        elif status == "failed":
+            output["error"] = result.get("error") or result.get("error_message") or "Unknown error"
+        else:
+            # Still running
+            if result.get("epoch"):
+                output["epoch"] = result["epoch"]
+            if result.get("loss"):
+                output["loss"] = result["loss"]
+            output["hint"] = "Still running. Check again in a minute or continue with other work."
+
+        return _fmt(output)
+    except SablierAPIError as e:
+        return _api_error(e)
 
 
 @server.tool(
