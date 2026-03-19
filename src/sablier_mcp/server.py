@@ -2305,12 +2305,55 @@ async def check_flow_job(
                     output.update(full_results)
                 except Exception:
                     output["next_steps"] = "Validation completed. Use get_model_validation to see results."
+            elif job_type == "generate":
+                # Fetch full generation results with per-asset stats and fan chart
+                try:
+                    results = await client.flow_get_results(job_id)
+                    summary = results.get("summary") or {}
+                    baseline_summary = results.get("baseline_summary") or {}
+                    satisfaction_rate = results.get("satisfaction_rate")
+                    result_horizon = results.get("horizon")
+                    mgid = results.get("model_group_id", "")
+
+                    per_asset = _build_per_asset_output(
+                        summary, include_paths=True, baseline_summary=baseline_summary,
+                    )
+                    output["model_group_id"] = mgid
+                    output["flow_job_id"] = job_id
+                    output["satisfaction_rate"] = satisfaction_rate
+                    output["constraints"] = results.get("constraints", [])
+                    output["horizon"] = result_horizon
+                    output["n_paths"] = results.get("n_paths")
+                    output["per_asset"] = per_asset
+                    output["next_steps"] = (
+                        f"Call test_flow_risk(flow_job_id='{job_id}') for risk metrics. "
+                        f"Run more scenarios with simulate_flow_scenario and compare via test_flow_risk on each. "
+                        f"Use list_flow_scenarios(model_group_id='{mgid}') to see all past scenarios."
+                    )
+
+                    try:
+                        chart_html = flow_fan_chart(summary, result_horizon, results.get("constraints"))
+                        if chart_html:
+                            return _with_widget(_fmt(output), chart_html)
+                    except Exception:
+                        logger.warning("Fan chart generation failed, returning text-only", exc_info=True)
+                except Exception:
+                    output["next_steps"] = "Generation completed. Results are ready."
             else:
                 output["next_steps"] = "Job completed. Results are ready."
         elif status == "failed":
             output["error"] = result.get("error") or result.get("error_message") or "Unknown error"
         else:
             # Still running — surface progress info
+            progress = result.get("progress") or result.get("result") or {}
+            if isinstance(progress, dict):
+                prog = progress.get("progress", {})
+                if prog.get("phase"):
+                    output["phase"] = prog["phase"]
+                if prog.get("message"):
+                    output["progress_message"] = prog["message"]
+                if prog.get("step") is not None and prog.get("total_steps"):
+                    output["progress"] = f"{prog['step']}/{prog['total_steps']}"
             current_epoch = result.get("current_epoch") or result.get("epoch")
             max_epochs = result.get("max_epochs")
             if current_epoch is not None:
@@ -2443,12 +2486,13 @@ async def generate_synthetic(
 @server.tool(
     name="simulate_flow_scenario",
     description=(
-        "Generate constrained what-if scenarios from a trained Flow model. "
+        "Start constrained what-if scenario generation from a trained Flow model. "
+        "Returns immediately with a job_id — use check_flow_job(job_id, job_type='generate') to poll for results. "
         "Requires model_group_id and feature_names from train_flow_model or generate_synthetic. "
         "IMPORTANT: feature_name in constraints must be the DISPLAY NAME from the training output's feature_names "
         "(e.g. 'Apple Inc.', 'NVIDIA Corporation', 'SPDR S&P 500 ETF Trust'), NOT ticker symbols. "
         "Constraint types: 'level' (absolute price bounds), 'return' (per-step return bounds). "
-        "Returns constrained paths (percentile bands + sample paths) + paired unconstrained baseline + satisfaction_rate (0-1). "
+        "When completed (via check_flow_job), returns constrained paths + paired baseline + satisfaction_rate. "
         "Pass portfolio_id through so test_flow_risk can be called directly on results. "
         "Run multiple scenarios and compare via test_flow_risk on each flow_job_id."
     ),
@@ -2486,65 +2530,31 @@ async def simulate_flow_scenario(
     try:
         client = get_client()
 
-        # Constrained generation (hold GPU lock for full duration)
-        async with _acquire_gpu():
-            job = await _retry_gpu_call(lambda: client.flow_generate_constrained_paths(
-                model_group_id=model_group_id,
-                constraints=constraints,
-                n_paths=n_paths,
-                horizon=horizon,
-            ))
-            job_id = job.get("job_id")
-            if not job_id:
-                return "Error: Constrained generation did not return a job_id."
-
-            # Poll until completion
-            poll_result = await client.poll_flow_job(
-                job_id, f"/flow/{job_id}/results",
-            )
-
-        poll_status = poll_result.get("status", "")
-        if poll_status == "failed":
-            return _fmt({
-                "error": "Constrained generation failed.",
-                "model_group_id": model_group_id,
-                "details": poll_result.get("error") or poll_result,
-            })
-
-        # Fetch full results
-        results = await client.flow_get_results(job_id)
-        summary = results.get("summary") or {}
-        baseline_summary = results.get("baseline_summary") or {}
-        satisfaction_rate = results.get("satisfaction_rate")
-        result_horizon = results.get("horizon", horizon or 20)
-
-        # Build per-asset stats with percentile bands, sample paths, and baseline comparison
-        per_asset = _build_per_asset_output(summary, include_paths=True, baseline_summary=baseline_summary)
+        # Dispatch constrained generation — return immediately like training
+        job = await _retry_gpu_call(lambda: client.flow_generate_constrained_paths(
+            model_group_id=model_group_id,
+            constraints=constraints,
+            n_paths=n_paths,
+            horizon=horizon,
+        ))
+        job_id = job.get("job_id")
+        if not job_id:
+            return "Error: Constrained generation did not return a job_id."
 
         pid_str = f"'{portfolio_id}'" if portfolio_id else "'<from generate_synthetic>'"
         output = {
-            "status": "completed",
+            "status": "generating",
             "model_group_id": model_group_id,
             "portfolio_id": portfolio_id,
             "flow_job_id": str(job_id),
-            "satisfaction_rate": satisfaction_rate,
             "constraints": constraints,
-            "horizon": result_horizon,
-            "n_paths": results.get("n_paths", n_paths),
-            "per_asset": per_asset,
+            "n_paths": n_paths,
             "next_steps": (
-                f"Call test_flow_risk(portfolio_id={pid_str}, flow_job_id='{job_id}') for risk metrics. "
-                f"Run more scenarios with simulate_flow_scenario and compare via test_flow_risk on each. "
-                f"Use list_flow_scenarios(model_group_id='{model_group_id}') to see all past scenarios."
+                f"Constrained generation started (job_id='{job_id}'). It typically takes 1-3 minutes. "
+                f"Use check_flow_job(job_id='{job_id}', job_type='generate') to check progress. "
+                f"Once completed, call test_flow_risk(portfolio_id={pid_str}, flow_job_id='{job_id}') for risk metrics."
             ),
         }
-
-        try:
-            chart_html = flow_fan_chart(summary, result_horizon, constraints)
-            if chart_html:
-                return _with_widget(_fmt(output), chart_html)
-        except Exception:
-            logger.warning("Fan chart generation failed, returning text-only", exc_info=True)
 
         return _fmt(output)
     except _FlowGPUBusy as e:
