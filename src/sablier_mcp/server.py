@@ -2282,9 +2282,9 @@ async def check_flow_job(
         if job_type == "train":
             result = await client.flow_train_status(job_id)
         elif job_type == "validate":
-            result = await client._get(f"/flow/validate/{job_id}/status")
+            result = await client.flow_validate_status(job_id)
         else:
-            result = await client._get(f"/flow/{job_id}/results")
+            result = await client.flow_get_results(job_id)
 
         status = result.get("status", "unknown")
         output: dict = {"job_id": job_id, "status": status}

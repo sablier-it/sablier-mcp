@@ -66,40 +66,6 @@ class SablierClient:
         self._auth_token = token
         self._client.headers["Authorization"] = f"Bearer {token}"
 
-    async def close(self):
-        await self._client.aclose()
-
-    # ──────────────────────────────────────────────
-    # Auth (unauthenticated endpoints)
-    # ──────────────────────────────────────────────
-
-    async def register(
-        self, email: str, name: str, company: str, role: str, password: str
-    ) -> dict:
-        """Register a new Sablier account. No auth required."""
-        return await self._post(
-            "/auth/register",
-            json={
-                "email": email,
-                "name": name,
-                "company": company,
-                "role": role,
-                "password": password,
-            },
-        )
-
-    async def login(self, email: str, password: str) -> dict:
-        """Login and get JWT tokens. No auth required."""
-        result = await self._post(
-            "/auth/login",
-            json={"email": email, "password": password},
-        )
-        # Auto-set the access token for this session
-        access_token = result.get("access_token")
-        if access_token:
-            self.set_auth_token(access_token)
-        return result
-
     async def _request(self, method: str, path: str, **kwargs) -> Any:
         response = await self._client.request(method, path, **kwargs)
         if response.status_code >= 400:
@@ -135,7 +101,7 @@ class SablierClient:
         query: str,
         is_asset: bool | None = None,
         source: str | None = None,
-        limit: int = 50,
+        limit: int = 20,
     ) -> list[dict]:
         params: dict[str, Any] = {"q": query, "limit": limit}
         if is_asset is not None:
@@ -212,7 +178,7 @@ class SablierClient:
     # Portfolios
     # ──────────────────────────────────────────────
 
-    async def list_portfolios(self, limit: int = 100, offset: int = 0) -> dict:
+    async def list_portfolios(self, limit: int = 50, offset: int = 0) -> dict:
         return await self._get("/portfolios", params={"limit": limit, "offset": offset})
 
     async def get_portfolio(self, portfolio_id: str) -> dict:
@@ -373,9 +339,6 @@ class SablierClient:
     # ──────────────────────────────────────────────
     # Models
     # ──────────────────────────────────────────────
-
-    async def list_models(self, limit: int = 100, offset: int = 0) -> dict:
-        return await self._get("/models", params={"limit": limit, "offset": offset})
 
     async def list_model_groups(self) -> list[dict]:
         return await self._get("/models/groups")
@@ -601,14 +564,6 @@ class SablierClient:
             f"/moment/validation/batch/{validation_batch_id}/results"
         )
 
-    async def list_simulation_history(
-        self, simulation_batch_id: str
-    ) -> dict:
-        """List past scenario runs for a given betas simulation batch."""
-        return await self._get(
-            f"/moment/simulate-returns/batch/history/{simulation_batch_id}"
-        )
-
     # ──────────────────────────────────────────────
     # Market Radar
     # ──────────────────────────────────────────────
@@ -663,7 +618,7 @@ class SablierClient:
     async def flow_generate_paths(
         self,
         model_group_id: str,
-        n_paths: int = 100,
+        n_paths: int = 500,
         horizon: int | None = None,
     ) -> dict:
         """Start async path generation job."""
