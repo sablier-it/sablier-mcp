@@ -168,6 +168,8 @@ def _api_error(e: SablierAPIError) -> str:
     """Convert an API error into a friendly message for the LLM."""
     if e.status_code == 404:
         return f"Error: Not found — {e.detail}"
+    if e.status_code == 409:
+        return f"Already exists — {e.detail}"
     if e.status_code == 422:
         return f"Error: Invalid input — {e.detail}"
     return f"Error: API returned {e.status_code} — {e.detail}"
@@ -551,6 +553,8 @@ async def delete_api_key(
     name="add_feature",
     description=(
         "Add a ticker to the feature catalog so it can be used in portfolios or conditioning sets. "
+        "IMPORTANT: First use search_features to check if the ticker already exists — "
+        "calling add_feature for an existing ticker returns a 409 error. "
         "Specify source ('yahoo' for stocks/ETFs/futures, 'fred' for rates/economic indicators). "
         "Validates the ticker exists on the source API and auto-populates metadata "
         "(display_name, category, units, etc.) from the API response. "
