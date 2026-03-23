@@ -3,8 +3,8 @@
   "name": "sablier",
   "display_name": "Sablier",
   "description": "Wall Street-grade portfolio analytics, stress-testing, and SEC filing intelligence for AI assistants. Factor models, Monte Carlo simulations, generative market paths, and GRAIN thematic analysis — in under 2 minutes.",
-  "homepage": "https://sablier-ai.com/discover",
-  "repository": "https://github.com/miradebs98/sablier-mcp",
+  "homepage": "https://sablier.ai/discover",
+  "repository": "https://github.com/sablier-it/sablier-mcp",
   "license": "MIT",
   "is_official": true,
   "category": "finance",
@@ -21,12 +21,12 @@
   ],
   "icons": [
     {
-      "src": "https://sablier-ai.com/logo-mcp.svg?v=2",
+      "src": "https://sablier.ai/logo-mcp.svg?v=2",
       "mimeType": "image/svg+xml"
     }
   ],
   "privacy_policies": [
-    "https://sablier-ai.com/privacy"
+    "https://sablier.ai/privacy"
   ],
   "contacts": {
     "email": "team@sablier.it"
@@ -34,7 +34,7 @@
   "installations": {
     "remote": {
       "type": "streamable-http",
-      "url": "https://mcp.sablier-ai.com/mcp/",
+      "url": "https://mcp.sablier.ai/mcp/",
       "auth": {
         "type": "oauth2"
       }

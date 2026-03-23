@@ -13,9 +13,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://sablier-ai.com"
-Repository = "https://github.com/miradebs98/sablier-mcp"
-Issues = "https://github.com/miradebs98/sablier-mcp/issues"
+Homepage = "https://sablier.ai"
+Repository = "https://github.com/sablier-it/sablier-mcp"
+Issues = "https://github.com/sablier-it/sablier-mcp/issues"
 
 [build-system]
 requires = ["hatchling"]
