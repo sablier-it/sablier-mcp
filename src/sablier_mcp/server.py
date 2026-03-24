@@ -46,11 +46,12 @@ logger = logging.getLogger("sablier-mcp")
 # Server setup
 # ══════════════════════════════════════════════════
 
-_transport = os.getenv("MCP_TRANSPORT", "streamable-http")
+# Default to stdio when API key is set (local/CLI mode), otherwise HTTP (Cloud Run)
+_transport = os.getenv("MCP_TRANSPORT", "stdio" if os.getenv("SABLIER_API_KEY") else "streamable-http")
 _oauth_provider: SablierOAuthProvider | None = None
 
 _ICONS = [
-    Icon(src="https://sablier-ai.com/logo-mcp.svg", mimeType="image/svg+xml"),
+    Icon(src="https://sablier.ai/logo-mcp.svg", mimeType="image/svg+xml"),
 ]
 
 if _transport != "stdio":
