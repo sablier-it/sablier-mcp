@@ -749,6 +749,10 @@ class SablierClient:
             params["month"] = month
         return await self._get("/billing/usage", params=params)
 
+    async def get_credits(self) -> dict:
+        """Get current credit balance for this month."""
+        return await self._get("/billing/credits")
+
     # ──────────────────────────────────────────────
     # Tests
     # ──────────────────────────────────────────────

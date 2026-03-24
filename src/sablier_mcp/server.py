@@ -2833,6 +2833,26 @@ async def market_radar() -> str:
 # ══════════════════════════════════════════════════
 
 @server.tool(
+    name="get_credits",
+    description=(
+        "Get your current credit balance: credits used, credits remaining, monthly allocation, "
+        "and overage status. Credits are the unified currency — every operation costs credits "
+        "based on its parameters. Free: 100/mo (blocked at 0), Pro: 1000/mo ($0.25/credit overage)."
+    ),
+    annotations=ToolAnnotations(title="Get Credits", readOnlyHint=True),
+)
+async def get_credits() -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        data = await client.get_credits()
+        return _fmt(data)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
     name="get_billing_info",
     description=(
         "Get your current billing info: subscription tier, included limits, "
@@ -2881,20 +2901,20 @@ async def get_billing_usage(
     name="subscribe",
     description=(
         "Subscribe to a Sablier plan (new subscription). Returns a Stripe Checkout URL to complete payment. "
-        "Tiers: 'pro' (Pro, $79/mo — 100 Moment fits, 100 GRAIN, 20 Flow trains), "
-        "'enterprise' (Enterprise, $399/mo per seat — unlimited everything). "
+        "Tiers: 'pro' (Pro, $199/mo — 1,000 credits/month, $0.25/credit overage, full feature access). "
+        "Enterprise pricing is custom — contact team@sablier.it. "
         "To manage an existing subscription (upgrade, downgrade, cancel, update payment), "
         "use manage_subscription instead."
     ),
     annotations=ToolAnnotations(title="Subscribe", destructiveHint=True),
 )
 async def subscribe(
-    tier: Annotated[str, Field(description="Subscription tier: 'pro' ($79/mo) or 'enterprise' ($399/mo per seat)")],
+    tier: Annotated[str, Field(description="Subscription tier: 'pro' ($199/mo, 1000 credits)")],
 ) -> str:
     if err := _require_auth():
         return err
     if tier not in ('pro', 'enterprise'):
-        return "Invalid tier. Choose: 'pro' (Pro, $79/mo) or 'enterprise' (Enterprise, $399/mo per seat)"
+        return "Invalid tier. Choose 'pro' ($199/mo, 1000 credits). For Enterprise, contact team@sablier.it."
     try:
         client = get_client()
         data = await client.create_checkout_session(tier)
