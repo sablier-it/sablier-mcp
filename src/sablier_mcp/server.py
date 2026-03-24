@@ -63,6 +63,7 @@ if _transport != "stdio":
         icons=_ICONS,
         host="0.0.0.0",
         port=_port,
+        stateless_http=True,  # No server-side sessions — survives Cloud Run cold starts
         auth_server_provider=_oauth_provider,
         auth=AuthSettings(
             issuer_url=_issuer_url,
