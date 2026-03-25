@@ -174,6 +174,12 @@ def _api_error(e: SablierAPIError) -> str:
         return f"Already exists — {e.detail}"
     if e.status_code == 422:
         return f"Error: Invalid input — {e.detail}"
+    if e.status_code == 429:
+        return (
+            f"Credit limit reached — {e.detail}\n\n"
+            f"To check your balance, use the get_credits tool. "
+            f"To upgrade, use the subscribe tool or visit https://sablier.ai/app/billing"
+        )
     return f"Error: API returned {e.status_code} — {e.detail}"
 
 
