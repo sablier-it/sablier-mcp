@@ -636,6 +636,7 @@ class SablierClient:
         constraints: list[dict],
         n_paths: int = 100,
         horizon: int | None = None,
+        name: str | None = None,
     ) -> dict:
         """Start async constrained path generation job (SMC filtering)."""
         body: dict[str, Any] = {
@@ -645,6 +646,8 @@ class SablierClient:
         }
         if horizon is not None:
             body["horizon"] = horizon
+        if name is not None:
+            body["name"] = name
         return await self._post("/flow/generate-constrained-paths", json=body)
 
     async def flow_get_results(self, job_id: str) -> dict:
