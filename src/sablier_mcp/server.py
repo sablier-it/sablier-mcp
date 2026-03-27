@@ -16,7 +16,7 @@ import logging
 import os
 import re
 import urllib.parse
-from typing import Annotated
+from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
@@ -949,6 +949,7 @@ async def optimize_portfolio(
 async def get_efficient_frontier(
     portfolio_id: Annotated[str, Field(description="The portfolio UUID")],
     n_points: Annotated[int, Field(description="Number of points on the frontier curve (default 20)", default=20)] = 20,
+    timeframe: Annotated[str, Field(description="Historical lookback period: '1Y', '2Y', '5Y', etc. Default '1Y'.", default="1Y")] = "1Y",
 ) -> str:
     if err := _require_auth():
         return err
@@ -956,7 +957,32 @@ async def get_efficient_frontier(
         return err
     try:
         client = get_client()
-        result = await client.get_efficient_frontier(portfolio_id, n_points=n_points)
+        result = await client.get_efficient_frontier(portfolio_id, n_points=n_points, timeframe=timeframe)
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="get_optimization_history",
+    description=(
+        "Retrieve past portfolio optimization results. Each entry includes the objective, "
+        "optimal weights, expected return, volatility, VaR, and Sharpe ratio. "
+        "Optionally filter by simulation_batch_id to see results for a specific beta computation."
+    ),
+    annotations=ToolAnnotations(title="Get Optimization History", readOnlyHint=True),
+)
+async def get_optimization_history(
+    portfolio_id: Annotated[str, Field(description="The portfolio UUID")],
+    simulation_batch_id: Annotated[str | None, Field(description="Filter to a specific beta simulation run. Optional.", default=None)] = None,
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(portfolio_id, "portfolio_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.get_optimization_history(portfolio_id, simulation_batch_id=simulation_batch_id)
         return _fmt(result)
     except SablierAPIError as e:
         return _api_error(e)
@@ -1074,20 +1100,23 @@ async def analyze_qualitative(
                 ticker_entry = {
                     "ticker": ts.get("ticker"),
                     "score": ts.get("score"),
-                    "tier": ts.get("tier") or ts.get("tier_name"),
+                    "tier": ts.get("tier") if ts.get("tier") is not None else ts.get("tier_name"),
                     "direction": ts.get("direction"),
                     "confidence": ts.get("confidence"),
                     "top_evidence": [],
                 }
                 for ev in (ts.get("evidence") or [])[:3]:
-                    ticker_entry["top_evidence"].append({
+                    ev_entry: dict[str, Any] = {
                         "passage": (ev.get("passage") or "")[:500],
                         "source": ev.get("source"),
                         "source_type": ev.get("source_type"),
                         "fiscal_period": ev.get("fiscal_period"),
                         "filing_date": ev.get("filing_date"),
                         "why_relevant": ev.get("why_relevant"),
-                    })
+                    }
+                    if ev.get("filing_url"):
+                        ev_entry["filing_url"] = ev["filing_url"]
+                    ticker_entry["top_evidence"].append(ev_entry)
                 theme_summary["ticker_scores"].append(ticker_entry)
             summary["themes"].append(theme_summary)
 
@@ -1882,7 +1911,7 @@ async def run_scenario(
         "This is the starting point for Moment (linear) analysis. "
         "Requires conditioning_set_id (the market drivers — get one from list_feature_set_templates or create_feature_set). "
         "Uses a two-layer architecture: thematic factors (conditioning_set_id) + optional baseline factors "
-        "(use_baseline=True absorbs market/value/growth variance before thematic factors). "
+        "(baseline_mode='us' absorbs market/value/growth variance via real-time ETF proxies before thematic factors). "
         "Pass either portfolio_id or tickers directly (auto-creates portfolio with equal weights). "
         "Returns: factor exposures (betas), simulation_batch_id, and factor_last_values_raw. "
         "Next step: call simulate_returns with the simulation_batch_id to run what-if stress tests."
@@ -1894,8 +1923,7 @@ async def analyze_quantitative(
     portfolio_id: Annotated[str | None, Field(description="UUID of an existing portfolio. If omitted, provide tickers instead.", default=None)] = None,
     tickers: Annotated[list[str] | None, Field(description="Tickers to analyze (e.g. ['AAPL', 'MSFT']). Auto-creates a portfolio if portfolio_id is not given.", default=None)] = None,
     weights: Annotated[list[float] | None, Field(description="Optional weights for tickers (must sum to 1.0). Defaults to equal weights.", default=None)] = None,
-    use_baseline: Annotated[bool, Field(description="Include baseline factors (Market, Value, Growth, etc.) to absorb common variance. Default True.", default=True)] = True,
-    baseline_set_id: Annotated[str | None, Field(description="UUID of a custom baseline conditioning set. If omitted, uses the System default baseline. Only used when use_baseline=True.", default=None)] = None,
+    baseline_mode: Annotated[str | None, Field(description="Baseline factor orthogonalization region. ETF-based (real-time): 'us', 'global', 'developed_ex_us', 'europe', 'japan'. Legacy FF5 (~2mo lag): 'us_ff5', 'global_ff5'. Set 'none' or omit to skip baseline.", default=None)] = None,
     nonlinear: Annotated[bool, Field(description="Also fit nonlinear factor exposure model on top of linear betas, producing sensitivity curves. Requires Pro+ tier. Default True (runs if tier allows).", default=True)] = True,
 ) -> list | str:
     if err := _require_auth():
@@ -1942,9 +1970,8 @@ async def analyze_quantitative(
         # Step 2: Train (synchronous — Moment returns results directly)
         train_result = await _retry_api_call(lambda: client.train_batch(
             model_group_id=model_group_id,
-            use_baseline=use_baseline,
-            baseline_set_id=baseline_set_id,
             nonlinear=nonlinear,
+            baseline_mode=baseline_mode,
         ))
         if train_result.get("status") == "failed" or train_result.get("failed", 0) == train_result.get("total", 0):
             return _fmt({

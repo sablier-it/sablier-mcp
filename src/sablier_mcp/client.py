@@ -255,12 +255,24 @@ class SablierClient:
         )
 
     async def get_efficient_frontier(
-        self, portfolio_id: str, n_points: int = 20,
+        self, portfolio_id: str, n_points: int = 20, timeframe: str = "1Y",
     ) -> dict:
         """Calculate efficient frontier for portfolio assets."""
         return await self._get(
             f"/portfolios/{portfolio_id}/efficient-frontier",
-            params={"n_points": n_points},
+            params={"n_points": n_points, "timeframe": timeframe},
+        )
+
+    async def get_optimization_history(
+        self, portfolio_id: str, simulation_batch_id: str | None = None,
+    ) -> dict:
+        """Retrieve past optimization results for a portfolio."""
+        params: dict[str, Any] = {}
+        if simulation_batch_id:
+            params["simulation_batch_id"] = simulation_batch_id
+        return await self._get(
+            f"/portfolios/{portfolio_id}/optimization-history",
+            params=params or None,
         )
 
     # ──────────────────────────────────────────────
@@ -415,18 +427,22 @@ class SablierClient:
     async def train_batch(
         self,
         model_group_id: str,
-        use_baseline: bool = True,
-        baseline_set_id: str | None = None,
         nonlinear: bool = True,
+        baseline_mode: str | None = None,
     ) -> dict:
-        """Batch train all models in a group. Synchronous — returns results directly."""
+        """Batch train all models in a group. Synchronous — returns results directly.
+
+        baseline_mode: ETF-based factor orthogonalization region.
+            'us', 'global', 'developed_ex_us', 'europe', 'japan' (real-time ETF proxies)
+            'us_ff5', 'global_ff5', etc. (legacy academic FF5, ~2 month lag)
+            'none' or None to skip baseline.
+        """
         body: dict = {
             "model_group_id": model_group_id,
-            "use_baseline": use_baseline,
             "nonlinear": nonlinear,
         }
-        if baseline_set_id:
-            body["baseline_set_id"] = baseline_set_id
+        if baseline_mode is not None:
+            body["baseline_mode"] = baseline_mode
         return await self._post_long("/moment/train/batch", json=body)
 
     # ──────────────────────────────────────────────
@@ -543,20 +559,33 @@ class SablierClient:
     async def get_latest_group_validation(self, model_group_id: str) -> dict:
         return await self._get(f"/moment/validation/group/{model_group_id}/latest")
 
+    async def validate_single_model(self, model_id: str) -> dict:
+        """Validate a single trained model. Synchronous — returns on completion."""
+        return await self._post_long(
+            "/moment/validation/validate",
+            json={"model_id": model_id},
+        )
+
     async def trigger_batch_validation(
         self,
         model_group_id: str,
         n_samples: int = 200,
         max_starting_points: int = 100,
+        timeout: float | None = None,
     ) -> dict:
         """Run validation for all models in a group. Synchronous."""
-        return await self._post_long(
-            "/moment/validation/batch",
-            json={
+        kwargs: dict[str, Any] = {
+            "json": {
                 "model_group_id": model_group_id,
                 "n_samples": n_samples,
                 "max_starting_points": max_starting_points,
             },
+        }
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        return await self._post_long(
+            "/moment/validation/batch",
+            **kwargs,
         )
 
     async def get_batch_validation_results(self, validation_batch_id: str) -> dict:
@@ -755,6 +784,35 @@ class SablierClient:
     async def get_credits(self) -> dict:
         """Get current credit balance for this month."""
         return await self._get("/billing/credits")
+
+    # ──────────────────────────────────────────────
+    # Portfolio Aggregation
+    # ──────────────────────────────────────────────
+
+    async def aggregate_portfolio_simulations(
+        self,
+        portfolio_id: str,
+        simulation_ids: dict[str, str],
+        mode: str = "single_shot_nonlinear",
+    ) -> dict:
+        """Aggregate per-asset simulation results into portfolio-level analytics.
+
+        Args:
+            portfolio_id: Portfolio defining assets and weights.
+            simulation_ids: {asset_ticker: returns_simulation_id} from simulate_returns_batch.
+            mode: 'single_shot_linear', 'single_shot_nonlinear', or 'rollout_nonlinear'.
+
+        Returns:
+            Portfolio-level analytics including VaR, ES, expected return,
+            portfolio betas, and (for nonlinear modes) distribution stats.
+        """
+        return await self._post_long(
+            f"/portfolios/{portfolio_id}/aggregate",
+            json={
+                "simulation_ids": simulation_ids,
+                "mode": mode,
+            },
+        )
 
     # ──────────────────────────────────────────────
     # Tests
