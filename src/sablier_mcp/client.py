@@ -671,7 +671,7 @@ class SablierClient:
         """Start async OT-CFM flow model training job.
 
         All hyperparameters are optional — the backend applies sensible defaults
-        (horizon=60, obs_length=200, max_epochs=2000, lr=1e-4, batch_size=64,
+        (horizon=120, obs_length=200, max_epochs=500, lr=1e-4, batch_size=64,
         patience=80, context_dim=96, encoder_d_model=192, encoder_n_layers=2,
         denoiser_d_model=192, denoiser_n_layers=6).
         """
