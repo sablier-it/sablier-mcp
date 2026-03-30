@@ -1,6 +1,6 @@
 [project]
 name = "sablier-mcp"
-version = "0.3.0"
+version = "0.4.0"
 description = "Sablier MCP — plug Wall Street-grade portfolio analytics, stress-testing, and SEC filing intelligence into any AI assistant. What takes quants & analysts weeks, done in 2 minutes."
 requires-python = ">=3.11"
 license = {text = "MIT"}

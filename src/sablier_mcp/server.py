@@ -456,7 +456,7 @@ def _require_auth() -> str | None:
 async def search_features(
     query: Annotated[str, Field(description="Search term (e.g. 'AAPL', 'technology', 'volatility', 'gold')")],
     is_asset: Annotated[bool | None, Field(description="If True, only assets. If False, only indicators.", default=None)] = None,
-    limit: Annotated[int, Field(description="Max results (default 20)", default=20)] = 20,
+    limit: Annotated[int, Field(description="Max results (default 50)", default=50)] = 50,
 ) -> str:
     if err := _require_auth():
         return err
@@ -686,7 +686,7 @@ async def list_transformations() -> str:
     annotations=ToolAnnotations(title="List Portfolios", readOnlyHint=True),
 )
 async def list_portfolios(
-    limit: Annotated[int, Field(description="Max portfolios to return", default=50)] = 50,
+    limit: Annotated[int, Field(description="Max portfolios to return", default=100)] = 100,
 ) -> list:
     if err := _require_auth():
         return err
@@ -948,7 +948,7 @@ async def optimize_portfolio(
 )
 async def get_efficient_frontier(
     portfolio_id: Annotated[str, Field(description="The portfolio UUID")],
-    n_points: Annotated[int, Field(description="Number of points on the frontier curve (default 20)", default=20)] = 20,
+    num_portfolios: Annotated[int, Field(description="Number of points on the frontier curve (default 50)", default=50)] = 50,
     timeframe: Annotated[str, Field(description="Historical lookback period: '1Y', '2Y', '5Y', etc. Default '1Y'.", default="1Y")] = "1Y",
 ) -> str:
     if err := _require_auth():
@@ -957,7 +957,7 @@ async def get_efficient_frontier(
         return err
     try:
         client = get_client()
-        result = await client.get_efficient_frontier(portfolio_id, n_points=n_points, timeframe=timeframe)
+        result = await client.get_efficient_frontier(portfolio_id, num_portfolios=num_portfolios, timeframe=timeframe)
         return _fmt(result)
     except SablierAPIError as e:
         return _api_error(e)
@@ -1598,7 +1598,7 @@ async def simulate_returns(
             "Keys must match conditioning_features exactly."
         )
     )],
-    n_samples: Annotated[int, Field(description="Number of Monte Carlo samples", default=5000)] = 5000,
+    n_samples: Annotated[int, Field(description="Number of Monte Carlo samples (default 1000)", default=1000)] = 1000,
 ) -> str:
     if err := _require_auth():
         return err
@@ -2267,17 +2267,17 @@ async def train_flow_model(
         description="Optional weights (must sum to 1.0). Defaults to equal weights.",
         default=None,
     )] = None,
-    horizon: Annotated[int, Field(
-        description="Forecast horizon in trading days. ~1 month = 20, ~1 quarter = 60, ~6 months = 120. Default 20.",
-        default=20,
-    )] = 20,
+    horizon: Annotated[int | None, Field(
+        description="Forecast horizon in trading days. ~1 month = 20, ~1 quarter = 60, ~6 months = 120. Defaults to 60 if omitted.",
+        default=None,
+    )] = None,
 ) -> str:
     if err := _require_auth():
         return err
     try:
         client = get_client()
         result, mgid, pid, fnames = await _train_flow_model_impl(
-            client, conditioning_set_id, portfolio_id, tickers, weights, horizon,
+            client, conditioning_set_id, portfolio_id, tickers, weights, horizon or 60,
         )
         if isinstance(result, str):
             return result
@@ -2416,7 +2416,7 @@ async def check_flow_job(
         "Requires model_group_id from train_flow_model or list_model_groups. "
         "If paths already exist, returns cached results instantly. "
         "Path generation takes ~1-3 min on GPU. "
-        "Defaults: horizon=20 (~1 month), n_paths=500."
+        "Defaults: horizon=60 (~1 quarter), n_paths=1000."
     ),
     annotations=ToolAnnotations(title="Generate Flow Paths", destructiveHint=True, openWorldHint=True),
 )
@@ -2429,13 +2429,13 @@ async def generate_flow_paths(
         default=None,
     )] = None,
     horizon: Annotated[int, Field(
-        description="Forecast horizon in trading days. Default 20.",
-        default=20,
-    )] = 20,
+        description="Forecast horizon in trading days. Default 60.",
+        default=60,
+    )] = 60,
     n_paths: Annotated[int, Field(
-        description="Number of paths to generate. 500 default, 1000+ for high-confidence.",
-        default=500,
-    )] = 500,
+        description="Number of paths to generate. 1000 default.",
+        default=1000,
+    )] = 1000,
 ) -> list | str:
     if err := _require_auth():
         return err
@@ -2484,8 +2484,8 @@ async def generate_synthetic(
         description="Optional weights (must sum to 1.0). Defaults to equal weights.",
         default=None,
     )] = None,
-    horizon: Annotated[int, Field(description="Forecast horizon in trading days. Default 20.", default=20)] = 20,
-    n_paths: Annotated[int, Field(description="Number of paths to generate. Default 500.", default=500)] = 500,
+    horizon: Annotated[int, Field(description="Forecast horizon in trading days. Default 60.", default=60)] = 60,
+    n_paths: Annotated[int, Field(description="Number of paths to generate. Default 1000.", default=1000)] = 1000,
 ) -> list | str:
     if err := _require_auth():
         return err
@@ -2550,9 +2550,9 @@ async def simulate_flow_scenario(
         default=None,
     )] = None,
     n_paths: Annotated[int, Field(
-        description="Number of paths to generate. More = better diversity. 500 default, 1000+ for high-confidence.",
-        default=500,
-    )] = 500,
+        description="Number of paths to generate. More = better diversity. 1000 default.",
+        default=1000,
+    )] = 1000,
     horizon: Annotated[int | None, Field(
         description="Override horizon (defaults to training horizon).",
         default=None,
@@ -2872,7 +2872,7 @@ async def market_radar() -> str:
     description=(
         "Get your current credit balance: credits used, credits remaining, monthly allocation, "
         "and overage status. Credits are the unified currency — every operation costs credits "
-        "based on its parameters. Free: 100/mo (blocked at 0), Pro: 1000/mo ($0.25/credit overage)."
+        "based on its parameters. Free: 100/mo (blocked at 0), Pro: 1000/mo (€0.50/credit overage monthly, €0.35/credit annual)."
     ),
     annotations=ToolAnnotations(title="Get Credits", readOnlyHint=True),
 )
@@ -2936,7 +2936,7 @@ async def get_billing_usage(
     name="subscribe",
     description=(
         "Subscribe to a Sablier plan (new subscription). Returns a Stripe Checkout URL to complete payment. "
-        "Tiers: 'pro' (Pro, $199/mo — 1,000 credits/month, $0.25/credit overage, full feature access). "
+        "Tiers: 'pro' (Pro Monthly €499/mo or Pro Annual €349/mo — 1,000 credits/month, overage at €0.50/credit monthly or €0.35/credit annual). "
         "Enterprise pricing is custom — contact team@sablier.it. "
         "To manage an existing subscription (upgrade, downgrade, cancel, update payment), "
         "use manage_subscription instead."
@@ -2944,12 +2944,12 @@ async def get_billing_usage(
     annotations=ToolAnnotations(title="Subscribe", destructiveHint=True),
 )
 async def subscribe(
-    tier: Annotated[str, Field(description="Subscription tier: 'pro' ($199/mo, 1000 credits)")],
+    tier: Annotated[str, Field(description="Subscription tier: 'pro' (€499/mo or €349/mo annual, 1000 credits)")],
 ) -> str:
     if err := _require_auth():
         return err
-    if tier not in ('pro', 'enterprise'):
-        return "Invalid tier. Choose 'pro' ($199/mo, 1000 credits). For Enterprise, contact team@sablier.it."
+    if tier not in ('pro', 'pro_annual', 'enterprise'):
+        return "Invalid tier. Choose 'pro' (€499/mo), 'pro_annual' (€349/mo billed annually), or contact team@sablier.it for Enterprise."
     try:
         client = get_client()
         data = await client.create_checkout_session(tier)
@@ -2973,6 +2973,74 @@ async def manage_subscription() -> str:
     try:
         client = get_client()
         data = await client.create_portal_session()
+        return _fmt(data)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="list_credit_packs",
+    description=(
+        "List available credit packs for one-time purchase. "
+        "Returns pack options with credits, price, and per-credit cost. "
+        "Credit packs are available to all tiers and never expire. "
+        "To purchase, use buy_credit_pack with the pack_id."
+    ),
+    annotations=ToolAnnotations(title="List Credit Packs", readOnlyHint=True),
+)
+async def list_credit_packs() -> str:
+    try:
+        client = get_client()
+        data = await client.list_credit_packs()
+        return _fmt(data)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="buy_credit_pack",
+    description=(
+        "Purchase a one-time credit pack. Returns a Stripe Checkout URL to complete payment. "
+        "Available packs: 'pack_100' (100 credits, €69), 'pack_500' (500 credits, €299), "
+        "'pack_1000' (1000 credits, €499). Credits are added instantly after payment and never expire. "
+        "Use list_credit_packs to see current pricing. Use get_credits to check your balance first."
+    ),
+    annotations=ToolAnnotations(title="Buy Credit Pack", destructiveHint=True),
+)
+async def buy_credit_pack(
+    pack_id: Annotated[str, Field(description="Pack to purchase: 'pack_100', 'pack_500', or 'pack_1000'")],
+) -> str:
+    if err := _require_auth():
+        return err
+    if pack_id not in ('pack_100', 'pack_500', 'pack_1000'):
+        return "Invalid pack_id. Choose 'pack_100' (100 credits, €69), 'pack_500' (500 credits, €299), or 'pack_1000' (1000 credits, €499). Use list_credit_packs for details."
+    try:
+        client = get_client()
+        data = await client.purchase_credit_pack(pack_id)
+        return _fmt(data)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="toggle_overage",
+    description=(
+        "Enable or disable on-demand overage credits for Pro subscribers. "
+        "When enabled, operations continue beyond the monthly credit allocation "
+        "and are billed at the overage rate (€0.50/credit monthly, €0.35/credit annual). "
+        "When disabled, operations are blocked once monthly credits run out. "
+        "Only available for Pro tier — free users should buy credit packs or subscribe."
+    ),
+    annotations=ToolAnnotations(title="Toggle Overage", destructiveHint=True),
+)
+async def toggle_overage(
+    enabled: Annotated[bool, Field(description="True to enable overage, False to disable")],
+) -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        data = await client.toggle_overage(enabled)
         return _fmt(data)
     except SablierAPIError as e:
         return _api_error(e)

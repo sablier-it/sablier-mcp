@@ -101,7 +101,7 @@ class SablierClient:
         query: str,
         is_asset: bool | None = None,
         source: str | None = None,
-        limit: int = 20,
+        limit: int = 50,
     ) -> list[dict]:
         params: dict[str, Any] = {"q": query, "limit": limit}
         if is_asset is not None:
@@ -178,7 +178,7 @@ class SablierClient:
     # Portfolios
     # ──────────────────────────────────────────────
 
-    async def list_portfolios(self, limit: int = 50, offset: int = 0) -> dict:
+    async def list_portfolios(self, limit: int = 100, offset: int = 0) -> dict:
         return await self._get("/portfolios", params={"limit": limit, "offset": offset})
 
     async def get_portfolio(self, portfolio_id: str) -> dict:
@@ -218,6 +218,12 @@ class SablierClient:
     async def optimize_portfolio(
         self, portfolio_id: str, simulation_batch_id: str,
         objective: str = "max_sharpe",
+        risk_aversion: float | None = None,
+        risk_free_rate: float | None = None,
+        max_position: float | None = None,
+        long_only: bool | None = None,
+        max_drawdown_limit: float | None = None,
+        target_exposures: dict | None = None,
     ) -> dict:
         """Find optimal portfolio weights.
 
@@ -246,21 +252,40 @@ class SablierClient:
         }
         api_objective = obj_map.get(objective, objective)
 
+        body: dict[str, Any] = {
+            "beta_simulation_ids": beta_sim_ids,
+            "objective": api_objective,
+        }
+        if risk_aversion is not None:
+            body["risk_aversion"] = risk_aversion
+        if risk_free_rate is not None:
+            body["risk_free_rate"] = risk_free_rate
+        if max_position is not None:
+            body["max_position"] = max_position
+        if long_only is not None:
+            body["long_only"] = long_only
+        if max_drawdown_limit is not None:
+            body["max_drawdown_limit"] = max_drawdown_limit
+        if target_exposures is not None:
+            body["target_exposures"] = target_exposures
+
         return await self._post(
             f"/portfolios/{portfolio_id}/optimize",
-            json={
-                "beta_simulation_ids": beta_sim_ids,
-                "objective": api_objective,
-            },
+            json=body,
         )
 
     async def get_efficient_frontier(
-        self, portfolio_id: str, n_points: int = 20, timeframe: str = "1Y",
+        self, portfolio_id: str, num_portfolios: int = 50,
+        timeframe: str = "1Y", risk_free_rate: float = 0.02,
     ) -> dict:
         """Calculate efficient frontier for portfolio assets."""
         return await self._get(
             f"/portfolios/{portfolio_id}/efficient-frontier",
-            params={"n_points": n_points, "timeframe": timeframe},
+            params={
+                "num_portfolios": num_portfolios,
+                "timeframe": timeframe,
+                "risk_free_rate": risk_free_rate,
+            },
         )
 
     async def get_optimization_history(
@@ -287,6 +312,8 @@ class SablierClient:
         min_year: int | None = None,
         max_year: int | None = None,
         use_transcripts: bool = True,
+        use_cache: bool = True,
+        force_refresh: bool = False,
         weights: dict[str, float] | None = None,
         portfolio_id: str | None = None,
         portfolio_name: str | None = None,
@@ -296,6 +323,8 @@ class SablierClient:
             "tickers": tickers,
             "themes": themes,
             "use_transcripts": use_transcripts,
+            "use_cache": use_cache,
+            "force_refresh": force_refresh,
         }
         if source_types:
             body["source_types"] = source_types
@@ -429,6 +458,11 @@ class SablierClient:
         model_group_id: str,
         nonlinear: bool = True,
         baseline_mode: str | None = None,
+        use_baseline: bool = True,
+        baseline_set_id: str | None = None,
+        use_factor_selection: bool = False,
+        rolling_huber_window: int | None = None,
+        rolling_huber_epsilon: float | None = None,
     ) -> dict:
         """Batch train all models in a group. Synchronous — returns results directly.
 
@@ -436,13 +470,27 @@ class SablierClient:
             'us', 'global', 'developed_ex_us', 'europe', 'japan' (real-time ETF proxies)
             'us_ff5', 'global_ff5', etc. (legacy academic FF5, ~2 month lag)
             'none' or None to skip baseline.
+        use_baseline: Whether to include baseline factors (default True).
+        baseline_set_id: UUID of a custom baseline feature set (overrides baseline_mode).
+        use_factor_selection: Enable LASSO-based factor selection (default False).
+        rolling_huber_window: Window size for rolling Huber regression (default 252).
+        rolling_huber_epsilon: Huber epsilon for outlier robustness (default 1.345).
         """
         body: dict = {
             "model_group_id": model_group_id,
             "nonlinear": nonlinear,
+            "use_baseline": use_baseline,
         }
         if baseline_mode is not None:
             body["baseline_mode"] = baseline_mode
+        if baseline_set_id is not None:
+            body["baseline_set_id"] = baseline_set_id
+        if use_factor_selection:
+            body["use_factor_selection"] = use_factor_selection
+        if rolling_huber_window is not None:
+            body["rolling_huber_window"] = rolling_huber_window
+        if rolling_huber_epsilon is not None:
+            body["rolling_huber_epsilon"] = rolling_huber_epsilon
         return await self._post_long("/moment/train/batch", json=body)
 
     # ──────────────────────────────────────────────
@@ -483,7 +531,7 @@ class SablierClient:
         self,
         simulation_batch_id: str,
         factors: dict[str, float],
-        n_samples: int = 5000,
+        n_samples: int = 1000,
     ) -> dict:
         """Sample returns under stressed factor values. Synchronous."""
         return await self._post_long(
@@ -608,23 +656,37 @@ class SablierClient:
     async def flow_train(
         self,
         model_group_id: str,
-        horizon: int = 20,
-        obs_length: int = 60,
-        max_epochs: int = 500,
-        lr: float = 1e-3,
-        batch_size: int = 64,
-        patience: int = 50,
+        horizon: int | None = None,
+        obs_length: int | None = None,
+        max_epochs: int | None = None,
+        lr: float | None = None,
+        batch_size: int | None = None,
+        patience: int | None = None,
+        context_dim: int | None = None,
+        encoder_d_model: int | None = None,
+        encoder_n_layers: int | None = None,
+        denoiser_d_model: int | None = None,
+        denoiser_n_layers: int | None = None,
     ) -> dict:
-        """Start async OT-CFM flow model training job."""
-        body: dict[str, Any] = {
-            "model_group_id": model_group_id,
-            "horizon": horizon,
-            "obs_length": obs_length,
-            "max_epochs": max_epochs,
-            "lr": lr,
-            "batch_size": batch_size,
-            "patience": patience,
-        }
+        """Start async OT-CFM flow model training job.
+
+        All hyperparameters are optional — the backend applies sensible defaults
+        (horizon=60, obs_length=200, max_epochs=2000, lr=1e-4, batch_size=64,
+        patience=50, context_dim=64, encoder_d_model=128, encoder_n_layers=2,
+        denoiser_d_model=128, denoiser_n_layers=4).
+        """
+        body: dict[str, Any] = {"model_group_id": model_group_id}
+        for key, val in [
+            ("horizon", horizon), ("obs_length", obs_length),
+            ("max_epochs", max_epochs), ("lr", lr),
+            ("batch_size", batch_size), ("patience", patience),
+            ("context_dim", context_dim), ("encoder_d_model", encoder_d_model),
+            ("encoder_n_layers", encoder_n_layers),
+            ("denoiser_d_model", denoiser_d_model),
+            ("denoiser_n_layers", denoiser_n_layers),
+        ]:
+            if val is not None:
+                body[key] = val
         return await self._post("/flow/train", json=body)
 
     async def flow_train_status(self, job_id: str) -> dict:
@@ -647,7 +709,7 @@ class SablierClient:
     async def flow_generate_paths(
         self,
         model_group_id: str,
-        n_paths: int = 500,
+        n_paths: int = 1000,
         horizon: int | None = None,
     ) -> dict:
         """Start async path generation job."""
@@ -663,7 +725,7 @@ class SablierClient:
         self,
         model_group_id: str,
         constraints: list[dict],
-        n_paths: int = 100,
+        n_paths: int = 1000,
         horizon: int | None = None,
         name: str | None = None,
     ) -> dict:
@@ -785,6 +847,31 @@ class SablierClient:
         """Get current credit balance for this month."""
         return await self._get("/billing/credits")
 
+    async def list_credit_packs(self) -> list[dict]:
+        """List available credit packages with pricing. No auth required."""
+        return await self._get("/billing/credit-packs")
+
+    async def purchase_credit_pack(
+        self,
+        pack_id: str,
+        success_url: str | None = None,
+        cancel_url: str | None = None,
+    ) -> dict:
+        """Create a Stripe Checkout Session to purchase a credit pack.
+
+        pack_id: 'pack_100', 'pack_500', or 'pack_1000'.
+        """
+        body: dict[str, Any] = {"pack_id": pack_id}
+        if success_url:
+            body["success_url"] = success_url
+        if cancel_url:
+            body["cancel_url"] = cancel_url
+        return await self._post("/billing/credit-packs/checkout", json=body)
+
+    async def toggle_overage(self, enabled: bool) -> dict:
+        """Toggle on-demand overage credits for Pro subscribers."""
+        return await self._post("/billing/overage", json={"enabled": enabled})
+
     # ──────────────────────────────────────────────
     # Portfolio Aggregation
     # ──────────────────────────────────────────────
@@ -793,7 +880,7 @@ class SablierClient:
         self,
         portfolio_id: str,
         simulation_ids: dict[str, str],
-        mode: str = "single_shot_nonlinear",
+        mode: str = "single_shot_linear",
     ) -> dict:
         """Aggregate per-asset simulation results into portfolio-level analytics.
 
