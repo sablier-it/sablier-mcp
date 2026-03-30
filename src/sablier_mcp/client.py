@@ -672,8 +672,8 @@ class SablierClient:
 
         All hyperparameters are optional — the backend applies sensible defaults
         (horizon=60, obs_length=200, max_epochs=2000, lr=1e-4, batch_size=64,
-        patience=50, context_dim=64, encoder_d_model=128, encoder_n_layers=2,
-        denoiser_d_model=128, denoiser_n_layers=4).
+        patience=80, context_dim=96, encoder_d_model=192, encoder_n_layers=2,
+        denoiser_d_model=192, denoiser_n_layers=6).
         """
         body: dict[str, Any] = {"model_group_id": model_group_id}
         for key, val in [
