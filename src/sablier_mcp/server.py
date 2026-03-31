@@ -2527,7 +2527,9 @@ async def generate_synthetic(
         "IMPORTANT: feature_name in constraints must be the DISPLAY NAME from the training output's feature_names "
         "(e.g. 'Apple Inc.', 'NVIDIA Corporation', 'SPDR S&P 500 ETF Trust'), NOT ticker symbols. "
         "Constraint types: 'level' (absolute price bounds), 'return' (per-step return bounds). "
-        "When completed (via check_flow_job), returns constrained paths + paired baseline + satisfaction_rate. "
+        "When completed (via check_flow_job), returns constrained paths + satisfaction_rate. "
+        "IMPORTANT: Run generate_flow_paths first to create a baseline for comparison — "
+        "if no baseline exists for today, this tool will auto-generate one before the scenario. "
         "Pass portfolio_id through so test_flow_risk can be called directly on results. "
         "Run multiple scenarios and compare via test_flow_risk on each flow_job_id."
     ),
@@ -2565,7 +2567,34 @@ async def simulate_flow_scenario(
     try:
         client = get_client()
 
-        # Dispatch constrained generation — return immediately like training
+        # Auto-check: if no baseline exists for today, generate one first
+        from datetime import date
+        today = date.today().isoformat()
+        try:
+            baselines = await client.flow_list_baselines(model_group_id)
+            has_today_baseline = any(
+                b.get("created_at", "")[:10] == today
+                for b in (baselines.get("baselines") or [])
+            )
+        except Exception:
+            has_today_baseline = False
+
+        baseline_job_id = None
+        if not has_today_baseline:
+            logger.info("No baseline for today — auto-generating before scenario")
+            bl_job = await _retry_gpu_call(lambda: client.flow_generate_paths(
+                model_group_id=model_group_id,
+                n_paths=n_paths,
+                horizon=horizon,
+            ))
+            baseline_job_id = bl_job.get("job_id")
+            if baseline_job_id:
+                # Poll until baseline completes (typically 1-2 min)
+                bl_result = await client.poll_flow_job(baseline_job_id, f"/flow/{baseline_job_id}/results")
+                if bl_result.get("status") == "failed":
+                    logger.warning("Auto-baseline generation failed, proceeding with scenario anyway")
+
+        # Dispatch constrained generation
         job = await _retry_gpu_call(lambda: client.flow_generate_constrained_paths(
             model_group_id=model_group_id,
             constraints=constraints,
@@ -2577,7 +2606,7 @@ async def simulate_flow_scenario(
             return "Error: Constrained generation did not return a job_id."
 
         pid_str = f"'{portfolio_id}'" if portfolio_id else "'<from generate_synthetic>'"
-        output = {
+        output: dict = {
             "status": "generating",
             "model_group_id": model_group_id,
             "portfolio_id": portfolio_id,
@@ -2590,6 +2619,9 @@ async def simulate_flow_scenario(
                 f"Once completed, call test_flow_risk(portfolio_id={pid_str}, flow_job_id='{job_id}') for risk metrics."
             ),
         }
+        if baseline_job_id:
+            output["auto_baseline_job_id"] = baseline_job_id
+            output["note"] = "A baseline was auto-generated for today before running the scenario."
 
         return _fmt(output)
     except _FlowGPUBusy as e:
@@ -2703,6 +2735,70 @@ async def list_flow_scenarios(
         else:
             scenarios = [result]
         return _fmt(scenarios)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="list_flow_baselines",
+    description=(
+        "List completed baseline (unconstrained) generation jobs for a Flow model group. "
+        "Returns job IDs, path counts, horizons, and creation dates. "
+        "Baselines are standalone unconstrained simulations used for comparison with scenarios. "
+        "Use generate_flow_paths to create new baselines."
+    ),
+    annotations=ToolAnnotations(title="List Flow Baselines", readOnlyHint=True),
+)
+async def list_flow_baselines(
+    model_group_id: Annotated[str, Field(
+        description="UUID of the Flow model group"
+    )],
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(model_group_id, "model_group_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.flow_list_baselines(model_group_id)
+        baselines = result.get("baselines", []) if isinstance(result, dict) else result
+        return _fmt(baselines)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="download_flow_paths",
+    description=(
+        "Download all generated paths from a Flow generation job as CSV. "
+        "Returns raw path data with columns: path_idx, day, then one column per feature. "
+        "Works for both baseline and scenario generation jobs. "
+        "Use the flow_job_id from generate_flow_paths, simulate_flow_scenario, or list_flow_baselines/list_flow_scenarios."
+    ),
+    annotations=ToolAnnotations(title="Download Flow Paths", readOnlyHint=True),
+)
+async def download_flow_paths(
+    flow_job_id: Annotated[str, Field(
+        description="Flow generation job ID (from generate_flow_paths or simulate_flow_scenario)"
+    )],
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(flow_job_id, "flow_job_id"):
+        return err
+    try:
+        client = get_client()
+        csv_bytes = await client.flow_download_paths(flow_job_id)
+        # Return first 50 lines as preview + total line count
+        lines = csv_bytes.decode('utf-8', errors='replace').split('\n')
+        total_lines = len(lines)
+        preview = '\n'.join(lines[:51])
+        return _fmt({
+            "total_rows": total_lines - 1,  # exclude header
+            "preview_rows": min(50, total_lines - 1),
+            "csv_preview": preview,
+            "note": f"Showing first 50 of {total_lines - 1} rows. Full CSV has {total_lines - 1} data rows.",
+        })
     except SablierAPIError as e:
         return _api_error(e)
 
@@ -3002,7 +3098,7 @@ async def list_credit_packs() -> str:
     description=(
         "Purchase a one-time credit pack. Returns a Stripe Checkout URL to complete payment. "
         "Available packs: 'pack_100' (100 credits, €69), 'pack_500' (500 credits, €299), "
-        "'pack_1000' (1000 credits, €499). Credits are added instantly after payment and never expire. "
+        "'pack_1000' (1000 credits, €549). Credits are added instantly after payment and never expire. "
         "Use list_credit_packs to see current pricing. Use get_credits to check your balance first."
     ),
     annotations=ToolAnnotations(title="Buy Credit Pack", destructiveHint=True),
@@ -3013,7 +3109,7 @@ async def buy_credit_pack(
     if err := _require_auth():
         return err
     if pack_id not in ('pack_100', 'pack_500', 'pack_1000'):
-        return "Invalid pack_id. Choose 'pack_100' (100 credits, €69), 'pack_500' (500 credits, €299), or 'pack_1000' (1000 credits, €499). Use list_credit_packs for details."
+        return "Invalid pack_id. Choose 'pack_100' (100 credits, €69), 'pack_500' (500 credits, €299), or 'pack_1000' (1000 credits, €549). Use list_credit_packs for details."
     try:
         client = get_client()
         data = await client.purchase_credit_pack(pack_id)

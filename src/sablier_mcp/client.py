@@ -728,12 +728,14 @@ class SablierClient:
         n_paths: int = 1000,
         horizon: int | None = None,
         name: str | None = None,
+        skip_baseline: bool = True,
     ) -> dict:
-        """Start async constrained path generation job (SMC filtering)."""
+        """Start async constrained path generation job (latent optimization)."""
         body: dict[str, Any] = {
             "model_group_id": model_group_id,
             "constraints": constraints,
             "n_paths": n_paths,
+            "skip_baseline": skip_baseline,
         }
         if horizon is not None:
             body["horizon"] = horizon
@@ -785,6 +787,22 @@ class SablierClient:
     async def flow_list_scenarios(self, model_group_id: str) -> dict:
         """List completed constrained scenarios for a flow model group."""
         return await self._get(f"/flow/model-group/{model_group_id}/scenarios")
+
+    async def flow_list_baselines(self, model_group_id: str) -> dict:
+        """List completed baseline (unconstrained) generation jobs for a flow model group."""
+        return await self._get(f"/flow/model-group/{model_group_id}/baselines")
+
+    async def flow_download_paths(self, job_id: str) -> bytes:
+        """Download all generated paths as CSV for a flow generation job."""
+        response = await self._client.request("GET", f"/flow/{job_id}/download-paths")
+        if response.status_code >= 400:
+            try:
+                detail = response.json().get("detail", response.text)
+            except Exception:
+                detail = response.text
+            from sablier_mcp.client import SablierAPIError
+            raise SablierAPIError(response.status_code, str(detail))
+        return response.content
 
     async def flow_portfolio_test(self, portfolio_id: str, flow_job_id: str) -> dict:
         """Run portfolio risk analytics on flow-generated paths."""
