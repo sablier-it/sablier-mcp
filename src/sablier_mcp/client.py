@@ -804,6 +804,10 @@ class SablierClient:
             raise SablierAPIError(response.status_code, str(detail))
         return response.content
 
+    async def delete_flow_job(self, job_id: str) -> dict:
+        """Delete a flow simulation job (baseline or scenario)."""
+        return await self._delete(f"/flow/{job_id}")
+
     async def flow_portfolio_test(self, portfolio_id: str, flow_job_id: str) -> dict:
         """Run portfolio risk analytics on flow-generated paths."""
         return await self._post(

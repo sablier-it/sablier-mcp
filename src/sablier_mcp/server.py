@@ -2804,6 +2804,26 @@ async def download_flow_paths(
 
 
 @server.tool(
+    name="delete_flow_job",
+    description="Delete a flow simulation job (baseline or constrained scenario). This is permanent.",
+    annotations=ToolAnnotations(title="Delete Flow Job", destructiveHint=True),
+)
+async def delete_flow_job(
+    job_id: Annotated[str, Field(description="The flow job UUID to delete (from list_flow_baselines or list_flow_scenarios)")],
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(job_id, "job_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.delete_flow_job(job_id)
+        return _fmt({"message": f"Flow job {job_id} deleted.", **result})
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
     name="flow_validate",
     description=(
         "Validate a trained Flow model against real data. "
