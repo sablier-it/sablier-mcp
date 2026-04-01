@@ -2986,9 +2986,9 @@ async def market_radar() -> str:
 @server.tool(
     name="get_credits",
     description=(
-        "Get your current credit balance: credits used, credits remaining, monthly allocation, "
-        "and overage status. Credits are the unified currency — every operation costs credits "
-        "based on its parameters. Free: 100/mo (blocked at 0), Pro: 1000/mo (€0.50/credit overage monthly, €0.35/credit annual)."
+        "Get your current credit balance: credits used, credits remaining, and overage status. "
+        "Credits are the unified currency — every operation costs credits based on its parameters. "
+        "Free: 100 one-time credits on signup (blocked at 0), Pro: 1000/mo (€0.50/credit overage monthly, €0.35/credit annual)."
     ),
     annotations=ToolAnnotations(title="Get Credits", readOnlyHint=True),
 )
