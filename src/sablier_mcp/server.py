@@ -1217,7 +1217,7 @@ async def delete_grain_analysis(
 
 @server.tool(
     name="list_model_groups",
-    description="List all model groups (each created by analyze_quantitative or generate_synthetic). A model group ties a portfolio to a conditioning set and contains per-asset models. Check model_type: null/absent = Moment (linear), 'flow_generative' = Flow. Use this to find model_group_ids for simulate_betas, simulate_returns, generate_synthetic (resume), or run_model_validation.",
+    description="List all model groups (each created by analyze_quantitative or generate_synthetic). A model group ties a portfolio to a conditioning set and contains per-asset models. Check model_type: null/absent = Moment (linear), 'flow_generative' = Flow. Use this to find model_group_ids for simulate_betas, simulate_returns, or generate_synthetic (resume).",
     annotations=ToolAnnotations(title="List Model Groups", readOnlyHint=True),
 )
 async def list_model_groups() -> str:
@@ -1490,83 +1490,6 @@ async def simulate_betas(
         return _api_error(e)
 
 
-@server.tool(
-    name="run_model_validation",
-    description=(
-        "Trigger validation for all models in a trained model group. "
-        "Computes per-asset quality metrics: R², autocorrelation, regime sensitivity, pass rate, "
-        "and quality badge (EXCELLENT/GOOD/ACCEPTABLE/POOR). "
-        "Use this after analyze_quantitative to assess model reliability before running scenarios. "
-        "For cached results from a previous run, use get_model_validation instead."
-    ),
-    annotations=ToolAnnotations(title="Run Model Validation", readOnlyHint=True, openWorldHint=True),
-)
-async def run_model_validation(
-    model_group_id: Annotated[str, Field(description="UUID of the model group (from analyze_quantitative or list_model_groups)")],
-) -> str:
-    if err := _require_auth():
-        return err
-    if err := _validate_uuid(model_group_id, "model_group_id"):
-        return err
-    try:
-        client = get_client()
-        # Synchronous — Moment returns results directly
-        batch = await client.trigger_batch_validation(model_group_id)
-
-        validation_batch_id = batch.get("validation_batch_id")
-        if not validation_batch_id:
-            return "Error: validation did not return a validation_batch_id."
-
-        results = await client.get_batch_validation_results(validation_batch_id)
-        return _format_validation_results(model_group_id, results)
-    except SablierAPIError as e:
-        return _api_error(e)
-
-
-@server.tool(
-    name="get_model_validation",
-    description=(
-        "Get cached validation metrics from the latest validation run for a model group. "
-        "Returns per-asset model quality: R², autocorrelation, regime sensitivity, pass rate, "
-        "and quality badge. To trigger a fresh validation, use run_model_validation instead."
-    ),
-    annotations=ToolAnnotations(title="Get Model Validation", readOnlyHint=True),
-)
-async def get_model_validation(
-    model_group_id: Annotated[str, Field(description="UUID of the model group (from analyze_quantitative or list_model_groups)")],
-) -> str:
-    if err := _require_auth():
-        return err
-    if err := _validate_uuid(model_group_id, "model_group_id"):
-        return err
-    try:
-        client = get_client()
-        result = await client.get_latest_group_validation(model_group_id)
-        return _format_validation_results(model_group_id, result)
-    except SablierAPIError as e:
-        return _api_error(e)
-
-
-def _format_validation_results(model_group_id: str, result: dict) -> str:
-    per_asset = result.get("per_asset", [])
-    formatted = []
-    for asset in per_asset:
-        entry = {
-            "asset": asset.get("asset_id") or asset.get("model_name"),
-            "quality": asset.get("quality"),
-            "pass_rate": asset.get("pass_rate"),
-            "n_passed": asset.get("n_passed"),
-            "n_tests": asset.get("n_tests"),
-            "r_squared": asset.get("r_squared"),
-            "r_squared_p10": asset.get("r_squared_p10"),
-            "autocorrelation": asset.get("autocorrelation"),
-        }
-        formatted.append(entry)
-
-    return _fmt({
-        "model_group_id": model_group_id,
-        "assets": formatted,
-    })
 
 
 # ══════════════════════════════════════════════════
@@ -2337,7 +2260,7 @@ async def check_flow_job(
                     f"to produce simulated price trajectories."
                 )
             elif job_type == "validate":
-                output["next_steps"] = f"Validation complete. Use get_model_validation(model_group_id=...) to see results."
+                output["next_steps"] = "Validation complete. R² is available in the beta matrix."
             else:
                 mgid = result.get("model_group_id", "")
                 output["next_steps"] = (

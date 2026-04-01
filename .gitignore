@@ -16,3 +16,4 @@ venv/
 
 # Manual testing
 Tests/
+.env.bak
