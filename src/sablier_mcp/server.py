@@ -1925,6 +1925,7 @@ async def analyze_quantitative(
     weights: Annotated[list[float] | None, Field(description="Optional weights for tickers (must sum to 1.0). Defaults to equal weights.", default=None)] = None,
     baseline_mode: Annotated[str | None, Field(description="Baseline factor orthogonalization region. ETF-based (real-time): 'us', 'global', 'developed_ex_us', 'europe', 'japan'. Legacy FF5 (~2mo lag): 'us_ff5', 'global_ff5'. Set 'none' or omit to skip baseline.", default=None)] = None,
     nonlinear: Annotated[bool, Field(description="Also fit nonlinear factor exposure model on top of linear betas, producing sensitivity curves. Requires Pro+ tier. Default True (runs if tier allows).", default=True)] = True,
+    rolling_window: Annotated[int | None, Field(description="Rolling window size in trading days for beta estimation (default 252 = ~1 year). Smaller = more responsive to recent regime changes, larger = more stable.", default=None)] = None,
 ) -> list | str:
     if err := _require_auth():
         return err
@@ -1972,6 +1973,7 @@ async def analyze_quantitative(
             model_group_id=model_group_id,
             nonlinear=nonlinear,
             baseline_mode=baseline_mode,
+            rolling_huber_window=rolling_window,
         ))
         if train_result.get("status") == "failed" or train_result.get("failed", 0) == train_result.get("total", 0):
             return _fmt({
