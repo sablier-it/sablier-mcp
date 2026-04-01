@@ -2295,11 +2295,12 @@ async def train_flow_model(
     name="check_flow_job",
     description=(
         "Check the status of an async Flow job (training, generation, or validation). "
-        "Returns the current status ('running', 'completed', 'failed') and progress details "
-        "including current epoch/max_epochs for training jobs. "
+        "Returns status ('running', 'completed', 'failed') and progress details. "
+        "This is a lightweight status check — it does NOT return results data. "
+        "When status is 'completed', use get_flow_results(job_id) to fetch the actual data. "
         "IMPORTANT: Do NOT call this in a loop. Call it ONCE, report the status to the user, "
         "then ask if they want to do something else while waiting or check again later. "
-        "Training takes 5-15 min, validation 3-5 min."
+        "Training takes 5-15 min, generation 1-3 min, validation 3-5 min."
     ),
     annotations=ToolAnnotations(title="Check Flow Job", readOnlyHint=True),
 )
@@ -2334,48 +2335,13 @@ async def check_flow_job(
                     f"to produce simulated price trajectories."
                 )
             elif job_type == "validate":
-                # Fetch full validation results
-                try:
-                    full_results = await client.flow_validate_results(job_id)
-                    output.update(full_results)
-                except Exception:
-                    output["next_steps"] = "Validation completed. Use get_model_validation to see results."
-            elif job_type == "generate":
-                # Fetch full generation results with per-asset stats and fan chart
-                try:
-                    results = await client.flow_get_results(job_id)
-                    summary = results.get("summary") or {}
-                    baseline_summary = results.get("baseline_summary") or {}
-                    satisfaction_rate = results.get("satisfaction_rate")
-                    result_horizon = results.get("horizon")
-                    mgid = results.get("model_group_id", "")
-
-                    per_asset = _build_per_asset_output(
-                        summary, include_paths=True, baseline_summary=baseline_summary,
-                    )
-                    output["model_group_id"] = mgid
-                    output["flow_job_id"] = job_id
-                    output["satisfaction_rate"] = satisfaction_rate
-                    output["constraints"] = results.get("constraints", [])
-                    output["horizon"] = result_horizon
-                    output["n_paths"] = results.get("n_paths")
-                    output["per_asset"] = per_asset
-                    output["next_steps"] = (
-                        f"Call test_flow_risk(flow_job_id='{job_id}') for risk metrics. "
-                        f"Run more scenarios with simulate_flow_scenario and compare via test_flow_risk on each. "
-                        f"Use list_flow_scenarios(model_group_id='{mgid}') to see all past scenarios."
-                    )
-
-                    try:
-                        chart_html = flow_fan_chart(summary, result_horizon, results.get("constraints"))
-                        if chart_html:
-                            return _with_widget(_fmt(output), chart_html)
-                    except Exception:
-                        logger.warning("Fan chart generation failed, returning text-only", exc_info=True)
-                except Exception:
-                    output["next_steps"] = "Generation completed. Results are ready."
+                output["next_steps"] = f"Validation complete. Use get_model_validation(model_group_id=...) to see results."
             else:
-                output["next_steps"] = "Job completed. Results are ready."
+                mgid = result.get("model_group_id", "")
+                output["next_steps"] = (
+                    f"Generation complete! Use get_flow_results(job_id='{job_id}') to fetch full results. "
+                    f"Use test_flow_risk(flow_job_id='{job_id}') for portfolio risk metrics."
+                )
         elif status == "failed":
             output["error"] = result.get("error") or result.get("error_message") or "Unknown error"
         else:
@@ -2824,6 +2790,114 @@ async def delete_flow_job(
 
 
 @server.tool(
+    name="get_flow_results",
+    description=(
+        "Get the full results of a completed Flow generation job (baseline or scenario). "
+        "Returns per-asset summary statistics (mean return, percentiles, terminal values), "
+        "percentile bands (P5/P25/P50/P75/P95 timeseries), and sample paths for downstream analysis. "
+        "Use check_flow_job first to verify the job is completed. "
+        "For scenario jobs, also returns satisfaction_rate and constraint details. "
+        "Use this to analyze simulation outputs, compare scenarios, or feed into custom analytics."
+    ),
+    annotations=ToolAnnotations(title="Get Flow Results", readOnlyHint=True),
+)
+async def get_flow_results(
+    job_id: Annotated[str, Field(description="Job ID from generate_flow_paths or simulate_flow_scenario")],
+    max_sample_paths: Annotated[int, Field(
+        description="Max sample paths to return per asset (default 10, max 50). More paths = more data for analysis.",
+        default=10,
+    )] = 10,
+) -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        results = await client.flow_get_results(job_id)
+        status = results.get("status", "unknown")
+        if status != "completed":
+            return _fmt({"error": f"Job not completed (status: {status}). Use check_flow_job to monitor progress."})
+
+        summary = results.get("summary") or {}
+        baseline_summary = results.get("baseline_summary") or {}
+        satisfaction_rate = results.get("satisfaction_rate")
+        result_horizon = results.get("horizon")
+        mgid = results.get("model_group_id", "")
+
+        # Build per-asset output with configurable sample path count
+        max_paths = min(max(1, max_sample_paths), 50)
+        per_asset = _build_per_asset_output(
+            summary, include_paths=True, baseline_summary=baseline_summary,
+        )
+        # Adjust sample path count if requested beyond default 10
+        if max_paths != 10:
+            MAX_TS_POINTS = 60
+            for name, data in summary.items():
+                if not isinstance(data, dict) or data.get("feature_type") != "target":
+                    continue
+                ts = data.get("timeseries") or {}
+                sample = ts.get("sample_paths") or []
+                if sample and name in per_asset:
+                    step = max(1, len(sample) // max_paths)
+                    picked = sample[::step][:max_paths]
+                    def _ds(arr):
+                        if not arr or len(arr) <= MAX_TS_POINTS:
+                            return arr
+                        s = max(1, len(arr) // MAX_TS_POINTS)
+                        return arr[::s]
+                    per_asset[name]["sample_paths"] = [_ds(p) for p in picked]
+
+        output = {
+            "job_id": job_id,
+            "model_group_id": mgid,
+            "horizon": result_horizon,
+            "n_paths": results.get("n_paths"),
+            "per_asset": per_asset,
+        }
+        if satisfaction_rate is not None:
+            output["satisfaction_rate"] = satisfaction_rate
+            output["constraints"] = results.get("constraints", [])
+
+        try:
+            chart_html = flow_fan_chart(summary, result_horizon, results.get("constraints"))
+            if chart_html:
+                return _with_widget(_fmt(output), chart_html)
+        except Exception:
+            logger.warning("Fan chart generation failed, returning text-only", exc_info=True)
+
+        return _fmt(output)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="list_flow_baselines",
+    description=(
+        "List all completed baseline (unconstrained) simulations for a Flow model. "
+        "Returns job_id, n_paths, horizon, and created_at for each baseline. "
+        "Use get_flow_results(job_id) to fetch full data for any baseline. "
+        "Baselines are the reference distribution — compare scenarios against them."
+    ),
+    annotations=ToolAnnotations(title="List Flow Baselines", readOnlyHint=True),
+)
+async def list_flow_baselines(
+    model_group_id: Annotated[str, Field(description="UUID of the Flow model")],
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(model_group_id, "model_group_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.flow_list_baselines(model_group_id)
+        baselines = result.get("baselines", [])
+        if not baselines:
+            return _fmt({"baselines": [], "message": "No baselines yet. Use generate_flow_paths to create one."})
+        return _fmt({"baselines": baselines, "count": len(baselines)})
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
     name="flow_validate",
     description=(
         "Validate a trained Flow model against real data. "
@@ -2977,6 +3051,42 @@ async def market_radar() -> str:
     except Exception as e:
         logger.error("market_radar failed: %s", e, exc_info=True)
         return f"Market radar failed: {e}"
+
+
+# ══════════════════════════════════════════════════
+# Account
+# ══════════════════════════════════════════════════
+
+@server.tool(
+    name="whoami",
+    description=(
+        "Get your account info: name, email, subscription tier, credit balance, and usage. "
+        "Useful to understand what you can do (credit limits, tier features) before running operations."
+    ),
+    annotations=ToolAnnotations(title="Who Am I", readOnlyHint=True),
+)
+async def whoami() -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        user = await client.get_user_info()
+        credits = await client.get_credits()
+        output = {
+            "name": user.get("name"),
+            "email": user.get("email"),
+            "company": user.get("company"),
+            "tier": credits.get("tier", "free"),
+            "credits_remaining": credits.get("credits_remaining", 0),
+            "credits_used": credits.get("credits_used", 0),
+            "purchased_credits": credits.get("purchased_credits", 0),
+            "allow_overage": credits.get("allow_overage", False),
+        }
+        if credits.get("billing_period_end"):
+            output["billing_period_end"] = credits["billing_period_end"]
+        return _fmt(output)
+    except SablierAPIError as e:
+        return _api_error(e)
 
 
 # ══════════════════════════════════════════════════

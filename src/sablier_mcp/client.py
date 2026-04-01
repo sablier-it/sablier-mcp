@@ -816,6 +816,14 @@ class SablierClient:
         )
 
     # ──────────────────────────────────────────────
+    # Account
+    # ──────────────────────────────────────────────
+
+    async def get_user_info(self) -> dict:
+        """Get current user's account info (name, email, tier, etc.)."""
+        return await self._get("/account/user")
+
+    # ──────────────────────────────────────────────
     # User API Keys (third-party: FRED, Finnhub)
     # ──────────────────────────────────────────────
 
