@@ -932,6 +932,61 @@ class SablierClient:
         )
 
     # ──────────────────────────────────────────────
+    # Derivatives
+    # ──────────────────────────────────────────────
+
+    async def analyze_derivatives(
+        self,
+        flow_job_id: str,
+        options_positions: list[dict],
+        portfolio_id: str | None = None,
+        risk_free_rate: float = 0.045,
+        capital: float | None = None,
+    ) -> dict:
+        """Run options risk analysis on FLOW-generated paths.
+
+        Combines futures positions (from portfolio weights) with options overlay
+        and computes the joint P&L distribution across all generated paths.
+        """
+        body: dict[str, Any] = {
+            "flow_job_id": flow_job_id,
+            "options_positions": options_positions,
+            "risk_free_rate": risk_free_rate,
+        }
+        if portfolio_id:
+            body["portfolio_id"] = portfolio_id
+        if capital is not None:
+            body["capital"] = capital
+        return await self._post_long("/derivatives/analyze", json=body)
+
+    async def price_option(
+        self,
+        underlying_ticker: str,
+        strike: float,
+        days_to_expiry: int,
+        option_type: str = "call",
+        implied_vol: float | None = None,
+        risk_free_rate: float = 0.045,
+        flow_job_id: str | None = None,
+    ) -> dict:
+        """Price a single option on a futures contract using Black-76.
+
+        If flow_job_id is provided, also computes Esscher fair-value from FLOW paths.
+        """
+        body: dict[str, Any] = {
+            "underlying_ticker": underlying_ticker,
+            "strike": strike,
+            "days_to_expiry": days_to_expiry,
+            "option_type": option_type,
+            "risk_free_rate": risk_free_rate,
+        }
+        if implied_vol is not None:
+            body["implied_vol"] = implied_vol
+        if flow_job_id:
+            body["flow_job_id"] = flow_job_id
+        return await self._post("/derivatives/price", json=body)
+
+    # ──────────────────────────────────────────────
     # Tests
     # ──────────────────────────────────────────────
 
