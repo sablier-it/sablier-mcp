@@ -2007,7 +2007,8 @@ async def _train_flow_model_impl(
             "failed_assets": create_result.get("failed_assets", []),
         }), None, None, []
 
-    # Dispatch training job to GPU worker
+    # Dispatch training job to GPU worker — returns immediately.
+    # Training runs async on GPU (~5-15 min).
     train_job = await _retry_gpu_call(lambda: client.flow_train(
         model_group_id=model_group_id,
         horizon=horizon,
@@ -2018,30 +2019,19 @@ async def _train_flow_model_impl(
 
     feature_names = train_job.get("feature_names", [])
 
-    # Poll until training completes (typically 5-15 min).
-    # This blocks the tool call but lets the agent get a clean
-    # completed/failed result without needing to poll manually.
-    train_result = await client.poll_flow_train(train_job_id)
-    train_status = train_result.get("status", "unknown")
-
-    if train_status == "failed":
-        error_msg = train_result.get("error_message") or train_result.get("error") or "Unknown training error"
-        return _fmt({
-            "status": "failed",
-            "error": error_msg,
-            "model_group_id": model_group_id,
-            "job_id": train_job_id,
-        }), None, None, []
-
     output = {
-        "status": "trained",
+        "status": "training_started",
         "model_group_id": model_group_id,
         "portfolio_id": portfolio_id,
         "job_id": train_job_id,
         "feature_names": feature_names,
-        "next_steps": (
-            f"Training complete! Call generate_flow_paths(model_group_id='{model_group_id}') "
-            f"to produce simulated price trajectories."
+        "estimated_time": "5-15 minutes",
+        "instructions": (
+            f"GPU training job dispatched (job_id='{train_job_id}'). "
+            f"Tell the user: 'Training started — it takes about 5-15 minutes. "
+            f"You can keep chatting with me, and ask me to check progress anytime.' "
+            f"When the user asks to check: check_flow_job(job_id='{train_job_id}'). "
+            f"When training completes: generate_flow_paths(model_group_id='{model_group_id}')."
         ),
     }
     return output, model_group_id, portfolio_id, feature_names
@@ -2194,10 +2184,12 @@ async def _generate_flow_paths_impl(
     name="train_flow_model",
     description=(
         "Train a generative Flow model on a portfolio and conditioning set. "
-        "This tool blocks until training completes (~5-15 min) — no polling needed. "
+        "Returns immediately — training runs on a GPU and takes 5-15 minutes. "
+        "After calling this, STOP and tell the user training has started. Let them keep chatting. "
+        "The user will ask you to check progress — use check_flow_job(job_id=...) when they do. "
+        "Do NOT automatically poll or call check_flow_job yourself. "
         "Requires conditioning_set_id (from list_feature_set_templates or create_feature_set) "
-        "and tickers or portfolio_id. "
-        "After training completes, call generate_flow_paths to produce simulated price trajectories."
+        "and tickers or portfolio_id."
     ),
     annotations=ToolAnnotations(title="Train Flow Model", destructiveHint=True, openWorldHint=True),
 )
@@ -2375,9 +2367,9 @@ async def generate_flow_paths(
     description=(
         "Train a Flow model AND generate paths in one call. "
         "Convenience wrapper: equivalent to train_flow_model then generate_flow_paths. "
-        "This tool blocks until both training and generation complete (~5-18 min total) — no polling needed. "
         "TWO MODES: "
-        "(1) NEW RUN: pass conditioning_set_id + tickers/portfolio_id. Trains then generates. "
+        "(1) NEW RUN: pass conditioning_set_id + tickers/portfolio_id. Dispatches training (~5-15 min async), "
+        "then tell the user to wait and check back. Do NOT poll automatically. "
         "(2) RESUME: pass model_group_id to retrieve existing results or generate new paths without retraining."
     ),
     annotations=ToolAnnotations(title="Generate Synthetic Paths", destructiveHint=True, openWorldHint=True),
@@ -2446,11 +2438,13 @@ async def generate_synthetic(
         "IMPORTANT: feature_name in constraints must be the DISPLAY NAME from the training output's feature_names "
         "(e.g. 'Apple Inc.', 'NVIDIA Corporation', 'SPDR S&P 500 ETF Trust'), NOT ticker symbols. "
         "Constraint types: 'level' (absolute price bounds), 'return' (per-step return bounds). "
+        "BEFORE setting constraints, check the current price (from generate_flow_paths last_price or price_option) "
+        "and set realistic levels relative to spot — e.g. a 15% drop, not an arbitrary number. "
         "When completed (via check_flow_job), returns constrained paths + satisfaction_rate. "
-        "IMPORTANT: Run generate_flow_paths first to create a baseline for comparison — "
+        "Run generate_flow_paths first to create a baseline for comparison — "
         "if no baseline exists for today, this tool will auto-generate one before the scenario. "
         "Pass portfolio_id through so test_flow_risk can be called directly on results. "
-        "Run multiple scenarios and compare via test_flow_risk on each flow_job_id."
+        "Run scenarios SEQUENTIALLY (one at a time), not in parallel, to avoid GPU queue contention."
     ),
     annotations=ToolAnnotations(title="Simulate Flow Scenario", readOnlyHint=True, openWorldHint=True),
 )
@@ -2536,7 +2530,9 @@ async def simulate_flow_scenario(
                 f"Constrained generation started (job_id='{job_id}'). Takes 1-3 minutes. "
                 f"STOP HERE — tell the user and wait. Do NOT poll in a loop. "
                 f"The user can ask you to check with: check_flow_job(job_id='{job_id}', job_type='generate'). "
-                f"Once completed: test_flow_risk(portfolio_id={pid_str}, flow_job_id='{job_id}') for risk metrics."
+                f"Once completed: test_flow_risk(portfolio_id={pid_str}, flow_job_id='{job_id}') for futures-only risk, "
+                f"or analyze_derivatives(flow_job_id='{job_id}', portfolio_id={pid_str}, options_positions=...) "
+                f"if the user has options positions to overlay."
             ),
         }
         if baseline_job_id:
@@ -2556,10 +2552,12 @@ async def simulate_flow_scenario(
 @server.tool(
     name="test_flow_risk",
     description=(
-        "Run portfolio risk analytics on Flow-generated paths. "
+        "Run portfolio risk analytics on Flow-generated paths (FUTURES/EQUITIES ONLY — no options). "
         "Computes expected return, volatility, Sharpe ratio, Sortino ratio, Calmar ratio, "
         "VaR 95%, CVaR 95%, max drawdown, profitability rate, and return distribution percentiles. "
         "Requires portfolio_id and flow_job_id from generate_flow_paths, generate_synthetic, or simulate_flow_scenario. "
+        "If the user has OPTIONS positions, use analyze_derivatives instead — it reprices options "
+        "on every path using Black-76 and shows combined futures+options risk. "
         "TIP: Call this on multiple flow_job_ids (baseline + different scenarios) to build a "
         "side-by-side comparison of risk metrics across scenarios."
     ),
