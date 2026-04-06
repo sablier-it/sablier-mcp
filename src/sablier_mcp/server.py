@@ -1092,8 +1092,25 @@ async def analyze_qualitative(
             })
 
         # Summarize results
-        raw_results = result.get("results", {})
+        raw_results = result.get("results") or {}
+
+        # Surface not-covered tickers clearly (ETFs, non-US equities with no SEC filings)
+        not_covered = raw_results.get("not_covered_info") or {}
+        not_covered_tickers = not_covered.get("not_covered_tickers", [])
+
         themes_data = raw_results.get("results", []) or raw_results.get("themes", [])
+
+        if not themes_data and not_covered_tickers:
+            return _fmt({
+                "status": "not_covered",
+                "not_covered_tickers": not_covered_tickers,
+                "message": (
+                    f"{', '.join(not_covered_tickers)} {'have' if len(not_covered_tickers) > 1 else 'has'} "
+                    "no SEC filings in GRAIN. GRAIN requires equities with 10-K/10-Q filings. "
+                    "ETFs, non-US equities, and funds are not supported."
+                ),
+            })
+
         summary = {
             "status": "completed",
             "processing_time_seconds": result.get("processing_time_seconds"),
