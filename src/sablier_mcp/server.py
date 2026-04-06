@@ -2707,32 +2707,58 @@ async def delete_flow_job(
 @server.tool(
     name="create_rule",
     description=(
-        "Add a systematic trading rule to a portfolio. Rules are evaluated on FLOW forward paths "
-        "during fortest_rules — not backtested on history. Each rule has a trigger (an indicator "
-        "crossing a threshold on a specific asset's path) and an action (adjust the portfolio weight "
-        "for an asset). Rules start inactive; activate with toggle_rule or is_active=True.\n\n"
-        "Trigger fields:\n"
-        "  indicator: moving_average | ema | rsi | bollinger_upper | bollinger_lower | "
-        "bollinger_width | macd_line | macd_signal | rolling_std | rate_of_change | z_score | rolling_volatility\n"
-        "  asset: any ticker in the FLOW model — portfolio assets OR conditioning factors (e.g. 'CL=F', '^VIX', 'DX-Y.NYB', 'DGS10')\n"
-        "  params: indicator parameters — e.g. {\"period\": 14} for RSI, {\"window\": 20} for MA\n"
+        "Add a systematic trading rule to a portfolio. Rules are evaluated day-by-day on FLOW "
+        "forward paths during fortest_rules — not backtested on history. "
+        "Each rule has a trigger (one or more conditions) and an action (weight change on one asset).\n\n"
+
+        "── TRIGGER ──\n"
+        "Single condition (shorthand):\n"
+        "  {indicator, asset, params, operator, threshold}\n\n"
+        "Multi-condition AND / OR:\n"
+        "  {combinator: 'all'|'any', conditions: [{indicator, asset, params, operator, threshold}, ...]}\n\n"
+        "  indicator: raw | moving_average | ema | rsi | bollinger_upper | bollinger_lower |\n"
+        "             bollinger_width | macd_line | macd_signal | rolling_std |\n"
+        "             rolling_volatility | rate_of_change | z_score\n"
+        "    'raw' = use the price/value directly with no transformation (no params needed)\n"
+        "  asset: any ticker the FLOW model was trained on — portfolio assets OR conditioning\n"
+        "         factors (e.g. '^VIX', 'DX-Y.NYB', 'T10Y2Y', 'DGS10', 'ZN=F')\n"
+        "  params: {window:20} for MA/std, {period:14} for RSI, {fast:12,slow:26} for MACD, etc.\n"
         "  operator: '>' | '<' | '>=' | '<=' | '==' | 'crosses_above' | 'crosses_below'\n"
         "  threshold: numeric value\n\n"
-        "Action fields:\n"
-        "  type: 'scale_weight' (multiply weight by value) | 'set_weight' (set exact weight) | 'exit' (set to 0)\n"
-        "  asset: ticker to act on\n"
-        "  value: multiplier for scale_weight or target weight for set_weight (omit for exit)\n\n"
-        "Examples:\n"
-        "  RSI overbought exit: trigger={indicator:'rsi', asset:'CL=F', params:{period:14}, operator:'>', threshold:70}, action={type:'exit', asset:'CL=F'}\n"
-        "  MA trend filter halve: trigger={indicator:'moving_average', asset:'ES=F', params:{window:20}, operator:'<', threshold:4500}, action={type:'scale_weight', asset:'ES=F', value:0.5}"
+
+        "── ACTION ──\n"
+        "  {type, asset, value?}\n"
+        "  exit         — set weight to 0 (go flat)\n"
+        "  set_weight   — set weight to exact value; negative = short (e.g. -0.2 = 20% short)\n"
+        "  scale_weight — multiply current weight by value (0.5=halve, 2.0=double, -1=reverse)\n"
+        "  reverse      — flip sign of current weight (long→short, short→long)\n\n"
+
+        "── EXAMPLES ──\n"
+        "RSI overbought → exit:\n"
+        "  trigger={indicator:'rsi', asset:'CL=F', params:{period:14}, operator:'>', threshold:70}\n"
+        "  action={type:'exit', asset:'CL=F'}\n\n"
+        "MA crossover → go short (trend reversal):\n"
+        "  trigger={indicator:'moving_average', asset:'ES=F', params:{window:20}, operator:'crosses_below', threshold:0}\n"
+        "  (threshold=0 won't work for price — compare two MAs via two rules or use rate_of_change)\n\n"
+        "VIX spike AND RSI overbought → halve oil position (AND logic):\n"
+        "  trigger={combinator:'all', conditions:[\n"
+        "    {indicator:'raw', asset:'^VIX', params:{}, operator:'>', threshold:30},\n"
+        "    {indicator:'rsi', asset:'CL=F', params:{period:14}, operator:'>', threshold:65}\n"
+        "  ]}\n"
+        "  action={type:'scale_weight', asset:'CL=F', value:0.5}\n\n"
+        "Inverted yield curve → reduce duration (raw value):\n"
+        "  trigger={indicator:'raw', asset:'T10Y2Y', params:{}, operator:'<', threshold:0}\n"
+        "  action={type:'scale_weight', asset:'ZN=F', value:0.3}\n\n"
+        "Multiple rules build a strategy: e.g. priority-0 rules set direction, "
+        "priority-1 rules are vol/regime filters that scale the result."
     ),
     annotations=ToolAnnotations(title="Create Trading Rule"),
 )
 async def create_rule(
     portfolio_id: Annotated[str, Field(description="Portfolio UUID")],
     name: Annotated[str, Field(description="Short descriptive name for the rule")],
-    trigger: Annotated[dict, Field(description="Trigger definition: {indicator, asset, params, operator, threshold}")],
-    action: Annotated[dict, Field(description="Action definition: {type, asset, value}")],
+    trigger: Annotated[dict, Field(description="Single condition {indicator,asset,params,operator,threshold} or multi-condition {combinator:'all'|'any', conditions:[...]}")],
+    action: Annotated[dict, Field(description="Weight change: {type:'exit'|'set_weight'|'scale_weight'|'reverse', asset, value?}")],
     description: Annotated[str | None, Field(description="Optional longer description")] = None,
     is_active: Annotated[bool, Field(description="Whether the rule is active (default false)")] = False,
     priority: Annotated[int, Field(description="Evaluation order when multiple rules fire (lower = first, default 0)")] = 0,
