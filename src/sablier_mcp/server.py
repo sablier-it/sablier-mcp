@@ -2395,15 +2395,16 @@ async def generate_synthetic(
     description=(
         "Start constrained what-if scenario generation from a trained Flow model. "
         "Returns immediately with a job_id — use check_flow_job(job_id, job_type='generate') to poll for results. "
-        "Requires model_group_id and feature_names from train_flow_model or generate_synthetic. "
-        "IMPORTANT: feature_name in constraints must be the DISPLAY NAME from the training output's feature_names "
-        "(e.g. 'Apple Inc.', 'NVIDIA Corporation', 'SPDR S&P 500 ETF Trust'), NOT ticker symbols. "
+        "IMPORTANT: Always run generate_flow_paths FIRST on the same day before running any scenarios. "
+        "This establishes a same-day baseline — when you retrieve results via get_flow_results, "
+        "scenario_probability is automatically computed: the fraction of unconstrained baseline paths "
+        "that naturally satisfy your constraints, telling you how likely the scenario is. "
+        "≥5% = within normal range | 1-5% = rare, treat with care | <1% = very rare, consider loosening constraints. "
+        "IMPORTANT: feature_name in constraints must be the DISPLAY NAME from feature_names "
+        "(e.g. 'Apple Inc.', 'SPDR S&P 500 ETF Trust'), NOT ticker symbols. "
         "Constraint types: 'level' (absolute price bounds), 'return' (per-step return bounds). "
-        "BEFORE setting constraints, check the current price (from generate_flow_paths last_price or price_option) "
-        "and set realistic levels relative to spot — e.g. a 15% drop, not an arbitrary number. "
-        "When completed (via check_flow_job), returns constrained paths + satisfaction_rate. "
-        "Run generate_flow_paths first to create a baseline for comparison — "
-        "if no baseline exists for today, this tool will auto-generate one before the scenario. "
+        "BEFORE setting constraints, check current prices from generate_flow_paths last_price "
+        "and set realistic levels — e.g. a 15% drop from spot, not an arbitrary number. "
         "Pass portfolio_id through so test_flow_risk can be called directly on results. "
         "Run scenarios SEQUENTIALLY (one at a time), not in parallel, to avoid GPU queue contention."
     ),
@@ -2769,6 +2770,12 @@ async def get_flow_results(
         if satisfaction_rate is not None:
             output["satisfaction_rate"] = satisfaction_rate
             output["constraints"] = results.get("constraints", [])
+        if results.get("scenario_probability") is not None:
+            output["scenario_probability"] = results["scenario_probability"]
+            output["scenario_probability_note"] = results.get("scenario_probability_note")
+        elif results.get("scenario_probability_note"):
+            # No baseline found — surface the warning
+            output["scenario_probability_note"] = results["scenario_probability_note"]
 
         try:
             chart_html = flow_fan_chart(summary, result_horizon, results.get("constraints"))
