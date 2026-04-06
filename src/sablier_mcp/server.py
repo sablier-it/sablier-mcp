@@ -2714,7 +2714,7 @@ async def delete_flow_job(
         "Trigger fields:\n"
         "  indicator: moving_average | ema | rsi | bollinger_upper | bollinger_lower | "
         "bollinger_width | macd_line | macd_signal | rolling_std | rate_of_change | z_score | rolling_volatility\n"
-        "  asset: ticker present in the portfolio (e.g. 'CL=F')\n"
+        "  asset: any ticker in the FLOW model — portfolio assets OR conditioning factors (e.g. 'CL=F', '^VIX', 'DX-Y.NYB', 'DGS10')\n"
         "  params: indicator parameters — e.g. {\"period\": 14} for RSI, {\"window\": 20} for MA\n"
         "  operator: '>' | '<' | '>=' | '<=' | '==' | 'crosses_above' | 'crosses_below'\n"
         "  threshold: numeric value\n\n"
