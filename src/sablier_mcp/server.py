@@ -1028,14 +1028,17 @@ async def analyze_qualitative(
 
         # Summarize results
         raw_results = result.get("results") or {}
-
-        # Surface not-covered tickers clearly (ETFs, non-US equities with no SEC filings)
-        not_covered = raw_results.get("not_covered_info") or {}
-        not_covered_tickers = not_covered.get("not_covered_tickers", [])
-
         themes_data = raw_results.get("results", []) or raw_results.get("themes", [])
 
-        if not themes_data and not_covered_tickers:
+        # Surface not-covered tickers clearly (ETFs, non-US equities with no SEC filings)
+        # not_covered_tickers lives in each theme's coverage_summary (same list across themes)
+        not_covered_tickers: list[str] = []
+        if themes_data:
+            first_coverage = (themes_data[0] or {}).get("coverage_summary") or {}
+            not_covered_tickers = first_coverage.get("not_covered_tickers") or []
+        covered_count = (themes_data[0] or {}).get("coverage_summary", {}).get("covered_count", 1) if themes_data else 0
+
+        if not covered_count and not_covered_tickers:
             return _fmt({
                 "status": "not_covered",
                 "not_covered_tickers": not_covered_tickers,
