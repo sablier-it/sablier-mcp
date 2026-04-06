@@ -376,7 +376,7 @@ async def _ensure_portfolio(
     try:
         portfolio = await client.create_portfolio(name, assets)
     except SablierAPIError as e:
-        if e.status_code in (409, 500) and "unique" in str(e).lower():
+        if e.status_code == 409 or (e.status_code == 500 and "unique" in str(e).lower()):
             # Duplicate name — find and reuse the existing portfolio
             all_portfolios = await client.list_portfolios()
             items = all_portfolios.get("portfolios", all_portfolios) if isinstance(all_portfolios, dict) else all_portfolios
@@ -776,9 +776,10 @@ async def create_portfolio(
 @server.tool(
     name="update_portfolio",
     description=(
-        "Update an existing portfolio. Can change name, description, weights, and/or capital. "
+        "Update an existing portfolio. Can change name, description, weights, capital, and/or options_positions. "
         "Only pass the fields you want to update — omitted fields stay unchanged. "
-        "Weights must sum to 1.0 if provided."
+        "Weights must sum to 1.0 if provided. "
+        "options_positions sets the options overlay for derivatives analysis (persisted on the portfolio)."
     ),
     annotations=ToolAnnotations(title="Update Portfolio", destructiveHint=True),
 )
@@ -788,6 +789,15 @@ async def update_portfolio(
     description: Annotated[str | None, Field(description="New description", default=None)] = None,
     weights: Annotated[dict[str, float] | None, Field(description="New weights by ticker (e.g. {'AAPL': 0.5, 'MSFT': 0.5}). Must sum to 1.0.", default=None)] = None,
     capital: Annotated[float | None, Field(description="New capital allocation in USD", default=None)] = None,
+    options_positions: Annotated[list[dict] | None, Field(
+        description=(
+            "Options overlay positions to persist on the portfolio. Each dict: "
+            "underlying (display_name), option_type ('call'/'put'), strike (float), "
+            "days_to_expiry (int), quantity (int, negative=short), implied_vol (float), "
+            "entry_premium (float). These are used by analyze_derivatives when no positions are passed inline."
+        ),
+        default=None,
+    )] = None,
 ) -> str:
     if err := _require_auth():
         return err
@@ -802,18 +812,23 @@ async def update_portfolio(
         fields["weights"] = weights
     if capital is not None:
         fields["capital"] = capital
+    if options_positions is not None:
+        fields["options_positions"] = options_positions
     if not fields:
-        return "Error: provide at least one field to update (name, description, weights, capital)."
+        return "Error: provide at least one field to update (name, description, weights, capital, options_positions)."
     try:
         client = get_client()
         result = await client.update_portfolio(portfolio_id, **fields)
-        return _fmt({
+        output = {
             "portfolio_id": result["id"],
             "name": result["name"],
             "weights": result.get("weights", {}),
             "capital": result.get("capital"),
             "message": "Portfolio updated successfully.",
-        })
+        }
+        if result.get("options_positions"):
+            output["options_positions"] = result["options_positions"]
+        return _fmt(output)
     except SablierAPIError as e:
         return _api_error(e)
 
@@ -1992,9 +2007,8 @@ async def _train_flow_model_impl(
             "failed_assets": create_result.get("failed_assets", []),
         }), None, None, []
 
-    # Start training without holding GPU lock during polling — the backend
-    # manages its own GPU resources.  Return immediately so Claude can keep
-    # working while the job runs.
+    # Dispatch training job to GPU worker — returns immediately.
+    # Training runs async on GPU (~5-15 min).
     train_job = await _retry_gpu_call(lambda: client.flow_train(
         model_group_id=model_group_id,
         horizon=horizon,
@@ -2006,16 +2020,18 @@ async def _train_flow_model_impl(
     feature_names = train_job.get("feature_names", [])
 
     output = {
-        "status": "training",
+        "status": "training_started",
         "model_group_id": model_group_id,
         "portfolio_id": portfolio_id,
         "job_id": train_job_id,
         "feature_names": feature_names,
-        "next_steps": (
-            f"Training started (job_id='{train_job_id}'). It typically takes 5-15 minutes. "
-            f"Use check_flow_job(job_id='{train_job_id}') to check progress. "
-            f"Once completed, call generate_flow_paths(model_group_id='{model_group_id}') "
-            f"to produce simulated price trajectories."
+        "estimated_time": "5-15 minutes",
+        "instructions": (
+            f"GPU training job dispatched (job_id='{train_job_id}'). "
+            f"Tell the user: 'Training started — it takes about 5-15 minutes. "
+            f"You can keep chatting with me, and ask me to check progress anytime.' "
+            f"When the user asks to check: check_flow_job(job_id='{train_job_id}'). "
+            f"When training completes: generate_flow_paths(model_group_id='{model_group_id}')."
         ),
     }
     return output, model_group_id, portfolio_id, feature_names
@@ -2100,10 +2116,16 @@ async def _generate_flow_paths_impl(
                 "hint": "Create a new model with train_flow_model(conditioning_set_id=..., tickers=...).",
             })
         if mg_status not in ("trained", "completed", ""):
+            training_job_id = (_mg_info or {}).get("active_training_job_id")
             return _fmt({
                 "error": f"Model group status is '{mg_status}'. Training may still be in progress.",
                 "model_group_id": model_group_id,
-                "hint": "Wait for training to complete, or train a new model with train_flow_model.",
+                "training_job_id": training_job_id,
+                "hint": (
+                    f"Use check_flow_job(job_id='{training_job_id}', job_type='train') to monitor progress."
+                    if training_job_id else
+                    "Wait for training to complete, or train a new model with train_flow_model."
+                ),
             })
     except Exception:
         logger.debug("Could not check model group status", exc_info=True)
@@ -2168,11 +2190,12 @@ async def _generate_flow_paths_impl(
     name="train_flow_model",
     description=(
         "Train a generative Flow model on a portfolio and conditioning set. "
-        "Returns immediately with a job_id — training runs asynchronously (~5-15 min). "
-        "Use check_flow_job(job_id=...) to monitor progress. "
+        "Returns immediately — training runs on a GPU and takes 5-15 minutes. "
+        "After calling this, STOP and tell the user training has started. Let them keep chatting. "
+        "The user will ask you to check progress — use check_flow_job(job_id=...) when they do. "
+        "Do NOT automatically poll or call check_flow_job yourself. "
         "Requires conditioning_set_id (from list_feature_set_templates or create_feature_set) "
-        "and tickers or portfolio_id. "
-        "After training completes, call generate_flow_paths to produce simulated price trajectories."
+        "and tickers or portfolio_id."
     ),
     annotations=ToolAnnotations(title="Train Flow Model", destructiveHint=True, openWorldHint=True),
 )
@@ -2223,9 +2246,11 @@ async def train_flow_model(
         "Returns status ('running', 'completed', 'failed') and progress details. "
         "This is a lightweight status check — it does NOT return results data. "
         "When status is 'completed', use get_flow_results(job_id) to fetch the actual data. "
-        "IMPORTANT: Do NOT call this in a loop. Call it ONCE, report the status to the user, "
-        "then ask if they want to do something else while waiting or check again later. "
-        "Training takes 5-15 min, generation 1-3 min, validation 3-5 min."
+        "CRITICAL: Call this ONCE, report the status to the user, then STOP. "
+        "Do NOT call this repeatedly or in a loop — the job takes minutes, not seconds. "
+        "Do NOT launch a new training/generation job if this returns 'running' — just wait. "
+        "Tell the user: 'Training takes 5-15 min, generation 1-3 min. I'll check when you ask.' "
+        "Typical times: training 5-15 min, generation 1-3 min, validation 3-5 min."
     ),
     annotations=ToolAnnotations(title="Check Flow Job", readOnlyHint=True),
 )
@@ -2289,8 +2314,9 @@ async def check_flow_job(
             if current_epoch and max_epochs:
                 output["progress"] = f"{current_epoch}/{max_epochs} epochs"
             output["hint"] = (
-                "Job is still running. Tell the user the current progress and ask if they'd like to "
-                "do something else in the meantime, or check back later. Do NOT call this tool again automatically."
+                "STOP. Job is still running. Report progress to the user and STOP calling tools. "
+                "Do NOT call check_flow_job again — the user will ask you when they want an update. "
+                "Suggest they can ask 'check my training job' in a few minutes."
             )
 
         return _fmt(output)
@@ -2348,9 +2374,9 @@ async def generate_flow_paths(
         "Train a Flow model AND generate paths in one call. "
         "Convenience wrapper: equivalent to train_flow_model then generate_flow_paths. "
         "TWO MODES: "
-        "(1) NEW RUN: pass conditioning_set_id + tickers/portfolio_id. Trains then generates (~5-18 min). "
-        "(2) RESUME: pass model_group_id to retrieve existing results or generate new paths without retraining. "
-        "Prefer the separate train_flow_model + generate_flow_paths tools for more control."
+        "(1) NEW RUN: pass conditioning_set_id + tickers/portfolio_id. Dispatches training (~5-15 min async), "
+        "then tell the user to wait and check back. Do NOT poll automatically. "
+        "(2) RESUME: pass model_group_id to retrieve existing results or generate new paths without retraining."
     ),
     annotations=ToolAnnotations(title="Generate Synthetic Paths", destructiveHint=True, openWorldHint=True),
 )
@@ -2418,11 +2444,13 @@ async def generate_synthetic(
         "IMPORTANT: feature_name in constraints must be the DISPLAY NAME from the training output's feature_names "
         "(e.g. 'Apple Inc.', 'NVIDIA Corporation', 'SPDR S&P 500 ETF Trust'), NOT ticker symbols. "
         "Constraint types: 'level' (absolute price bounds), 'return' (per-step return bounds). "
+        "BEFORE setting constraints, check the current price (from generate_flow_paths last_price or price_option) "
+        "and set realistic levels relative to spot — e.g. a 15% drop, not an arbitrary number. "
         "When completed (via check_flow_job), returns constrained paths + satisfaction_rate. "
-        "IMPORTANT: Run generate_flow_paths first to create a baseline for comparison — "
+        "Run generate_flow_paths first to create a baseline for comparison — "
         "if no baseline exists for today, this tool will auto-generate one before the scenario. "
         "Pass portfolio_id through so test_flow_risk can be called directly on results. "
-        "Run multiple scenarios and compare via test_flow_risk on each flow_job_id."
+        "Run scenarios SEQUENTIALLY (one at a time), not in parallel, to avoid GPU queue contention."
     ),
     annotations=ToolAnnotations(title="Simulate Flow Scenario", readOnlyHint=True, openWorldHint=True),
 )
@@ -2505,9 +2533,12 @@ async def simulate_flow_scenario(
             "constraints": constraints,
             "n_paths": n_paths,
             "next_steps": (
-                f"Constrained generation started (job_id='{job_id}'). It typically takes 1-3 minutes. "
-                f"Use check_flow_job(job_id='{job_id}', job_type='generate') to check progress. "
-                f"Once completed, call test_flow_risk(portfolio_id={pid_str}, flow_job_id='{job_id}') for risk metrics."
+                f"Constrained generation started (job_id='{job_id}'). Takes 1-3 minutes. "
+                f"STOP HERE — tell the user and wait. Do NOT poll in a loop. "
+                f"The user can ask you to check with: check_flow_job(job_id='{job_id}', job_type='generate'). "
+                f"Once completed: test_flow_risk(portfolio_id={pid_str}, flow_job_id='{job_id}') for futures-only risk, "
+                f"or analyze_derivatives(flow_job_id='{job_id}', portfolio_id={pid_str}, options_positions=...) "
+                f"if the user has options positions to overlay."
             ),
         }
         if baseline_job_id:
@@ -2527,10 +2558,12 @@ async def simulate_flow_scenario(
 @server.tool(
     name="test_flow_risk",
     description=(
-        "Run portfolio risk analytics on Flow-generated paths. "
+        "Run portfolio risk analytics on Flow-generated paths (FUTURES/EQUITIES ONLY — no options). "
         "Computes expected return, volatility, Sharpe ratio, Sortino ratio, Calmar ratio, "
         "VaR 95%, CVaR 95%, max drawdown, profitability rate, and return distribution percentiles. "
         "Requires portfolio_id and flow_job_id from generate_flow_paths, generate_synthetic, or simulate_flow_scenario. "
+        "If the user has OPTIONS positions, use analyze_derivatives instead — it reprices options "
+        "on every path using Black-76 and shows combined futures+options risk. "
         "TIP: Call this on multiple flow_job_ids (baseline + different scenarios) to build a "
         "side-by-side comparison of risk metrics across scenarios."
     ),
@@ -2732,7 +2765,7 @@ async def get_flow_results(
         description="Max sample paths to return per asset (default 10, max 50). More paths = more data for analysis.",
         default=10,
     )] = 10,
-) -> str:
+) -> list | str:
     if err := _require_auth():
         return err
     try:
@@ -2869,6 +2902,181 @@ async def flow_validate(
         return str(e)
     except SablierAPIError as e:
         return _api_error(e)
+
+
+# ══════════════════════════════════════════════════
+# Derivatives Analysis
+# ══════════════════════════════════════════════════
+
+
+@server.tool(
+    name="analyze_derivatives",
+    description=(
+        "Run options risk analysis on FLOW-generated paths for a mixed futures + options portfolio. "
+        "Reprices each option at every timestep of every path using Black-76, then computes portfolio-level "
+        "risk metrics (VaR, CVaR, Sharpe, Sortino, max drawdown) and per-position Greeks (delta, gamma, vega, theta, rho). "
+        "Returns separate risk breakdowns for: combined portfolio, futures-only, and options-only components, "
+        "plus P&L timeseries percentile bands. "
+        "Requires a flow_job_id from generate_flow_paths or simulate_flow_scenario. "
+        "For scenario analysis: run simulate_flow_scenario first (e.g., 'VIX > 30 and crude drops 20%'), "
+        "then call this tool to see how your options hedge performs under that scenario."
+    ),
+    annotations=ToolAnnotations(title="Analyze Derivatives Risk", readOnlyHint=True, openWorldHint=True),
+)
+async def analyze_derivatives(
+    flow_job_id: Annotated[str, Field(
+        description="Flow generation job ID (from generate_flow_paths, generate_synthetic, or simulate_flow_scenario)"
+    )],
+    options_positions: Annotated[list[dict], Field(
+        description=(
+            "List of option positions. Each dict must have: "
+            "underlying (display_name of the futures, e.g. 'E-mini S&P 500 Futures'), "
+            "option_type ('call' or 'put'), strike (float), days_to_expiry (int), "
+            "quantity (int, negative for short), implied_vol (float, annualized e.g. 0.20). "
+            "Optional: entry_premium (float), multiplier (float, defaults to contract spec)."
+        )
+    )],
+    portfolio_id: Annotated[str | None, Field(
+        description="Portfolio UUID for underlying futures weights. Optional for standalone options analysis.",
+        default=None,
+    )] = None,
+    risk_free_rate: Annotated[float, Field(
+        description="Annualized risk-free rate (default 0.045 = 4.5%)",
+        default=0.045,
+    )] = 0.045,
+    capital: Annotated[float | None, Field(
+        description="Override portfolio capital. If None, uses portfolio's capital.",
+        default=None,
+    )] = None,
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(flow_job_id, "flow_job_id"):
+        return err
+    if portfolio_id:
+        if err := _validate_uuid(portfolio_id, "portfolio_id"):
+            return err
+
+    try:
+        client = get_client()
+        result = await client.analyze_derivatives(
+            flow_job_id=flow_job_id,
+            options_positions=options_positions,
+            portfolio_id=portfolio_id,
+            risk_free_rate=risk_free_rate,
+            capital=capital,
+        )
+
+        # Extract key metrics for compact output
+        portfolio = result.get("portfolio", {})
+        options_only = result.get("options_only", {})
+        positions = result.get("positions", [])
+        agg_greeks = result.get("aggregate_greeks", {})
+
+        output = {
+            "status": "completed",
+            "flow_job_id": flow_job_id,
+            "portfolio_id": portfolio_id,
+            "n_paths": result.get("n_paths"),
+            "horizon": result.get("horizon"),
+            "combined_portfolio": {
+                "expected_return": portfolio.get("expected_return"),
+                "volatility_ann": portfolio.get("volatility_ann"),
+                "sharpe_ratio": portfolio.get("sharpe_ratio"),
+                "sortino_ratio": portfolio.get("sortino_ratio"),
+                "var_95": portfolio.get("var_95"),
+                "cvar_95": portfolio.get("cvar_95"),
+                "max_drawdown_pct": portfolio.get("max_drawdown_pct"),
+                "profitability": portfolio.get("profitability"),
+                "terminal_pnl": portfolio.get("terminal_pnl"),
+            },
+            "options_only": {
+                "expected_return": options_only.get("expected_return"),
+                "var_95": options_only.get("var_95"),
+                "terminal_pnl": options_only.get("terminal_pnl"),
+            },
+            "aggregate_greeks": agg_greeks,
+            "per_position": [
+                {
+                    "position": p.get("position"),
+                    "greeks": p.get("greeks"),
+                    "terminal_payoff": p.get("terminal_payoff"),
+                }
+                for p in positions
+            ],
+        }
+
+        return _fmt(output)
+    except SablierAPIError as e:
+        return _api_error(e)
+    except Exception as e:
+        logger.error("analyze_derivatives failed: %s", e, exc_info=True)
+        return "Derivatives analysis failed unexpectedly. Please try again."
+
+
+@server.tool(
+    name="price_option",
+    description=(
+        "Price a single option on a futures contract using the Black-76 model. "
+        "Returns the option price, per-contract value (price × contract multiplier), "
+        "and analytical Greeks (delta, gamma, vega, theta, rho). "
+        "Supports all major futures: ES=F, NQ=F, CL=F, GC=F, SI=F, ZB=F, ZN=F, ZC=F, ZW=F, ZS=F, etc. "
+        "If a flow_job_id is provided, also computes an Esscher fair-value estimate from FLOW paths "
+        "(captures fat tails and vol clustering that Black-76 misses). "
+        "Use this for quick pricing checks; use analyze_derivatives for full portfolio risk."
+    ),
+    annotations=ToolAnnotations(title="Price Option", readOnlyHint=True),
+)
+async def price_option_tool(
+    underlying_ticker: Annotated[str, Field(
+        description="Ticker of the underlying futures (e.g. 'ES=F', 'CL=F', 'GC=F')"
+    )],
+    strike: Annotated[float, Field(
+        description="Option strike price"
+    )],
+    days_to_expiry: Annotated[int, Field(
+        description="Trading days until option expiration"
+    )],
+    option_type: Annotated[str, Field(
+        description="'call' or 'put'",
+        default="call",
+    )] = "call",
+    implied_vol: Annotated[float | None, Field(
+        description="Annualized implied volatility (e.g. 0.20 for 20%). If omitted, uses 20% default.",
+        default=None,
+    )] = None,
+    risk_free_rate: Annotated[float, Field(
+        description="Annualized risk-free rate (default 0.045 = 4.5%)",
+        default=0.045,
+    )] = 0.045,
+    flow_job_id: Annotated[str | None, Field(
+        description="Optional Flow job ID. If provided, also computes Esscher fair-value from FLOW paths.",
+        default=None,
+    )] = None,
+) -> str:
+    if err := _require_auth():
+        return err
+    if flow_job_id:
+        if err := _validate_uuid(flow_job_id, "flow_job_id"):
+            return err
+
+    try:
+        client = get_client()
+        result = await client.price_option(
+            underlying_ticker=underlying_ticker,
+            strike=strike,
+            days_to_expiry=days_to_expiry,
+            option_type=option_type,
+            implied_vol=implied_vol,
+            risk_free_rate=risk_free_rate,
+            flow_job_id=flow_job_id,
+        )
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+    except Exception as e:
+        logger.error("price_option failed: %s", e, exc_info=True)
+        return "Option pricing failed unexpectedly. Please try again."
 
 
 # ══════════════════════════════════════════════════
