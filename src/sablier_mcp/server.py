@@ -1142,7 +1142,7 @@ async def list_grain_analyses(
 
 @server.tool(
     name="get_grain_analysis",
-    description="Load a saved GRAIN analysis with full results: theme scores, per-ticker breakdown, and evidence passages.",
+    description="Retrieve full results of a completed GRAIN analysis: theme scores, per-ticker breakdown, and evidence passages. Use list_grain_analyses first to find the analysis_id.",
     annotations=ToolAnnotations(title="Get GRAIN Analysis", readOnlyHint=True),
 )
 async def get_grain_analysis(
@@ -2708,57 +2708,69 @@ async def delete_flow_job(
     name="create_rule",
     description=(
         "Add a systematic trading rule to a portfolio. Rules are evaluated day-by-day on FLOW "
-        "forward paths during fortest_rules — not backtested on history. "
-        "Each rule has a trigger (one or more conditions) and an action (weight change on one asset).\n\n"
+        "forward paths during fortest_rules — not backtested on history.\n\n"
+        "TWO RULE TYPES:\n"
+        "  • Signal rules  (action.type='signal_weight') — continuous indicator → proportional position.\n"
+        "    This is how CTAs and trend-followers actually run strategies.\n"
+        "  • Binary rules  (all other action types) — trigger fires → discrete weight change.\n"
+        "    Best for risk overlays, hard stops, regime gates.\n\n"
+        "Use signal rules (priority 0) to define the core strategy, then binary rules (priority 1+) "
+        "to apply risk overrides on top.\n\n"
 
-        "── TRIGGER ──\n"
-        "Single condition (shorthand):\n"
-        "  {indicator, asset, params, operator, threshold}\n\n"
-        "Multi-condition AND / OR:\n"
-        "  {combinator: 'all'|'any', conditions: [{indicator, asset, params, operator, threshold}, ...]}\n\n"
+        "── SIGNAL RULE ──\n"
+        "trigger: {indicator, asset, params}  ← no operator/threshold needed\n"
+        "action:  {type:'signal_weight', asset, normalizer, max_weight, min_weight}\n"
+        "  normalizer  — typical signal magnitude; signal/normalizer is clipped to [-1, 1]\n"
+        "  max_weight  — position when signal is maximally positive (e.g. 0.6)\n"
+        "  min_weight  — position when signal is maximally negative (e.g. -0.3, or 0 for long-only)\n"
+        "Formula: scaled = clip(signal/normalizer, -1, 1)\n"
+        "         weight = scaled*max_weight if scaled≥0 else scaled*|min_weight|\n\n"
+        "Signal rule examples:\n"
+        "MACD trend-following on oil:\n"
+        "  trigger={indicator:'macd_line', asset:'CL=F', params:{fast:12, slow:60}}\n"
+        "  action={type:'signal_weight', asset:'CL=F', normalizer:2.0, max_weight:0.6, min_weight:-0.3}\n\n"
+        "Z-score mean-reversion on bonds:\n"
+        "  trigger={indicator:'z_score', asset:'ZN=F', params:{window:60}}\n"
+        "  action={type:'signal_weight', asset:'ZN=F', normalizer:2.0, max_weight:0.5, min_weight:-0.5}\n\n"
+        "Rate of change trend on equities (long-only):\n"
+        "  trigger={indicator:'rate_of_change', asset:'ES=F', params:{period:20}}\n"
+        "  action={type:'signal_weight', asset:'ES=F', normalizer:5.0, max_weight:1.0, min_weight:0}\n\n"
+
+        "── BINARY RULE ──\n"
+        "trigger: single condition {indicator, asset, params, operator, threshold}\n"
+        "      OR multi-condition  {combinator:'all'|'any', conditions:[...]}\n"
         "  indicator: raw | moving_average | ema | rsi | bollinger_upper | bollinger_lower |\n"
         "             bollinger_width | macd_line | macd_signal | rolling_std |\n"
         "             rolling_volatility | rate_of_change | z_score\n"
-        "    'raw' = use the price/value directly with no transformation (no params needed)\n"
-        "  asset: any ticker the FLOW model was trained on — portfolio assets OR conditioning\n"
-        "         factors (e.g. '^VIX', 'DX-Y.NYB', 'T10Y2Y', 'DGS10', 'ZN=F')\n"
-        "  params: {window:20} for MA/std, {period:14} for RSI, {fast:12,slow:26} for MACD, etc.\n"
+        "    'raw' = use the price/value directly, no transformation (no params needed)\n"
+        "  asset: portfolio assets OR conditioning factors ('^VIX', 'DX-Y.NYB', 'T10Y2Y', 'ZN=F', ...)\n"
         "  operator: '>' | '<' | '>=' | '<=' | '==' | 'crosses_above' | 'crosses_below'\n"
-        "  threshold: numeric value\n\n"
-
-        "── ACTION ──\n"
-        "  {type, asset, value?}\n"
+        "action: {type, asset, value?}\n"
         "  exit         — set weight to 0 (go flat)\n"
-        "  set_weight   — set weight to exact value; negative = short (e.g. -0.2 = 20% short)\n"
-        "  scale_weight — multiply current weight by value (0.5=halve, 2.0=double, -1=reverse)\n"
-        "  reverse      — flip sign of current weight (long→short, short→long)\n\n"
-
-        "── EXAMPLES ──\n"
+        "  set_weight   — set weight to exact value; negative = short (e.g. -0.2)\n"
+        "  scale_weight — multiply current weight (0.5=halve, 2.0=double, -1=reverse)\n"
+        "  reverse      — flip sign of current weight\n\n"
+        "Binary rule examples:\n"
         "RSI overbought → exit:\n"
         "  trigger={indicator:'rsi', asset:'CL=F', params:{period:14}, operator:'>', threshold:70}\n"
         "  action={type:'exit', asset:'CL=F'}\n\n"
-        "MA crossover → go short (trend reversal):\n"
-        "  trigger={indicator:'moving_average', asset:'ES=F', params:{window:20}, operator:'crosses_below', threshold:0}\n"
-        "  (threshold=0 won't work for price — compare two MAs via two rules or use rate_of_change)\n\n"
-        "VIX spike AND RSI overbought → halve oil position (AND logic):\n"
+        "VIX spike AND RSI hot → halve position:\n"
         "  trigger={combinator:'all', conditions:[\n"
         "    {indicator:'raw', asset:'^VIX', params:{}, operator:'>', threshold:30},\n"
         "    {indicator:'rsi', asset:'CL=F', params:{period:14}, operator:'>', threshold:65}\n"
         "  ]}\n"
         "  action={type:'scale_weight', asset:'CL=F', value:0.5}\n\n"
-        "Inverted yield curve → reduce duration (raw value):\n"
+        "Inverted yield curve → cut duration:\n"
         "  trigger={indicator:'raw', asset:'T10Y2Y', params:{}, operator:'<', threshold:0}\n"
-        "  action={type:'scale_weight', asset:'ZN=F', value:0.3}\n\n"
-        "Multiple rules build a strategy: e.g. priority-0 rules set direction, "
-        "priority-1 rules are vol/regime filters that scale the result."
+        "  action={type:'scale_weight', asset:'ZN=F', value:0.3}"
     ),
     annotations=ToolAnnotations(title="Create Trading Rule"),
 )
 async def create_rule(
     portfolio_id: Annotated[str, Field(description="Portfolio UUID")],
     name: Annotated[str, Field(description="Short descriptive name for the rule")],
-    trigger: Annotated[dict, Field(description="Single condition {indicator,asset,params,operator,threshold} or multi-condition {combinator:'all'|'any', conditions:[...]}")],
-    action: Annotated[dict, Field(description="Weight change: {type:'exit'|'set_weight'|'scale_weight'|'reverse', asset, value?}")],
+    trigger: Annotated[dict, Field(description="For BINARY rules: single condition {indicator,asset,params,operator,threshold} or multi-condition {combinator:'all'|'any', conditions:[...]}. For SIGNAL rules: just {indicator,asset,params} — no operator or threshold needed.")],
+    action: Annotated[dict, Field(description="Signal: {type:'signal_weight', asset, normalizer, max_weight, min_weight} OR binary: {type:'exit'|'set_weight'|'scale_weight'|'reverse', asset, value?}")],
     description: Annotated[str | None, Field(description="Optional longer description")] = None,
     is_active: Annotated[bool, Field(description="Whether the rule is active (default false)")] = False,
     priority: Annotated[int, Field(description="Evaluation order when multiple rules fire (lower = first, default 0)")] = 0,
@@ -2862,15 +2874,17 @@ async def delete_rule(
     name="fortest_rules",
     description=(
         "Forward-test systematic trading rules against FLOW-generated price paths. "
-        "This is the core evaluation tool: runs each rule on the same N FLOW paths "
-        "and returns risk metrics per rule vs the base static strategy. "
-        "Use this to compare rules and decide which to keep active.\n\n"
+        "Returns TWO levels of output:\n"
+        "  • combined_strategy — ALL rules applied together in priority order on every path. "
+        "This is your actual strategy performance vs the base static portfolio.\n"
+        "  • rule_attribution — each rule tested individually to show which rules help vs hurt.\n\n"
         "How it works:\n"
-        "  1. Loads the FLOW price paths (same paths for all rules — fair comparison)\n"
-        "  2. For each rule: steps through each path day-by-day, evaluates indicator triggers, "
-        "     applies weight adjustments, computes portfolio P&L\n"
-        "  3. Returns distribution of Sharpe, CVaR, drawdown, return for each rule vs base\n\n"
-        "Requires a completed flow_job_id from generate_flow_paths or simulate_flow_scenario. "
+        "  1. Loads the FLOW price paths (same N paths for every evaluation — fair comparison)\n"
+        "  2. Steps through each path day-by-day, applies rules in priority order, tracks P&L\n"
+        "  3. Returns Sharpe, CVaR, max drawdown, return for combined strategy and each rule alone\n\n"
+        "Prerequisites: (1) create rules with create_rule; "
+        "(2) activate them with toggle_rule(is_active=True); "
+        "(3) generate FLOW paths with generate_flow_paths or generate_synthetic.\n"
         "If rule_ids is omitted, tests all active rules."
     ),
     annotations=ToolAnnotations(title="Forward-Test Trading Rules"),
@@ -2893,39 +2907,63 @@ async def fortest_rules(
         base = result.get("base_strategy", {})
         base_stats = base.get("summary_stats", {})
 
-        rule_rows = []
-        for r in result.get("rule_results", []):
+        def _stats_row(stats, base_stats):
+            return {
+                "mean_return": stats.get("mean_return"),
+                "mean_sharpe": stats.get("mean_sharpe"),
+                "mean_max_drawdown": stats.get("mean_max_drawdown"),
+                "mean_volatility": stats.get("mean_volatility"),
+                "cvar_95": stats.get("cvar_95"),
+                "vs_base_return": round(stats.get("mean_return", 0) - base_stats.get("mean_return", 0), 4)
+                    if stats.get("mean_return") is not None else None,
+                "vs_base_sharpe": round(stats.get("mean_sharpe", 0) - base_stats.get("mean_sharpe", 0), 4)
+                    if stats.get("mean_sharpe") is not None else None,
+                "vs_base_drawdown": round(stats.get("mean_max_drawdown", 0) - base_stats.get("mean_max_drawdown", 0), 4)
+                    if stats.get("mean_max_drawdown") is not None else None,
+            }
+
+        # Combined strategy (all rules together — the actual strategy)
+        combined = result.get("combined_strategy")
+        combined_out = None
+        if combined:
+            combined_out = {
+                "rule_names": combined.get("rule_names"),
+                **_stats_row(combined.get("summary_stats", {}), base_stats),
+            }
+        elif result.get("combined_strategy_error"):
+            combined_out = {"error": result["combined_strategy_error"]}
+
+        # Individual rule attribution (each rule alone vs base)
+        attribution_rows = []
+        for r in result.get("rule_attribution", []):
             if r.get("error"):
-                rule_rows.append({"rule": r["rule_name"], "error": r["error"]})
+                attribution_rows.append({"rule": r["rule_name"], "priority": r.get("priority"), "error": r["error"]})
                 continue
-            s = r.get("summary_stats", {})
-            rule_rows.append({
+            attribution_rows.append({
                 "rule": r["rule_name"],
                 "rule_id": r["rule_id"],
-                "is_active": r.get("is_active"),
-                "mean_return": s.get("mean_return"),
-                "mean_sharpe": s.get("mean_sharpe"),
-                "mean_max_drawdown": s.get("mean_max_drawdown"),
-                "mean_volatility": s.get("mean_volatility"),
-                "vs_base_return": round(s.get("mean_return", 0) - base_stats.get("mean_return", 0), 4)
-                    if s.get("mean_return") is not None else None,
-                "vs_base_sharpe": round(s.get("mean_sharpe", 0) - base_stats.get("mean_sharpe", 0), 4)
-                    if s.get("mean_sharpe") is not None else None,
+                "priority": r.get("priority"),
+                **_stats_row(r.get("summary_stats", {}), base_stats),
             })
 
-        return _fmt({
+        out = {
             "portfolio_id": portfolio_id,
             "flow_job_id": flow_job_id,
-            "n_rules_tested": result.get("n_rules_tested"),
-            "base_strategy": {
-                "mean_return": base_stats.get("mean_return"),
-                "mean_sharpe": base_stats.get("mean_sharpe"),
-                "mean_max_drawdown": base_stats.get("mean_max_drawdown"),
-                "mean_volatility": base_stats.get("mean_volatility"),
-            },
-            "rule_results": rule_rows,
-            "tip": "Rules with higher mean_sharpe and lower mean_max_drawdown than base are candidates to activate.",
-        })
+            "horizon_days": result.get("horizon_days"),
+            "n_rules": result.get("n_rules_tested"),
+            "base_strategy": _stats_row(base_stats, base_stats),
+            "combined_strategy": combined_out,
+            "rule_attribution": attribution_rows,
+            "tip": (
+                "combined_strategy shows performance with ALL rules applied together in priority order — "
+                "this is your actual strategy. rule_attribution shows each rule tested alone to identify "
+                "which rules help vs hurt. Negative vs_base_drawdown = less drawdown = better."
+            ),
+        }
+        warnings = result.get("warnings", [])
+        if warnings:
+            out["warnings"] = warnings
+        return _fmt(out)
     except SablierAPIError as e:
         return _api_error(e)
 
