@@ -2702,6 +2702,208 @@ async def delete_flow_job(
         return _api_error(e)
 
 
+# ── Systematic Trading Rules ──────────────────────────────────────────────────
+
+@server.tool(
+    name="create_rule",
+    description=(
+        "Add a systematic trading rule to a portfolio. Rules are evaluated on FLOW forward paths "
+        "during fortest_rules — not backtested on history. Each rule has a trigger (an indicator "
+        "crossing a threshold on a specific asset's path) and an action (adjust the portfolio weight "
+        "for an asset). Rules start inactive; activate with toggle_rule or is_active=True.\n\n"
+        "Trigger fields:\n"
+        "  indicator: moving_average | ema | rsi | bollinger_upper | bollinger_lower | "
+        "bollinger_width | macd_line | macd_signal | rolling_std | rate_of_change | z_score | rolling_volatility\n"
+        "  asset: ticker present in the portfolio (e.g. 'CL=F')\n"
+        "  params: indicator parameters — e.g. {\"period\": 14} for RSI, {\"window\": 20} for MA\n"
+        "  operator: '>' | '<' | '>=' | '<=' | '==' | 'crosses_above' | 'crosses_below'\n"
+        "  threshold: numeric value\n\n"
+        "Action fields:\n"
+        "  type: 'scale_weight' (multiply weight by value) | 'set_weight' (set exact weight) | 'exit' (set to 0)\n"
+        "  asset: ticker to act on\n"
+        "  value: multiplier for scale_weight or target weight for set_weight (omit for exit)\n\n"
+        "Examples:\n"
+        "  RSI overbought exit: trigger={indicator:'rsi', asset:'CL=F', params:{period:14}, operator:'>', threshold:70}, action={type:'exit', asset:'CL=F'}\n"
+        "  MA trend filter halve: trigger={indicator:'moving_average', asset:'ES=F', params:{window:20}, operator:'<', threshold:4500}, action={type:'scale_weight', asset:'ES=F', value:0.5}"
+    ),
+    annotations=ToolAnnotations(title="Create Trading Rule"),
+)
+async def create_rule(
+    portfolio_id: Annotated[str, Field(description="Portfolio UUID")],
+    name: Annotated[str, Field(description="Short descriptive name for the rule")],
+    trigger: Annotated[dict, Field(description="Trigger definition: {indicator, asset, params, operator, threshold}")],
+    action: Annotated[dict, Field(description="Action definition: {type, asset, value}")],
+    description: Annotated[str | None, Field(description="Optional longer description")] = None,
+    is_active: Annotated[bool, Field(description="Whether the rule is active (default false)")] = False,
+    priority: Annotated[int, Field(description="Evaluation order when multiple rules fire (lower = first, default 0)")] = 0,
+) -> list | str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(portfolio_id, "portfolio_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.create_trading_rule(
+            portfolio_id=portfolio_id, name=name, trigger=trigger, action=action,
+            description=description, is_active=is_active, priority=priority,
+        )
+        return _fmt({
+            "rule_id": result.get("id"),
+            "name": name,
+            "is_active": is_active,
+            "trigger": trigger,
+            "action": action,
+            "message": f"Rule '{name}' created. Use fortest_rules to evaluate it on FLOW paths.",
+        })
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="list_rules",
+    description="List all systematic trading rules attached to a portfolio, including their trigger/action definitions, active status, and priority order.",
+    annotations=ToolAnnotations(title="List Trading Rules", readOnlyHint=True),
+)
+async def list_rules(
+    portfolio_id: Annotated[str, Field(description="Portfolio UUID")],
+) -> list | str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(portfolio_id, "portfolio_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.list_trading_rules(portfolio_id)
+        rules = result.get("rules", [])
+        return _fmt({
+            "portfolio_id": portfolio_id,
+            "count": len(rules),
+            "rules": [{
+                "rule_id": r["id"],
+                "name": r["name"],
+                "description": r.get("description"),
+                "is_active": r["is_active"],
+                "priority": r["priority"],
+                "trigger": r["trigger"],
+                "action": r["action"],
+            } for r in rules],
+        })
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="toggle_rule",
+    description="Activate or deactivate a systematic trading rule. Only active rules are included in fortest_rules by default.",
+    annotations=ToolAnnotations(title="Toggle Trading Rule"),
+)
+async def toggle_rule(
+    portfolio_id: Annotated[str, Field(description="Portfolio UUID")],
+    rule_id: Annotated[str, Field(description="Rule UUID")],
+    is_active: Annotated[bool, Field(description="True to activate, False to deactivate")],
+) -> list | str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        await client.update_trading_rule(portfolio_id, rule_id, is_active=is_active)
+        status = "activated" if is_active else "deactivated"
+        return _fmt({"rule_id": rule_id, "is_active": is_active, "message": f"Rule {status}."})
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="delete_rule",
+    description="Permanently delete a systematic trading rule from a portfolio.",
+    annotations=ToolAnnotations(title="Delete Trading Rule"),
+)
+async def delete_rule(
+    portfolio_id: Annotated[str, Field(description="Portfolio UUID")],
+    rule_id: Annotated[str, Field(description="Rule UUID")],
+) -> list | str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        await client.delete_trading_rule(portfolio_id, rule_id)
+        return _fmt({"rule_id": rule_id, "deleted": True})
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="fortest_rules",
+    description=(
+        "Forward-test systematic trading rules against FLOW-generated price paths. "
+        "This is the core evaluation tool: runs each rule on the same N FLOW paths "
+        "and returns risk metrics per rule vs the base static strategy. "
+        "Use this to compare rules and decide which to keep active.\n\n"
+        "How it works:\n"
+        "  1. Loads the FLOW price paths (same paths for all rules — fair comparison)\n"
+        "  2. For each rule: steps through each path day-by-day, evaluates indicator triggers, "
+        "     applies weight adjustments, computes portfolio P&L\n"
+        "  3. Returns distribution of Sharpe, CVaR, drawdown, return for each rule vs base\n\n"
+        "Requires a completed flow_job_id from generate_flow_paths or simulate_flow_scenario. "
+        "If rule_ids is omitted, tests all active rules."
+    ),
+    annotations=ToolAnnotations(title="Forward-Test Trading Rules"),
+)
+async def fortest_rules(
+    portfolio_id: Annotated[str, Field(description="Portfolio UUID")],
+    flow_job_id: Annotated[str, Field(description="Completed FLOW job ID")],
+    rule_ids: Annotated[list[str] | None, Field(description="Specific rule UUIDs to test. Omit to test all active rules.")] = None,
+) -> list | str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(portfolio_id, "portfolio_id"):
+        return err
+    if err := _validate_uuid(flow_job_id, "flow_job_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.fortest_rules(portfolio_id, flow_job_id, rule_ids)
+
+        base = result.get("base_strategy", {})
+        base_stats = base.get("summary_stats", {})
+
+        rule_rows = []
+        for r in result.get("rule_results", []):
+            if r.get("error"):
+                rule_rows.append({"rule": r["rule_name"], "error": r["error"]})
+                continue
+            s = r.get("summary_stats", {})
+            rule_rows.append({
+                "rule": r["rule_name"],
+                "rule_id": r["rule_id"],
+                "is_active": r.get("is_active"),
+                "mean_return": s.get("mean_return"),
+                "mean_sharpe": s.get("mean_sharpe"),
+                "mean_max_drawdown": s.get("mean_max_drawdown"),
+                "mean_volatility": s.get("mean_volatility"),
+                "vs_base_return": round(s.get("mean_return", 0) - base_stats.get("mean_return", 0), 4)
+                    if s.get("mean_return") is not None else None,
+                "vs_base_sharpe": round(s.get("mean_sharpe", 0) - base_stats.get("mean_sharpe", 0), 4)
+                    if s.get("mean_sharpe") is not None else None,
+            })
+
+        return _fmt({
+            "portfolio_id": portfolio_id,
+            "flow_job_id": flow_job_id,
+            "n_rules_tested": result.get("n_rules_tested"),
+            "base_strategy": {
+                "mean_return": base_stats.get("mean_return"),
+                "mean_sharpe": base_stats.get("mean_sharpe"),
+                "mean_max_drawdown": base_stats.get("mean_max_drawdown"),
+                "mean_volatility": base_stats.get("mean_volatility"),
+            },
+            "rule_results": rule_rows,
+            "tip": "Rules with higher mean_sharpe and lower mean_max_drawdown than base are candidates to activate.",
+        })
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
 @server.tool(
     name="get_flow_results",
     description=(

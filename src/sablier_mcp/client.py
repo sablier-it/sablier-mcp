@@ -987,6 +987,36 @@ class SablierClient:
         return await self._post("/derivatives/price", json=body)
 
     # ──────────────────────────────────────────────
+    # Trading Rules
+    # ──────────────────────────────────────────────
+
+    async def create_trading_rule(self, portfolio_id: str, name: str,
+                                  trigger: dict, action: dict,
+                                  description: str | None = None,
+                                  is_active: bool = False,
+                                  priority: int = 0) -> dict:
+        return await self._post(f"/portfolios/{portfolio_id}/rules", json={
+            "name": name, "trigger": trigger, "action": action,
+            "description": description, "is_active": is_active, "priority": priority,
+        })
+
+    async def list_trading_rules(self, portfolio_id: str) -> dict:
+        return await self._get(f"/portfolios/{portfolio_id}/rules")
+
+    async def update_trading_rule(self, portfolio_id: str, rule_id: str, **fields) -> dict:
+        return await self._request("PATCH", f"/portfolios/{portfolio_id}/rules/{rule_id}", json=fields)
+
+    async def delete_trading_rule(self, portfolio_id: str, rule_id: str) -> dict:
+        return await self._delete(f"/portfolios/{portfolio_id}/rules/{rule_id}")
+
+    async def fortest_rules(self, portfolio_id: str, flow_job_id: str,
+                            rule_ids: list[str] | None = None) -> dict:
+        body: dict = {"flow_job_id": flow_job_id}
+        if rule_ids is not None:
+            body["rule_ids"] = rule_ids
+        return await self._post(f"/portfolios/{portfolio_id}/rules/fortest", json=body)
+
+    # ──────────────────────────────────────────────
     # Tests
     # ──────────────────────────────────────────────
 
