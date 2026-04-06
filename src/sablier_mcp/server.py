@@ -376,7 +376,7 @@ async def _ensure_portfolio(
     try:
         portfolio = await client.create_portfolio(name, assets)
     except SablierAPIError as e:
-        if e.status_code in (409, 500) and "unique" in str(e).lower():
+        if e.status_code == 409 or (e.status_code == 500 and "unique" in str(e).lower()):
             # Duplicate name — find and reuse the existing portfolio
             all_portfolios = await client.list_portfolios()
             items = all_portfolios.get("portfolios", all_portfolios) if isinstance(all_portfolios, dict) else all_portfolios
@@ -2116,10 +2116,16 @@ async def _generate_flow_paths_impl(
                 "hint": "Create a new model with train_flow_model(conditioning_set_id=..., tickers=...).",
             })
         if mg_status not in ("trained", "completed", ""):
+            training_job_id = (_mg_info or {}).get("active_training_job_id")
             return _fmt({
                 "error": f"Model group status is '{mg_status}'. Training may still be in progress.",
                 "model_group_id": model_group_id,
-                "hint": "Wait for training to complete, or train a new model with train_flow_model.",
+                "training_job_id": training_job_id,
+                "hint": (
+                    f"Use check_flow_job(job_id='{training_job_id}', job_type='train') to monitor progress."
+                    if training_job_id else
+                    "Wait for training to complete, or train a new model with train_flow_model."
+                ),
             })
     except Exception:
         logger.debug("Could not check model group status", exc_info=True)
@@ -2759,7 +2765,7 @@ async def get_flow_results(
         description="Max sample paths to return per asset (default 10, max 50). More paths = more data for analysis.",
         default=10,
     )] = 10,
-) -> str:
+) -> list | str:
     if err := _require_auth():
         return err
     try:
