@@ -192,7 +192,7 @@ def _with_widget(text: str, html: str) -> list:
             resource=TextResourceContents(
                 uri=f"data:text/html,{urllib.parse.quote(html)}",
                 mimeType="text/html",
-                text=text,
+                text="[interactive chart]",
             ),
         ),
     ]
@@ -2399,7 +2399,13 @@ async def generate_synthetic(
         "This establishes a same-day baseline — when you retrieve results via get_flow_results, "
         "scenario_probability is automatically computed: the fraction of unconstrained baseline paths "
         "that naturally satisfy your constraints, telling you how likely the scenario is. "
-        "≥5% = within normal range | 1-5% = rare, treat with care | <1% = very rare, consider loosening constraints. "
+        "≥5% = within normal range | 1-5% = rare, treat with care | <1% = very rare, constraints too tight or duration too long. "
+        "DURATION MATTERS: constraining a feature for the entire horizon is far more restrictive than a short window. "
+        "Mean-reverting features (VIX, credit spreads, rates) spike briefly then revert — "
+        "use t_start/t_end to constrain a window (e.g. t_start=10, t_end=20 for a 2-week spike), not the full horizon. "
+        "VIX GUIDANCE: VIX has never historically sustained above 30 for more than a few weeks; "
+        "all-time intraday high ~89 (March 2020). Constraining VIX > 30 for 60 days returns probability ≈ 0%. "
+        "Realistic stress: VIX level constraint 30-50 for a short window (5-15 days), not the full horizon. "
         "IMPORTANT: feature_name in constraints must be the DISPLAY NAME from feature_names "
         "(e.g. 'Apple Inc.', 'SPDR S&P 500 ETF Trust'), NOT ticker symbols. "
         "Constraint types: 'level' (absolute price bounds), 'return' (per-step return bounds). "
@@ -2417,9 +2423,11 @@ async def simulate_flow_scenario(
     constraints: Annotated[list[dict], Field(
         description=(
             "List of constraints. Each: "
-            "{'feature_name': 'Apple Inc.', 'type': 'level', 'lower': 200, 'upper': null, 't_start': 0, 't_end': 20}. "
+            "{'feature_name': 'Equity Volatility (VIX)', 'type': 'level', 'lower': 30, 'upper': null, 't_start': 10, 't_end': 25}. "
             "Types: 'level' (absolute price bounds), 'return' (per-step return bounds). "
-            "feature_name must be from the training output's feature_names list."
+            "feature_name must be from the training output's feature_names list. "
+            "ALWAYS set t_start/t_end to constrain a specific window — do not leave t_end=null (full horizon) "
+            "for mean-reverting features like VIX or spreads, or scenario_probability will be near 0%."
         )
     )],
     portfolio_id: Annotated[str | None, Field(
