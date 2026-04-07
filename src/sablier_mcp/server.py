@@ -2015,7 +2015,7 @@ async def _train_flow_model_impl(
 
 async def _generate_flow_paths_impl(
     client, model_group_id: str, portfolio_id: str | None,
-    horizon: int, n_paths: int,
+    horizon: int, n_paths: int, price_history_length: int | None = None,
 ) -> list | str:
     """Generate paths from a trained model. Returns formatted output."""
     if err := _validate_uuid(model_group_id, "model_group_id"):
@@ -2112,6 +2112,7 @@ async def _generate_flow_paths_impl(
             model_group_id=model_group_id,
             n_paths=n_paths,
             horizon=horizon,
+            price_history_length=price_history_length,
         ))
         gen_job_id = gen_job.get("job_id")
         if not gen_job_id:
@@ -2325,12 +2326,16 @@ async def generate_flow_paths(
         description="Number of paths to generate. 1000 default.",
         default=1000,
     )] = 1000,
+    price_history_length: Annotated[int | None, Field(
+        description="Days of historical prices to include before the paths start. Defaults to horizon. Set higher (e.g. 120) to warm up indicators like MACD or z-score before fortest_rules.",
+        default=None,
+    )] = None,
 ) -> list | str:
     if err := _require_auth():
         return err
     try:
         client = get_client()
-        return await _generate_flow_paths_impl(client, model_group_id, portfolio_id, horizon, n_paths)
+        return await _generate_flow_paths_impl(client, model_group_id, portfolio_id, horizon, n_paths, price_history_length)
     except _FlowGPUBusy as e:
         return str(e)
     except SablierAPIError as e:
@@ -2375,6 +2380,10 @@ async def generate_synthetic(
     )] = None,
     horizon: Annotated[int, Field(description="Forecast horizon in trading days. Default 60.", default=60)] = 60,
     n_paths: Annotated[int, Field(description="Number of paths to generate. Default 1000.", default=1000)] = 1000,
+    price_history_length: Annotated[int | None, Field(
+        description="Days of historical prices to include before the paths start. Defaults to horizon. Set higher (e.g. 120) to warm up indicators like MACD or z-score before fortest_rules.",
+        default=None,
+    )] = None,
 ) -> list | str:
     if err := _require_auth():
         return err
@@ -2383,7 +2392,7 @@ async def generate_synthetic(
 
         # Resume mode: skip training
         if model_group_id:
-            return await _generate_flow_paths_impl(client, model_group_id, portfolio_id, horizon, n_paths)
+            return await _generate_flow_paths_impl(client, model_group_id, portfolio_id, horizon, n_paths, price_history_length)
 
         # New run: train then generate
         if not conditioning_set_id:
@@ -2397,7 +2406,7 @@ async def generate_synthetic(
         if not mgid:
             return _fmt(result)  # training output without model_group_id (shouldn't happen)
 
-        return await _generate_flow_paths_impl(client, mgid, pid, horizon, n_paths)
+        return await _generate_flow_paths_impl(client, mgid, pid, horizon, n_paths, price_history_length)
     except _FlowGPUBusy as e:
         return str(e)
     except SablierAPIError as e:

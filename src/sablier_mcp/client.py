@@ -711,6 +711,7 @@ class SablierClient:
         model_group_id: str,
         n_paths: int = 1000,
         horizon: int | None = None,
+        price_history_length: int | None = None,
     ) -> dict:
         """Start async path generation job."""
         body: dict[str, Any] = {
@@ -719,6 +720,8 @@ class SablierClient:
         }
         if horizon is not None:
             body["horizon"] = horizon
+        if price_history_length is not None:
+            body["price_history_length"] = price_history_length
         return await self._post("/flow/generate-paths", json=body)
 
     async def flow_generate_constrained_paths(
