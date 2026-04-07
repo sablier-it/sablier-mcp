@@ -11,6 +11,7 @@ Remote mode uses OAuth 2.0 — Claude Desktop opens a browser for login.
 
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import date as _date
 import json
 import logging
 import os
@@ -323,16 +324,34 @@ def _flatten_betas(results: dict) -> dict:
     factor_stds_raw = dict(zip(factor_names, stds_raw_list)) if stds_raw_list else {}
     factor_last_values_raw = dict(zip(factor_names, last_values_list)) if last_values_list else {}
 
+    factor_last_date_str = factor_stats.get("factor_last_date")
     out = {
         "conditioning_features": features,
         "assets": assets,
         "factor_last_values_raw": factor_last_values_raw,
+        "factor_last_date": factor_last_date_str,
         "factor_means_raw": factor_means_raw,
         "factor_stds_raw": factor_stds_raw,
         "factor_means": factor_means,
         "factor_stds": factor_stds,
-        "factor_last_date": factor_stats.get("factor_last_date"),
     }
+
+    # Warn when factor data is stale — one stale feature truncates the entire beta window
+    if factor_last_date_str:
+        try:
+            last_date = _date.fromisoformat(factor_last_date_str)
+            days_old = (_date.today() - last_date).days
+            business_days_old = round(days_old * 5 / 7)
+            if business_days_old > 5:
+                out["data_freshness_warning"] = (
+                    f"Factor data ends {factor_last_date_str} ({business_days_old} business days ago). "
+                    f"At least one conditioning feature has stale data — the beta estimation window "
+                    f"was truncated to this date for ALL features. Betas and factor_last_values_raw "
+                    f"may not reflect current market conditions. "
+                    f"Run refresh_feature_data on your conditioning set tickers to update."
+                )
+        except (ValueError, TypeError):
+            pass
     if results.get("collinear_groups"):
         out["collinear_groups"] = results["collinear_groups"]
     return out
@@ -1473,9 +1492,11 @@ async def simulate_betas(
         "Run an ad-hoc what-if stress test on a Moment (linear) model — the PRIMARY tool for quick scenario analysis. "
         "Requires simulation_batch_id from analyze_quantitative or simulate_betas. "
         "Pass ALL conditioning_features as absolute price levels in the factors dict. "
-        "Use factor_last_values_raw from the betas output as current baseline, then compute targets "
-        "(e.g. to shock SPY -5% from current 633: pass {'US Market': 601.35}). "
-        "Returns per-asset expected returns, VaR, Expected Shortfall, and return distribution. "
+        "BEFORE calling: read factor_last_values_raw from the betas output — these are today's values. "
+        "Always state current vs stressed levels explicitly (e.g. 'Oil is at $82 today, stressing to $120'). "
+        "Also check data_freshness_warning in betas output — if present, betas may be stale. "
+        "Use factor_last_values_raw as baseline, then compute targets "
+        "(e.g. oil currently 82, stress to 120: pass {'Crude Oil': 120.0}). "
         "For saved/reusable scenarios, use create_scenario + run_scenario instead. "
         "For Flow (generative) models, use simulate_flow_scenario instead."
     ),
