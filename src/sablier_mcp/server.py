@@ -832,7 +832,7 @@ async def get_asset_profiles(
 
 @server.tool(
     name="delete_portfolio",
-    description="Delete a portfolio by ID. This is permanent and cannot be undone.",
+    description="Delete a portfolio by ID. Permanent, cannot be undone.",
     annotations=ToolAnnotations(title="Delete Portfolio", destructiveHint=True),
 )
 async def delete_portfolio(
@@ -868,7 +868,7 @@ async def delete_portfolio(
 async def optimize_portfolio(
     portfolio_id: Annotated[str, Field(description="The portfolio UUID")],
     simulation_batch_id: Annotated[str, Field(description="From simulate_betas or analyze_quantitative")],
-    objective: Annotated[str, Field(description="Optimization objective: 'max_sharpe', 'min_variance', or 'max_return'", default="max_sharpe")] = "max_sharpe",
+    objective: Annotated[str, Field(description="Optimization objective: 'max_sharpe' (default), 'min_variance', 'max_return', 'analytical_risk_parity' (equal risk contributions), 'expected_utility' (CRRA), 'risk_parity' (CVaR-based), 'mean_cvar' (minimize CVaR)", default="max_sharpe")] = "max_sharpe",
 ) -> str:
     if err := _require_auth():
         return err
@@ -1162,7 +1162,7 @@ async def get_grain_analysis(
 
 @server.tool(
     name="delete_grain_analysis",
-    description="Delete a saved GRAIN qualitative analysis by ID. This cannot be undone.",
+    description="Delete a saved GRAIN qualitative analysis by ID. Permanent, cannot be undone.",
     annotations=ToolAnnotations(title="Delete GRAIN Analysis", readOnlyHint=False, destructiveHint=True),
 )
 async def delete_grain_analysis(
@@ -1335,7 +1335,7 @@ async def get_feature_set(
 
 @server.tool(
     name="delete_feature_set",
-    description="Delete a custom feature set. This is permanent and cannot be undone. Cannot delete shared templates.",
+    description="Delete a custom feature set. Permanent, cannot be undone. Cannot delete shared templates.",
     annotations=ToolAnnotations(title="Delete Feature Set", destructiveHint=True),
 )
 async def delete_feature_set(
@@ -1355,7 +1355,7 @@ async def delete_feature_set(
 
 @server.tool(
     name="delete_model_group",
-    description="Delete a model group and all its models, simulations, and associated data. This is permanent.",
+    description="Delete a model group and all its models, simulations, and associated data. Permanent, cannot be undone.",
     annotations=ToolAnnotations(title="Delete Model Group", destructiveHint=True),
 )
 async def delete_model_group(
@@ -1684,7 +1684,7 @@ async def update_scenario(
 
 @server.tool(
     name="delete_scenario",
-    description="Delete a saved scenario. This is permanent.",
+    description="Delete a saved scenario. Permanent, cannot be undone.",
     annotations=ToolAnnotations(title="Delete Scenario", destructiveHint=True),
 )
 async def delete_scenario(
@@ -2199,12 +2199,8 @@ async def train_flow_model(
     description=(
         "Check the status of an async Flow job (training, generation, or validation). "
         "Returns status ('running', 'completed', 'failed') and progress details. "
-        "This is a lightweight status check — it does NOT return results data. "
-        "When status is 'completed', use get_flow_results(job_id) to fetch the actual data. "
-        "CRITICAL: Call this ONCE, report the status to the user, then STOP. "
-        "Do NOT call this repeatedly or in a loop — the job takes minutes, not seconds. "
-        "Do NOT launch a new training/generation job if this returns 'running' — just wait. "
-        "Tell the user: 'Training takes 5-15 min, generation 1-3 min. I'll check when you ask.' "
+        "Does NOT return results — when completed, call get_flow_results(job_id) to fetch data. "
+        "Call this ONCE, report status to the user, then STOP — do not poll in a loop. "
         "Typical times: training 5-15 min, generation 1-3 min, validation 3-5 min."
     ),
     annotations=ToolAnnotations(title="Check Flow Job", readOnlyHint=True),
@@ -2399,13 +2395,10 @@ async def generate_synthetic(
         "This establishes a same-day baseline — when you retrieve results via get_flow_results, "
         "scenario_probability is automatically computed: the fraction of unconstrained baseline paths "
         "that naturally satisfy your constraints, telling you how likely the scenario is. "
-        "≥5% = within normal range | 1-5% = rare, treat with care | <1% = very rare, constraints too tight or duration too long. "
-        "DURATION MATTERS: constraining a feature for the entire horizon is far more restrictive than a short window. "
-        "Mean-reverting features (VIX, credit spreads, rates) spike briefly then revert — "
-        "use t_start/t_end to constrain a window (e.g. t_start=10, t_end=20 for a 2-week spike), not the full horizon. "
-        "VIX GUIDANCE: VIX has never historically sustained above 30 for more than a few weeks; "
-        "all-time intraday high ~89 (March 2020). Constraining VIX > 30 for 60 days returns probability ≈ 0%. "
-        "Realistic stress: VIX level constraint 30-50 for a short window (5-15 days), not the full horizon. "
+        "≥5% = within normal range | 1-5% = rare | <1% = outside training distribution (constraints too tight or duration too long). "
+        "DURATION MATTERS: mean-reverting features (VIX, spreads, rates) spike for days to weeks, not months. "
+        "Constraining VIX > 30 for a full 60-day horizon → ~0% probability (all-time high ~89, never sustained). "
+        "Always use t_start/t_end to window constraints (e.g. t_start=10, t_end=20 for a 2-week spike). "
         "IMPORTANT: feature_name in constraints must be the DISPLAY NAME from feature_names "
         "(e.g. 'Apple Inc.', 'SPDR S&P 500 ETF Trust'), NOT ticker symbols. "
         "Constraint types: 'level' (absolute price bounds), 'return' (per-step return bounds). "
@@ -2693,7 +2686,7 @@ async def download_flow_paths(
 
 @server.tool(
     name="delete_flow_job",
-    description="Delete a flow simulation job (baseline or constrained scenario). This is permanent.",
+    description="Delete a flow simulation job (baseline or constrained scenario). Permanent, cannot be undone.",
     annotations=ToolAnnotations(title="Delete Flow Job", destructiveHint=True),
 )
 async def delete_flow_job(
@@ -2719,59 +2712,33 @@ async def delete_flow_job(
         "Add a systematic trading rule to a portfolio. Rules are evaluated day-by-day on FLOW "
         "forward paths during fortest_rules — not backtested on history.\n\n"
         "TWO RULE TYPES:\n"
-        "  • Signal rules  (action.type='signal_weight') — continuous indicator → proportional position.\n"
-        "    This is how CTAs and trend-followers actually run strategies.\n"
-        "  • Binary rules  (all other action types) — trigger fires → discrete weight change.\n"
-        "    Best for risk overlays, hard stops, regime gates.\n\n"
-        "Use signal rules (priority 0) to define the core strategy, then binary rules (priority 1+) "
-        "to apply risk overrides on top.\n\n"
+        "  • Signal rules  (action.type='signal_weight') — continuous indicator → proportional position. For CTAs and trend-followers.\n"
+        "  • Binary rules  (all other action types) — trigger fires → discrete weight change. For risk overlays, hard stops, regime gates.\n\n"
+        "Use signal rules (priority 0) for the core strategy; binary rules (priority 1+) for risk overrides.\n\n"
 
         "── SIGNAL RULE ──\n"
-        "trigger: {indicator, asset, params}  ← no operator/threshold needed\n"
+        "trigger: {indicator, asset, params}  ← no operator/threshold\n"
         "action:  {type:'signal_weight', asset, normalizer, max_weight, min_weight}\n"
-        "  normalizer  — typical signal magnitude; signal/normalizer is clipped to [-1, 1]\n"
-        "  max_weight  — position when signal is maximally positive (e.g. 0.6)\n"
-        "  min_weight  — position when signal is maximally negative (e.g. -0.3, or 0 for long-only)\n"
-        "Formula: scaled = clip(signal/normalizer, -1, 1)\n"
-        "         weight = scaled*max_weight if scaled≥0 else scaled*|min_weight|\n\n"
-        "Signal rule examples:\n"
-        "MACD trend-following on oil:\n"
+        "  normalizer = typical signal magnitude; clip(signal/normalizer, -1, 1) → position\n"
+        "  weight = scaled*max_weight if scaled≥0 else scaled*|min_weight|\n\n"
         "  trigger={indicator:'macd_line', asset:'CL=F', params:{fast:12, slow:60}}\n"
         "  action={type:'signal_weight', asset:'CL=F', normalizer:2.0, max_weight:0.6, min_weight:-0.3}\n\n"
-        "Z-score mean-reversion on bonds:\n"
         "  trigger={indicator:'z_score', asset:'ZN=F', params:{window:60}}\n"
         "  action={type:'signal_weight', asset:'ZN=F', normalizer:2.0, max_weight:0.5, min_weight:-0.5}\n\n"
-        "Rate of change trend on equities (long-only):\n"
-        "  trigger={indicator:'rate_of_change', asset:'ES=F', params:{period:20}}\n"
-        "  action={type:'signal_weight', asset:'ES=F', normalizer:5.0, max_weight:1.0, min_weight:0}\n\n"
 
         "── BINARY RULE ──\n"
-        "trigger: single condition {indicator, asset, params, operator, threshold}\n"
-        "      OR multi-condition  {combinator:'all'|'any', conditions:[...]}\n"
-        "  indicator: raw | moving_average | ema | rsi | bollinger_upper | bollinger_lower |\n"
-        "             bollinger_width | macd_line | macd_signal | rolling_std |\n"
-        "             rolling_volatility | rate_of_change | z_score\n"
-        "    'raw' = use the price/value directly, no transformation (no params needed)\n"
+        "trigger: {indicator, asset, params, operator, threshold}  OR  {combinator:'all'|'any', conditions:[...]}\n"
+        "  indicators: raw | moving_average | ema | rsi | bollinger_upper | bollinger_lower |\n"
+        "              bollinger_width | macd_line | macd_signal | rolling_std | rolling_volatility | rate_of_change | z_score\n"
         "  asset: portfolio assets OR conditioning factors ('^VIX', 'DX-Y.NYB', 'T10Y2Y', 'ZN=F', ...)\n"
         "  operator: '>' | '<' | '>=' | '<=' | '==' | 'crosses_above' | 'crosses_below'\n"
-        "action: {type, asset, value?}\n"
-        "  exit         — set weight to 0 (go flat)\n"
-        "  set_weight   — set weight to exact value; negative = short (e.g. -0.2)\n"
-        "  scale_weight — multiply current weight (0.5=halve, 2.0=double, -1=reverse)\n"
-        "  reverse      — flip sign of current weight\n\n"
-        "Binary rule examples:\n"
-        "RSI overbought → exit:\n"
+        "action: exit | set_weight (exact value, negative=short) | scale_weight (multiplier) | reverse\n\n"
         "  trigger={indicator:'rsi', asset:'CL=F', params:{period:14}, operator:'>', threshold:70}\n"
         "  action={type:'exit', asset:'CL=F'}\n\n"
-        "VIX spike AND RSI hot → halve position:\n"
         "  trigger={combinator:'all', conditions:[\n"
         "    {indicator:'raw', asset:'^VIX', params:{}, operator:'>', threshold:30},\n"
-        "    {indicator:'rsi', asset:'CL=F', params:{period:14}, operator:'>', threshold:65}\n"
-        "  ]}\n"
-        "  action={type:'scale_weight', asset:'CL=F', value:0.5}\n\n"
-        "Inverted yield curve → cut duration:\n"
-        "  trigger={indicator:'raw', asset:'T10Y2Y', params:{}, operator:'<', threshold:0}\n"
-        "  action={type:'scale_weight', asset:'ZN=F', value:0.3}"
+        "    {indicator:'rsi', asset:'CL=F', params:{period:14}, operator:'>', threshold:65}]}\n"
+        "  action={type:'scale_weight', asset:'CL=F', value:0.5}"
     ),
     annotations=ToolAnnotations(title="Create Trading Rule"),
 )
@@ -3429,8 +3396,8 @@ async def market_radar() -> str:
 @server.tool(
     name="whoami",
     description=(
-        "Get your account info: name, email, subscription tier, credit balance, and usage. "
-        "Useful to understand what you can do (credit limits, tier features) before running operations."
+        "Quick account summary: name, email, tier, credit balance, and billing period. "
+        "Use this first to orient yourself — single call covers identity and credit status."
     ),
     annotations=ToolAnnotations(title="Who Am I", readOnlyHint=True),
 )
@@ -3465,9 +3432,8 @@ async def whoami() -> str:
 @server.tool(
     name="get_credits",
     description=(
-        "Get your current credit balance: credits used, credits remaining, and overage status. "
-        "Credits are the unified currency — every operation costs credits based on its parameters. "
-        "Free: 100 one-time credits on signup (blocked at 0), Pro: 1000/mo (€0.50/credit overage monthly, €0.35/credit annual)."
+        "Credit balance details: used, remaining, purchased packs, and overage status. "
+        "Use whoami for a quick summary; use this when you need the full credit object."
     ),
     annotations=ToolAnnotations(title="Get Credits", readOnlyHint=True),
 )
@@ -3485,9 +3451,8 @@ async def get_credits() -> str:
 @server.tool(
     name="get_billing_info",
     description=(
-        "Get your current billing info: subscription tier, included limits, "
-        "overage rates, and usage for the current month. Use this to check "
-        "what operations are available and what they cost."
+        "Subscription plan details: tier limits, overage rates, and per-operation costs. "
+        "Use this to understand pricing before running expensive operations (not for credit balance — use whoami or get_credits)."
     ),
     annotations=ToolAnnotations(title="Get Billing Info", readOnlyHint=True),
 )
