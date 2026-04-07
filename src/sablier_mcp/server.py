@@ -2043,44 +2043,46 @@ async def _generate_flow_paths_impl(
         except Exception:
             logger.debug("Could not resolve portfolio_id from model group", exc_info=True)
 
-    # Try existing results first
-    try:
-        results = await client.flow_get_latest_results(model_group_id)
-        summary = results.get("summary") or {}
-        feature_names = results.get("feature_names", [])
-        gen_job_id = results.get("job_id", "")
+    # Try existing results first — skip if caller explicitly set price_history_length
+    # (they want fresh paths with specific indicator seeding, not stale cached results)
+    if price_history_length is None:
+        try:
+            results = await client.flow_get_latest_results(model_group_id)
+            summary = results.get("summary") or {}
+            feature_names = results.get("feature_names", [])
+            gen_job_id = results.get("job_id", "")
 
-        if summary:
-            per_asset = _build_per_asset_output(summary, include_paths=True)
-            pid_str = f"'{portfolio_id}'" if portfolio_id else "'<find via list_portfolios>'"
-            feat_hint = f" Features for constraints: {', '.join(feature_names[:10])}." if feature_names else ""
-            output = {
-                "status": "completed (existing results)",
-                "model_group_id": model_group_id,
-                "portfolio_id": portfolio_id,
-                "flow_job_id": str(gen_job_id),
-                "horizon": results.get("horizon", horizon),
-                "n_paths": results.get("n_paths", n_paths),
-                "feature_names": feature_names,
-                "per_asset": per_asset,
-                "next_steps": (
-                    f"Available actions: "
-                    f"simulate_flow_scenario(model_group_id='{model_group_id}', portfolio_id={pid_str}, constraints=...) for what-if scenarios | "
-                    f"test_flow_risk(portfolio_id={pid_str}, flow_job_id='{gen_job_id}') for risk metrics | "
-                    f"flow_validate(model_group_id='{model_group_id}') for model quality check | "
-                    f"list_flow_scenarios(model_group_id='{model_group_id}') to see past scenarios.{feat_hint}"
-                ),
-            }
-            try:
-                chart_html = flow_fan_chart(summary, results.get("horizon", horizon))
-                if chart_html:
-                    return _with_widget(_fmt(output), chart_html)
-            except Exception:
-                pass
-            return _fmt(output)
-    except SablierAPIError as e:
-        if e.status_code != 404:
-            raise
+            if summary:
+                per_asset = _build_per_asset_output(summary, include_paths=True)
+                pid_str = f"'{portfolio_id}'" if portfolio_id else "'<find via list_portfolios>'"
+                feat_hint = f" Features for constraints: {', '.join(feature_names[:10])}." if feature_names else ""
+                output = {
+                    "status": "completed (existing results)",
+                    "model_group_id": model_group_id,
+                    "portfolio_id": portfolio_id,
+                    "flow_job_id": str(gen_job_id),
+                    "horizon": results.get("horizon", horizon),
+                    "n_paths": results.get("n_paths", n_paths),
+                    "feature_names": feature_names,
+                    "per_asset": per_asset,
+                    "next_steps": (
+                        f"Available actions: "
+                        f"simulate_flow_scenario(model_group_id='{model_group_id}', portfolio_id={pid_str}, constraints=...) for what-if scenarios | "
+                        f"test_flow_risk(portfolio_id={pid_str}, flow_job_id='{gen_job_id}') for risk metrics | "
+                        f"flow_validate(model_group_id='{model_group_id}') for model quality check | "
+                        f"list_flow_scenarios(model_group_id='{model_group_id}') to see past scenarios.{feat_hint}"
+                    ),
+                }
+                try:
+                    chart_html = flow_fan_chart(summary, results.get("horizon", horizon))
+                    if chart_html:
+                        return _with_widget(_fmt(output), chart_html)
+                except Exception:
+                    pass
+                return _fmt(output)
+        except SablierAPIError as e:
+            if e.status_code != 404:
+                raise
 
     # Check model status
     try:
