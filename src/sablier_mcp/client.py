@@ -711,6 +711,7 @@ class SablierClient:
         model_group_id: str,
         n_paths: int = 1000,
         horizon: int | None = None,
+        price_history_length: int | None = None,
     ) -> dict:
         """Start async path generation job."""
         body: dict[str, Any] = {
@@ -719,6 +720,8 @@ class SablierClient:
         }
         if horizon is not None:
             body["horizon"] = horizon
+        if price_history_length is not None:
+            body["price_history_length"] = price_history_length
         return await self._post("/flow/generate-paths", json=body)
 
     async def flow_generate_constrained_paths(
@@ -930,6 +933,91 @@ class SablierClient:
                 "mode": mode,
             },
         )
+
+    # ──────────────────────────────────────────────
+    # Derivatives
+    # ──────────────────────────────────────────────
+
+    async def analyze_derivatives(
+        self,
+        flow_job_id: str,
+        options_positions: list[dict],
+        portfolio_id: str | None = None,
+        risk_free_rate: float = 0.045,
+        capital: float | None = None,
+    ) -> dict:
+        """Run options risk analysis on FLOW-generated paths.
+
+        Combines futures positions (from portfolio weights) with options overlay
+        and computes the joint P&L distribution across all generated paths.
+        """
+        body: dict[str, Any] = {
+            "flow_job_id": flow_job_id,
+            "options_positions": options_positions,
+            "risk_free_rate": risk_free_rate,
+        }
+        if portfolio_id:
+            body["portfolio_id"] = portfolio_id
+        if capital is not None:
+            body["capital"] = capital
+        return await self._post_long("/derivatives/analyze", json=body)
+
+    async def price_option(
+        self,
+        underlying_ticker: str,
+        strike: float,
+        days_to_expiry: int,
+        option_type: str = "call",
+        implied_vol: float | None = None,
+        risk_free_rate: float = 0.045,
+        flow_job_id: str | None = None,
+    ) -> dict:
+        """Price a single option on a futures contract using Black-76.
+
+        If flow_job_id is provided, also computes Esscher fair-value from FLOW paths.
+        """
+        body: dict[str, Any] = {
+            "underlying_ticker": underlying_ticker,
+            "strike": strike,
+            "days_to_expiry": days_to_expiry,
+            "option_type": option_type,
+            "risk_free_rate": risk_free_rate,
+        }
+        if implied_vol is not None:
+            body["implied_vol"] = implied_vol
+        if flow_job_id:
+            body["flow_job_id"] = flow_job_id
+        return await self._post("/derivatives/price", json=body)
+
+    # ──────────────────────────────────────────────
+    # Trading Rules
+    # ──────────────────────────────────────────────
+
+    async def create_trading_rule(self, portfolio_id: str, name: str,
+                                  trigger: dict, action: dict,
+                                  description: str | None = None,
+                                  is_active: bool = False,
+                                  priority: int = 0) -> dict:
+        return await self._post(f"/portfolios/{portfolio_id}/rules", json={
+            "name": name, "trigger": trigger, "action": action,
+            "description": description, "is_active": is_active, "priority": priority,
+        })
+
+    async def list_trading_rules(self, portfolio_id: str) -> dict:
+        return await self._get(f"/portfolios/{portfolio_id}/rules")
+
+    async def update_trading_rule(self, portfolio_id: str, rule_id: str, **fields) -> dict:
+        return await self._request("PATCH", f"/portfolios/{portfolio_id}/rules/{rule_id}", json=fields)
+
+    async def delete_trading_rule(self, portfolio_id: str, rule_id: str) -> dict:
+        return await self._delete(f"/portfolios/{portfolio_id}/rules/{rule_id}")
+
+    async def fortest_rules(self, portfolio_id: str, flow_job_id: str,
+                            rule_ids: list[str] | None = None) -> dict:
+        body: dict = {"flow_job_id": flow_job_id}
+        if rule_ids is not None:
+            body["rule_ids"] = rule_ids
+        return await self._post(f"/portfolios/{portfolio_id}/rules/fortest", json=body)
 
     # ──────────────────────────────────────────────
     # Tests

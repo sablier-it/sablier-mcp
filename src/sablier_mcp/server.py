@@ -11,6 +11,7 @@ Remote mode uses OAuth 2.0 — Claude Desktop opens a browser for login.
 
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import date as _date
 import json
 import logging
 import os
@@ -192,7 +193,7 @@ def _with_widget(text: str, html: str) -> list:
             resource=TextResourceContents(
                 uri=f"data:text/html,{urllib.parse.quote(html)}",
                 mimeType="text/html",
-                text=text,
+                text="[interactive chart]",
             ),
         ),
     ]
@@ -323,16 +324,34 @@ def _flatten_betas(results: dict) -> dict:
     factor_stds_raw = dict(zip(factor_names, stds_raw_list)) if stds_raw_list else {}
     factor_last_values_raw = dict(zip(factor_names, last_values_list)) if last_values_list else {}
 
+    factor_last_date_str = factor_stats.get("factor_last_date")
     out = {
         "conditioning_features": features,
         "assets": assets,
         "factor_last_values_raw": factor_last_values_raw,
+        "factor_last_date": factor_last_date_str,
         "factor_means_raw": factor_means_raw,
         "factor_stds_raw": factor_stds_raw,
         "factor_means": factor_means,
         "factor_stds": factor_stds,
-        "factor_last_date": factor_stats.get("factor_last_date"),
     }
+
+    # Warn when factor data is stale — one stale feature truncates the entire beta window
+    if factor_last_date_str:
+        try:
+            last_date = _date.fromisoformat(factor_last_date_str)
+            days_old = (_date.today() - last_date).days
+            business_days_old = round(days_old * 5 / 7)
+            if business_days_old > 5:
+                out["data_freshness_warning"] = (
+                    f"Factor data ends {factor_last_date_str} ({business_days_old} business days ago). "
+                    f"At least one conditioning feature has stale data — the beta estimation window "
+                    f"was truncated to this date for ALL features. Betas and factor_last_values_raw "
+                    f"may not reflect current market conditions. "
+                    f"Run refresh_feature_data on your conditioning set tickers to update."
+                )
+        except (ValueError, TypeError):
+            pass
     if results.get("collinear_groups"):
         out["collinear_groups"] = results["collinear_groups"]
     return out
@@ -376,7 +395,7 @@ async def _ensure_portfolio(
     try:
         portfolio = await client.create_portfolio(name, assets)
     except SablierAPIError as e:
-        if e.status_code in (409, 500) and "unique" in str(e).lower():
+        if e.status_code == 409 or (e.status_code == 500 and "unique" in str(e).lower()):
             # Duplicate name — find and reuse the existing portfolio
             all_portfolios = await client.list_portfolios()
             items = all_portfolios.get("portfolios", all_portfolios) if isinstance(all_portfolios, dict) else all_portfolios
@@ -485,71 +504,6 @@ async def search_features(
 # ══════════════════════════════════════════════════
 
 
-@server.tool(
-    name="set_api_key",
-    description=(
-        "Store a user's API key for a third-party data provider (FRED, Finnhub). "
-        "Keys are encrypted at rest. Required before using FRED features — "
-        "get a free FRED key at https://fred.stlouisfed.org/docs/api/api_key.html"
-    ),
-    annotations=ToolAnnotations(title="Set API Key", destructiveHint=True),
-)
-async def set_api_key(
-    provider: Annotated[str, Field(description="Provider name: 'fred' or 'finnhub'")],
-    api_key: Annotated[str, Field(description="The API key to store (will be encrypted)")],
-) -> str:
-    if err := _require_auth():
-        return err
-    try:
-        client = get_client()
-        result = await client.set_user_api_key(provider=provider, api_key=api_key)
-        return _fmt({
-            "status": "success",
-            "provider": provider,
-            "message": f"API key for {provider} stored successfully. You can now use {provider} data sources.",
-        })
-    except SablierAPIError as e:
-        return _api_error(e)
-
-
-@server.tool(
-    name="list_api_keys",
-    description="List the user's stored third-party API keys (providers only, no secrets shown).",
-    annotations=ToolAnnotations(title="List API Keys", readOnlyHint=True),
-)
-async def list_api_keys() -> str:
-    if err := _require_auth():
-        return err
-    try:
-        client = get_client()
-        result = await client.list_user_api_keys()
-        keys = result.get("keys", [])
-        if not keys:
-            return _fmt({"message": "No API keys stored. Use set_api_key to add one.", "keys": []})
-        return _fmt({
-            "keys": [{"provider": k["provider"], "name": k.get("name"), "created_at": k.get("created_at")} for k in keys],
-            "total": result.get("total", len(keys)),
-        })
-    except SablierAPIError as e:
-        return _api_error(e)
-
-
-@server.tool(
-    name="delete_api_key",
-    description="Delete a user's stored API key for a third-party provider.",
-    annotations=ToolAnnotations(title="Delete API Key", destructiveHint=True),
-)
-async def delete_api_key(
-    provider: Annotated[str, Field(description="Provider to remove: 'fred' or 'finnhub'")],
-) -> str:
-    if err := _require_auth():
-        return err
-    try:
-        client = get_client()
-        result = await client.delete_user_api_key(provider=provider)
-        return _fmt({"status": "success", "message": f"API key for {provider} deleted."})
-    except SablierAPIError as e:
-        return _api_error(e)
 
 
 # ══════════════════════════════════════════════════
@@ -628,51 +582,6 @@ async def refresh_feature_data(
         return _api_error(e)
 
 
-@server.tool(
-    name="create_derived_feature",
-    description=(
-        "Create a derived feature from an existing base feature using a transformation. "
-        "Examples: 20-day moving average of VIX, spread between 10Y and 2Y rates. "
-        "Use list_transformations to see available transformation types."
-    ),
-    annotations=ToolAnnotations(title="Create Derived Feature", destructiveHint=True),
-)
-async def create_derived_feature(
-    name: Annotated[str, Field(description="Unique name/ticker for the derived feature (e.g. 'VIX_MA20')")],
-    base_feature: Annotated[str, Field(description="Ticker of the base feature to transform (e.g. 'VIX')")],
-    transformation: Annotated[str, Field(description="Transformation type (e.g. 'moving_average', 'spread', 'ratio')")],
-    parameters: Annotated[dict, Field(description="Transformation parameters (e.g. {'window': 20})")],
-    display_name: Annotated[str | None, Field(description="Human-readable name", default=None)] = None,
-    description: Annotated[str | None, Field(description="Description of the derived feature", default=None)] = None,
-) -> str:
-    if err := _require_auth():
-        return err
-    try:
-        client = get_client()
-        result = await client.create_derived_feature(
-            name=name, base_feature=base_feature,
-            transformation=transformation, parameters=parameters,
-            display_name=display_name, description=description,
-        )
-        return _fmt(result)
-    except SablierAPIError as e:
-        return _api_error(e)
-
-
-@server.tool(
-    name="list_transformations",
-    description="List available transformation types for creating derived features. Returns names, parameter schemas, and examples.",
-    annotations=ToolAnnotations(title="List Transformations", readOnlyHint=True),
-)
-async def list_transformations() -> str:
-    if err := _require_auth():
-        return err
-    try:
-        client = get_client()
-        result = await client.list_transformations()
-        return _fmt(result)
-    except SablierAPIError as e:
-        return _api_error(e)
 
 
 # ══════════════════════════════════════════════════
@@ -776,9 +685,10 @@ async def create_portfolio(
 @server.tool(
     name="update_portfolio",
     description=(
-        "Update an existing portfolio. Can change name, description, weights, and/or capital. "
+        "Update an existing portfolio. Can change name, description, weights, capital, and/or options_positions. "
         "Only pass the fields you want to update — omitted fields stay unchanged. "
-        "Weights must sum to 1.0 if provided."
+        "Weights must sum to 1.0 if provided. "
+        "options_positions sets the options overlay for derivatives analysis (persisted on the portfolio)."
     ),
     annotations=ToolAnnotations(title="Update Portfolio", destructiveHint=True),
 )
@@ -788,6 +698,15 @@ async def update_portfolio(
     description: Annotated[str | None, Field(description="New description", default=None)] = None,
     weights: Annotated[dict[str, float] | None, Field(description="New weights by ticker (e.g. {'AAPL': 0.5, 'MSFT': 0.5}). Must sum to 1.0.", default=None)] = None,
     capital: Annotated[float | None, Field(description="New capital allocation in USD", default=None)] = None,
+    options_positions: Annotated[list[dict] | None, Field(
+        description=(
+            "Options overlay positions to persist on the portfolio. Each dict: "
+            "underlying (display_name), option_type ('call'/'put'), strike (float), "
+            "days_to_expiry (int), quantity (int, negative=short), implied_vol (float), "
+            "entry_premium (float). These are used by analyze_derivatives when no positions are passed inline."
+        ),
+        default=None,
+    )] = None,
 ) -> str:
     if err := _require_auth():
         return err
@@ -802,18 +721,23 @@ async def update_portfolio(
         fields["weights"] = weights
     if capital is not None:
         fields["capital"] = capital
+    if options_positions is not None:
+        fields["options_positions"] = options_positions
     if not fields:
-        return "Error: provide at least one field to update (name, description, weights, capital)."
+        return "Error: provide at least one field to update (name, description, weights, capital, options_positions)."
     try:
         client = get_client()
         result = await client.update_portfolio(portfolio_id, **fields)
-        return _fmt({
+        output = {
             "portfolio_id": result["id"],
             "name": result["name"],
             "weights": result.get("weights", {}),
             "capital": result.get("capital"),
             "message": "Portfolio updated successfully.",
-        })
+        }
+        if result.get("options_positions"):
+            output["options_positions"] = result["options_positions"]
+        return _fmt(output)
     except SablierAPIError as e:
         return _api_error(e)
 
@@ -882,7 +806,7 @@ async def get_asset_profiles(
 
 @server.tool(
     name="delete_portfolio",
-    description="Delete a portfolio by ID. This is permanent and cannot be undone.",
+    description="Delete a portfolio by ID. Permanent, cannot be undone.",
     annotations=ToolAnnotations(title="Delete Portfolio", destructiveHint=True),
 )
 async def delete_portfolio(
@@ -918,7 +842,7 @@ async def delete_portfolio(
 async def optimize_portfolio(
     portfolio_id: Annotated[str, Field(description="The portfolio UUID")],
     simulation_batch_id: Annotated[str, Field(description="From simulate_betas or analyze_quantitative")],
-    objective: Annotated[str, Field(description="Optimization objective: 'max_sharpe', 'min_variance', or 'max_return'", default="max_sharpe")] = "max_sharpe",
+    objective: Annotated[str, Field(description="Optimization objective: 'max_sharpe' (default), 'min_variance', 'max_return', 'analytical_risk_parity' (equal risk contributions), 'expected_utility' (CRRA), 'risk_parity' (CVaR-based), 'mean_cvar' (minimize CVaR)", default="max_sharpe")] = "max_sharpe",
 ) -> str:
     if err := _require_auth():
         return err
@@ -1077,8 +1001,28 @@ async def analyze_qualitative(
             })
 
         # Summarize results
-        raw_results = result.get("results", {})
+        raw_results = result.get("results") or {}
         themes_data = raw_results.get("results", []) or raw_results.get("themes", [])
+
+        # Surface not-covered tickers clearly (ETFs, non-US equities with no SEC filings)
+        # not_covered_tickers lives in each theme's coverage_summary (same list across themes)
+        not_covered_tickers: list[str] = []
+        if themes_data:
+            first_coverage = (themes_data[0] or {}).get("coverage_summary") or {}
+            not_covered_tickers = first_coverage.get("not_covered_tickers") or []
+        covered_count = (themes_data[0] or {}).get("coverage_summary", {}).get("covered_count", 1) if themes_data else 0
+
+        if not covered_count and not_covered_tickers:
+            return _fmt({
+                "status": "not_covered",
+                "not_covered_tickers": not_covered_tickers,
+                "message": (
+                    f"{', '.join(not_covered_tickers)} {'have' if len(not_covered_tickers) > 1 else 'has'} "
+                    "no SEC filings in GRAIN. GRAIN requires equities with 10-K/10-Q filings. "
+                    "ETFs, non-US equities, and funds are not supported."
+                ),
+            })
+
         summary = {
             "status": "completed",
             "processing_time_seconds": result.get("processing_time_seconds"),
@@ -1172,7 +1116,7 @@ async def list_grain_analyses(
 
 @server.tool(
     name="get_grain_analysis",
-    description="Load a saved GRAIN analysis with full results: theme scores, per-ticker breakdown, and evidence passages.",
+    description="Retrieve full results of a completed GRAIN analysis: theme scores, per-ticker breakdown, and evidence passages. Use list_grain_analyses first to find the analysis_id.",
     annotations=ToolAnnotations(title="Get GRAIN Analysis", readOnlyHint=True),
 )
 async def get_grain_analysis(
@@ -1192,7 +1136,7 @@ async def get_grain_analysis(
 
 @server.tool(
     name="delete_grain_analysis",
-    description="Delete a saved GRAIN qualitative analysis by ID. This cannot be undone.",
+    description="Delete a saved GRAIN qualitative analysis by ID. Permanent, cannot be undone.",
     annotations=ToolAnnotations(title="Delete GRAIN Analysis", readOnlyHint=False, destructiveHint=True),
 )
 async def delete_grain_analysis(
@@ -1365,7 +1309,7 @@ async def get_feature_set(
 
 @server.tool(
     name="delete_feature_set",
-    description="Delete a custom feature set. This is permanent and cannot be undone. Cannot delete shared templates.",
+    description="Delete a custom feature set. Permanent, cannot be undone. Cannot delete shared templates.",
     annotations=ToolAnnotations(title="Delete Feature Set", destructiveHint=True),
 )
 async def delete_feature_set(
@@ -1385,7 +1329,7 @@ async def delete_feature_set(
 
 @server.tool(
     name="delete_model_group",
-    description="Delete a model group and all its models, simulations, and associated data. This is permanent.",
+    description="Delete a model group and all its models, simulations, and associated data. Permanent, cannot be undone.",
     annotations=ToolAnnotations(title="Delete Model Group", destructiveHint=True),
 )
 async def delete_model_group(
@@ -1503,9 +1447,11 @@ async def simulate_betas(
         "Run an ad-hoc what-if stress test on a Moment (linear) model — the PRIMARY tool for quick scenario analysis. "
         "Requires simulation_batch_id from analyze_quantitative or simulate_betas. "
         "Pass ALL conditioning_features as absolute price levels in the factors dict. "
-        "Use factor_last_values_raw from the betas output as current baseline, then compute targets "
-        "(e.g. to shock SPY -5% from current 633: pass {'US Market': 601.35}). "
-        "Returns per-asset expected returns, VaR, Expected Shortfall, and return distribution. "
+        "BEFORE calling: read factor_last_values_raw from the betas output — these are today's values. "
+        "Always state current vs stressed levels explicitly (e.g. 'Oil is at $82 today, stressing to $120'). "
+        "Also check data_freshness_warning in betas output — if present, betas may be stale. "
+        "Use factor_last_values_raw as baseline, then compute targets "
+        "(e.g. oil currently 82, stress to 120: pass {'Crude Oil': 120.0}). "
         "For saved/reusable scenarios, use create_scenario + run_scenario instead. "
         "For Flow (generative) models, use simulate_flow_scenario instead."
     ),
@@ -1714,7 +1660,7 @@ async def update_scenario(
 
 @server.tool(
     name="delete_scenario",
-    description="Delete a saved scenario. This is permanent.",
+    description="Delete a saved scenario. Permanent, cannot be undone.",
     annotations=ToolAnnotations(title="Delete Scenario", destructiveHint=True),
 )
 async def delete_scenario(
@@ -1732,94 +1678,6 @@ async def delete_scenario(
         return _api_error(e)
 
 
-@server.tool(
-    name="clone_scenario",
-    description="Clone an existing Moment scenario (typically a shared template) to create your own editable copy. After cloning, use update_scenario to customize factor specs, then run_scenario to execute it.",
-    annotations=ToolAnnotations(title="Clone Scenario", destructiveHint=True),
-)
-async def clone_scenario(
-    scenario_id: Annotated[str, Field(description="UUID of the scenario to clone")],
-) -> str:
-    if err := _require_auth():
-        return err
-    if err := _validate_uuid(scenario_id, "scenario_id"):
-        return err
-    try:
-        client = get_client()
-        result = await client.clone_scenario(scenario_id)
-        return _fmt({
-            "cloned_scenario_id": result.get("id"),
-            "name": result.get("name"),
-            "message": "Scenario cloned. Use update_scenario to customize it.",
-        })
-    except SablierAPIError as e:
-        return _api_error(e)
-
-
-@server.tool(
-    name="run_scenario",
-    description=(
-        "Run a previously saved scenario template (from create_scenario or clone_scenario). "
-        "For Moment scenarios: synchronously computes betas + simulates returns under the saved factor specs. "
-        "For Flow scenarios: queues an async GPU job. "
-        "Use simulate_returns for ad-hoc what-if tests without saving a scenario first. "
-        "Use simulate_flow_scenario for ad-hoc Flow what-if tests with constraints."
-    ),
-    annotations=ToolAnnotations(title="Run Scenario", readOnlyHint=True, openWorldHint=True),
-)
-async def run_scenario(
-    scenario_id: Annotated[str, Field(description="UUID of the scenario to run")],
-) -> str:
-    if err := _require_auth():
-        return err
-    if err := _validate_uuid(scenario_id, "scenario_id"):
-        return err
-    try:
-        client = get_client()
-        result = await client.run_scenario(scenario_id)
-        run_type = result.get("run_type", "unknown")
-        status = result.get("status", "unknown")
-
-        if run_type == "moment" and status == "completed":
-            # Format Moment results with per-asset risk metrics
-            per_asset = result.get("per_asset_results", {})
-            formatted = {}
-            for asset_id, data in per_asset.items():
-                if data.get("status") != "completed":
-                    formatted[asset_id] = {"status": data.get("status"), "error": data.get("error")}
-                    continue
-                summary = data.get("summary", [{}])
-                s = summary[0] if summary else {}
-                formatted[asset_id] = {
-                    "expected_return": s.get("expected"),
-                    "mean": s.get("mean"),
-                    "std": s.get("std"),
-                    "VaR_95": s.get("VaR_95"),
-                    "ES_95": s.get("ES_95"),
-                }
-            return _fmt({
-                "scenario_id": result["scenario_id"],
-                "run_type": "moment",
-                "status": "completed",
-                "simulation_batch_id": result.get("simulation_batch_id"),
-                "returns_batch_id": result.get("returns_batch_id"),
-                "per_asset_risk": formatted,
-            })
-        elif run_type == "flow":
-            return _fmt({
-                "scenario_id": result["scenario_id"],
-                "run_type": "flow",
-                "status": status,
-                "job_id": result.get("job_id"),
-                "message": (
-                    "Flow scenario job submitted. The job is running asynchronously. "
-                    "Use simulate_flow_scenario for new constrained scenarios instead."
-                ),
-            })
-        else:
-            return _fmt(result)
-    except SablierAPIError as e:
-        return _api_error(e)
 
 
 # ══════════════════════════════════════════════════
@@ -1992,9 +1850,8 @@ async def _train_flow_model_impl(
             "failed_assets": create_result.get("failed_assets", []),
         }), None, None, []
 
-    # Start training without holding GPU lock during polling — the backend
-    # manages its own GPU resources.  Return immediately so Claude can keep
-    # working while the job runs.
+    # Dispatch training job to GPU worker — returns immediately.
+    # Training runs async on GPU (~5-15 min).
     train_job = await _retry_gpu_call(lambda: client.flow_train(
         model_group_id=model_group_id,
         horizon=horizon,
@@ -2006,16 +1863,18 @@ async def _train_flow_model_impl(
     feature_names = train_job.get("feature_names", [])
 
     output = {
-        "status": "training",
+        "status": "training_started",
         "model_group_id": model_group_id,
         "portfolio_id": portfolio_id,
         "job_id": train_job_id,
         "feature_names": feature_names,
-        "next_steps": (
-            f"Training started (job_id='{train_job_id}'). It typically takes 5-15 minutes. "
-            f"Use check_flow_job(job_id='{train_job_id}') to check progress. "
-            f"Once completed, call generate_flow_paths(model_group_id='{model_group_id}') "
-            f"to produce simulated price trajectories."
+        "estimated_time": "5-15 minutes",
+        "instructions": (
+            f"GPU training job dispatched (job_id='{train_job_id}'). "
+            f"Tell the user: 'Training started — it takes about 5-15 minutes. "
+            f"You can keep chatting with me, and ask me to check progress anytime.' "
+            f"When the user asks to check: check_flow_job(job_id='{train_job_id}'). "
+            f"When training completes: generate_flow_paths(model_group_id='{model_group_id}')."
         ),
     }
     return output, model_group_id, portfolio_id, feature_names
@@ -2023,7 +1882,7 @@ async def _train_flow_model_impl(
 
 async def _generate_flow_paths_impl(
     client, model_group_id: str, portfolio_id: str | None,
-    horizon: int, n_paths: int,
+    horizon: int, n_paths: int, price_history_length: int | None = None,
 ) -> list | str:
     """Generate paths from a trained model. Returns formatted output."""
     if err := _validate_uuid(model_group_id, "model_group_id"):
@@ -2051,44 +1910,46 @@ async def _generate_flow_paths_impl(
         except Exception:
             logger.debug("Could not resolve portfolio_id from model group", exc_info=True)
 
-    # Try existing results first
-    try:
-        results = await client.flow_get_latest_results(model_group_id)
-        summary = results.get("summary") or {}
-        feature_names = results.get("feature_names", [])
-        gen_job_id = results.get("job_id", "")
+    # Try existing results first — skip if caller explicitly set price_history_length
+    # (they want fresh paths with specific indicator seeding, not stale cached results)
+    if price_history_length is None:
+        try:
+            results = await client.flow_get_latest_results(model_group_id)
+            summary = results.get("summary") or {}
+            feature_names = results.get("feature_names", [])
+            gen_job_id = results.get("job_id", "")
 
-        if summary:
-            per_asset = _build_per_asset_output(summary, include_paths=True)
-            pid_str = f"'{portfolio_id}'" if portfolio_id else "'<find via list_portfolios>'"
-            feat_hint = f" Features for constraints: {', '.join(feature_names[:10])}." if feature_names else ""
-            output = {
-                "status": "completed (existing results)",
-                "model_group_id": model_group_id,
-                "portfolio_id": portfolio_id,
-                "flow_job_id": str(gen_job_id),
-                "horizon": results.get("horizon", horizon),
-                "n_paths": results.get("n_paths", n_paths),
-                "feature_names": feature_names,
-                "per_asset": per_asset,
-                "next_steps": (
-                    f"Available actions: "
-                    f"simulate_flow_scenario(model_group_id='{model_group_id}', portfolio_id={pid_str}, constraints=...) for what-if scenarios | "
-                    f"test_flow_risk(portfolio_id={pid_str}, flow_job_id='{gen_job_id}') for risk metrics | "
-                    f"flow_validate(model_group_id='{model_group_id}') for model quality check | "
-                    f"list_flow_scenarios(model_group_id='{model_group_id}') to see past scenarios.{feat_hint}"
-                ),
-            }
-            try:
-                chart_html = flow_fan_chart(summary, results.get("horizon", horizon))
-                if chart_html:
-                    return _with_widget(_fmt(output), chart_html)
-            except Exception:
-                pass
-            return _fmt(output)
-    except SablierAPIError as e:
-        if e.status_code != 404:
-            raise
+            if summary:
+                per_asset = _build_per_asset_output(summary, include_paths=True)
+                pid_str = f"'{portfolio_id}'" if portfolio_id else "'<find via list_portfolios>'"
+                feat_hint = f" Features for constraints: {', '.join(feature_names[:10])}." if feature_names else ""
+                output = {
+                    "status": "completed (existing results)",
+                    "model_group_id": model_group_id,
+                    "portfolio_id": portfolio_id,
+                    "flow_job_id": str(gen_job_id),
+                    "horizon": results.get("horizon", horizon),
+                    "n_paths": results.get("n_paths", n_paths),
+                    "feature_names": feature_names,
+                    "per_asset": per_asset,
+                    "next_steps": (
+                        f"Available actions: "
+                        f"simulate_flow_scenario(model_group_id='{model_group_id}', portfolio_id={pid_str}, constraints=...) for what-if scenarios | "
+                        f"test_flow_risk(portfolio_id={pid_str}, flow_job_id='{gen_job_id}') for risk metrics | "
+                        f"flow_validate(model_group_id='{model_group_id}') for model quality check | "
+                        f"list_flow_scenarios(model_group_id='{model_group_id}') to see past scenarios.{feat_hint}"
+                    ),
+                }
+                try:
+                    chart_html = flow_fan_chart(summary, results.get("horizon", horizon))
+                    if chart_html:
+                        return _with_widget(_fmt(output), chart_html)
+                except Exception:
+                    pass
+                return _fmt(output)
+        except SablierAPIError as e:
+            if e.status_code != 404:
+                raise
 
     # Check model status
     try:
@@ -2100,10 +1961,16 @@ async def _generate_flow_paths_impl(
                 "hint": "Create a new model with train_flow_model(conditioning_set_id=..., tickers=...).",
             })
         if mg_status not in ("trained", "completed", ""):
+            training_job_id = (_mg_info or {}).get("active_training_job_id")
             return _fmt({
                 "error": f"Model group status is '{mg_status}'. Training may still be in progress.",
                 "model_group_id": model_group_id,
-                "hint": "Wait for training to complete, or train a new model with train_flow_model.",
+                "training_job_id": training_job_id,
+                "hint": (
+                    f"Use check_flow_job(job_id='{training_job_id}', job_type='train') to monitor progress."
+                    if training_job_id else
+                    "Wait for training to complete, or train a new model with train_flow_model."
+                ),
             })
     except Exception:
         logger.debug("Could not check model group status", exc_info=True)
@@ -2114,6 +1981,7 @@ async def _generate_flow_paths_impl(
             model_group_id=model_group_id,
             n_paths=n_paths,
             horizon=horizon,
+            price_history_length=price_history_length,
         ))
         gen_job_id = gen_job.get("job_id")
         if not gen_job_id:
@@ -2168,11 +2036,12 @@ async def _generate_flow_paths_impl(
     name="train_flow_model",
     description=(
         "Train a generative Flow model on a portfolio and conditioning set. "
-        "Returns immediately with a job_id — training runs asynchronously (~5-15 min). "
-        "Use check_flow_job(job_id=...) to monitor progress. "
+        "Returns immediately — training runs on a GPU and takes 5-15 minutes. "
+        "After calling this, STOP and tell the user training has started. Let them keep chatting. "
+        "The user will ask you to check progress — use check_flow_job(job_id=...) when they do. "
+        "Do NOT automatically poll or call check_flow_job yourself. "
         "Requires conditioning_set_id (from list_feature_set_templates or create_feature_set) "
-        "and tickers or portfolio_id. "
-        "After training completes, call generate_flow_paths to produce simulated price trajectories."
+        "and tickers or portfolio_id."
     ),
     annotations=ToolAnnotations(title="Train Flow Model", destructiveHint=True, openWorldHint=True),
 )
@@ -2221,11 +2090,9 @@ async def train_flow_model(
     description=(
         "Check the status of an async Flow job (training, generation, or validation). "
         "Returns status ('running', 'completed', 'failed') and progress details. "
-        "This is a lightweight status check — it does NOT return results data. "
-        "When status is 'completed', use get_flow_results(job_id) to fetch the actual data. "
-        "IMPORTANT: Do NOT call this in a loop. Call it ONCE, report the status to the user, "
-        "then ask if they want to do something else while waiting or check again later. "
-        "Training takes 5-15 min, generation 1-3 min, validation 3-5 min."
+        "Does NOT return results — when completed, call get_flow_results(job_id) to fetch data. "
+        "Call this ONCE, report status to the user, then STOP — do not poll in a loop. "
+        "Typical times: training 5-15 min, generation 1-3 min, validation 3-5 min."
     ),
     annotations=ToolAnnotations(title="Check Flow Job", readOnlyHint=True),
 )
@@ -2289,8 +2156,9 @@ async def check_flow_job(
             if current_epoch and max_epochs:
                 output["progress"] = f"{current_epoch}/{max_epochs} epochs"
             output["hint"] = (
-                "Job is still running. Tell the user the current progress and ask if they'd like to "
-                "do something else in the meantime, or check back later. Do NOT call this tool again automatically."
+                "STOP. Job is still running. Report progress to the user and STOP calling tools. "
+                "Do NOT call check_flow_job again — the user will ask you when they want an update. "
+                "Suggest they can ask 'check my training job' in a few minutes."
             )
 
         return _fmt(output)
@@ -2327,12 +2195,16 @@ async def generate_flow_paths(
         description="Number of paths to generate. 1000 default.",
         default=1000,
     )] = 1000,
+    price_history_length: Annotated[int | None, Field(
+        description="Days of historical prices to include before the paths start. Defaults to horizon. Set higher (e.g. 120) to warm up indicators like MACD or z-score before fortest_rules.",
+        default=None,
+    )] = None,
 ) -> list | str:
     if err := _require_auth():
         return err
     try:
         client = get_client()
-        return await _generate_flow_paths_impl(client, model_group_id, portfolio_id, horizon, n_paths)
+        return await _generate_flow_paths_impl(client, model_group_id, portfolio_id, horizon, n_paths, price_history_length)
     except _FlowGPUBusy as e:
         return str(e)
     except SablierAPIError as e:
@@ -2348,9 +2220,9 @@ async def generate_flow_paths(
         "Train a Flow model AND generate paths in one call. "
         "Convenience wrapper: equivalent to train_flow_model then generate_flow_paths. "
         "TWO MODES: "
-        "(1) NEW RUN: pass conditioning_set_id + tickers/portfolio_id. Trains then generates (~5-18 min). "
-        "(2) RESUME: pass model_group_id to retrieve existing results or generate new paths without retraining. "
-        "Prefer the separate train_flow_model + generate_flow_paths tools for more control."
+        "(1) NEW RUN: pass conditioning_set_id + tickers/portfolio_id. Dispatches training (~5-15 min async), "
+        "then tell the user to wait and check back. Do NOT poll automatically. "
+        "(2) RESUME: pass model_group_id to retrieve existing results or generate new paths without retraining."
     ),
     annotations=ToolAnnotations(title="Generate Synthetic Paths", destructiveHint=True, openWorldHint=True),
 )
@@ -2377,6 +2249,10 @@ async def generate_synthetic(
     )] = None,
     horizon: Annotated[int, Field(description="Forecast horizon in trading days. Default 60.", default=60)] = 60,
     n_paths: Annotated[int, Field(description="Number of paths to generate. Default 1000.", default=1000)] = 1000,
+    price_history_length: Annotated[int | None, Field(
+        description="Days of historical prices to include before the paths start. Defaults to horizon. Set higher (e.g. 120) to warm up indicators like MACD or z-score before fortest_rules.",
+        default=None,
+    )] = None,
 ) -> list | str:
     if err := _require_auth():
         return err
@@ -2385,7 +2261,7 @@ async def generate_synthetic(
 
         # Resume mode: skip training
         if model_group_id:
-            return await _generate_flow_paths_impl(client, model_group_id, portfolio_id, horizon, n_paths)
+            return await _generate_flow_paths_impl(client, model_group_id, portfolio_id, horizon, n_paths, price_history_length)
 
         # New run: train then generate
         if not conditioning_set_id:
@@ -2399,7 +2275,7 @@ async def generate_synthetic(
         if not mgid:
             return _fmt(result)  # training output without model_group_id (shouldn't happen)
 
-        return await _generate_flow_paths_impl(client, mgid, pid, horizon, n_paths)
+        return await _generate_flow_paths_impl(client, mgid, pid, horizon, n_paths, price_history_length)
     except _FlowGPUBusy as e:
         return str(e)
     except SablierAPIError as e:
@@ -2414,15 +2290,28 @@ async def generate_synthetic(
     description=(
         "Start constrained what-if scenario generation from a trained Flow model. "
         "Returns immediately with a job_id — use check_flow_job(job_id, job_type='generate') to poll for results. "
-        "Requires model_group_id and feature_names from train_flow_model or generate_synthetic. "
-        "IMPORTANT: feature_name in constraints must be the DISPLAY NAME from the training output's feature_names "
-        "(e.g. 'Apple Inc.', 'NVIDIA Corporation', 'SPDR S&P 500 ETF Trust'), NOT ticker symbols. "
+        "IMPORTANT: Always run generate_flow_paths FIRST on the same day before running any scenarios. "
+        "This establishes a same-day baseline — when you retrieve results via get_flow_results, "
+        "scenario_probability is automatically computed: the fraction of unconstrained baseline paths "
+        "that naturally satisfy your constraints, telling you how likely the scenario is. "
+        "≥5% = within normal range | 1-5% = rare | <1% = outside training distribution. "
+        "scenario_probability is measured from the baseline n_paths (default 1000), giving a resolution floor of 0.1% — "
+        "0% means below measurable threshold, not necessarily impossible. "
+        "THREE WAYS TO GET 0% PROBABILITY — avoid all: "
+        "(1) DURATION: mean-reverting features (VIX, spreads, rates) spike for days to weeks, not months. "
+        "Always use t_start/t_end to window constraints (e.g. t_start=10, t_end=20), not the full horizon. "
+        "(2) JUMP TOO ABRUPT: if today's value is far from the threshold, t_start must give enough time to get there. "
+        "(3) MULTIPLE CONSTRAINTS: joint probability multiplies — if oil ≥155 is 2% and VIX ≥40 is 3%, the joint is ~0.06%, below the 0.1% resolution floor. "
+        "With 2+ constraints, check scenario_probability first and consider testing each constraint individually before combining. "
+        "Check last_price from generate_flow_paths first — if VIX is at 15 and you constrain it above 30 from day 5, "
+        "that's a 2x move in 5 days (essentially never happens). Set t_start large enough for a realistic transition: "
+        "the bigger the gap between current value and threshold, the later t_start should be. "
+        "VIX all-time high ~89, never sustained above 30 for more than a few weeks. "
+        "IMPORTANT: feature_name in constraints must be the DISPLAY NAME from feature_names "
+        "(e.g. 'Apple Inc.', 'SPDR S&P 500 ETF Trust'), NOT ticker symbols. "
         "Constraint types: 'level' (absolute price bounds), 'return' (per-step return bounds). "
-        "When completed (via check_flow_job), returns constrained paths + satisfaction_rate. "
-        "IMPORTANT: Run generate_flow_paths first to create a baseline for comparison — "
-        "if no baseline exists for today, this tool will auto-generate one before the scenario. "
         "Pass portfolio_id through so test_flow_risk can be called directly on results. "
-        "Run multiple scenarios and compare via test_flow_risk on each flow_job_id."
+        "Run scenarios SEQUENTIALLY (one at a time), not in parallel, to avoid GPU queue contention."
     ),
     annotations=ToolAnnotations(title="Simulate Flow Scenario", readOnlyHint=True, openWorldHint=True),
 )
@@ -2433,9 +2322,12 @@ async def simulate_flow_scenario(
     constraints: Annotated[list[dict], Field(
         description=(
             "List of constraints. Each: "
-            "{'feature_name': 'Apple Inc.', 'type': 'level', 'lower': 200, 'upper': null, 't_start': 0, 't_end': 20}. "
+            "{'feature_name': 'Equity Volatility (VIX)', 'type': 'level', 'lower': 30, 'upper': null, 't_start': 10, 't_end': 25}. "
             "Types: 'level' (absolute price bounds), 'return' (per-step return bounds). "
-            "feature_name must be from the training output's feature_names list."
+            "feature_name must be from the training output's feature_names list. "
+            "ALWAYS set t_start/t_end to window the constraint. "
+            "Set t_start based on both duration AND current value: if the feature is far from the threshold today, "
+            "t_start must be large enough for a realistic transition (larger gap = later t_start)."
         )
     )],
     portfolio_id: Annotated[str | None, Field(
@@ -2505,9 +2397,12 @@ async def simulate_flow_scenario(
             "constraints": constraints,
             "n_paths": n_paths,
             "next_steps": (
-                f"Constrained generation started (job_id='{job_id}'). It typically takes 1-3 minutes. "
-                f"Use check_flow_job(job_id='{job_id}', job_type='generate') to check progress. "
-                f"Once completed, call test_flow_risk(portfolio_id={pid_str}, flow_job_id='{job_id}') for risk metrics."
+                f"Constrained generation started (job_id='{job_id}'). Takes 1-3 minutes. "
+                f"STOP HERE — tell the user and wait. Do NOT poll in a loop. "
+                f"The user can ask you to check with: check_flow_job(job_id='{job_id}', job_type='generate'). "
+                f"Once completed: test_flow_risk(portfolio_id={pid_str}, flow_job_id='{job_id}') for futures-only risk, "
+                f"or analyze_derivatives(flow_job_id='{job_id}', portfolio_id={pid_str}, options_positions=...) "
+                f"if the user has options positions to overlay."
             ),
         }
         if baseline_job_id:
@@ -2527,10 +2422,12 @@ async def simulate_flow_scenario(
 @server.tool(
     name="test_flow_risk",
     description=(
-        "Run portfolio risk analytics on Flow-generated paths. "
+        "Run portfolio risk analytics on Flow-generated paths (FUTURES/EQUITIES ONLY — no options). "
         "Computes expected return, volatility, Sharpe ratio, Sortino ratio, Calmar ratio, "
         "VaR 95%, CVaR 95%, max drawdown, profitability rate, and return distribution percentiles. "
         "Requires portfolio_id and flow_job_id from generate_flow_paths, generate_synthetic, or simulate_flow_scenario. "
+        "If the user has OPTIONS positions, use analyze_derivatives instead — it reprices options "
+        "on every path using Black-76 and shows combined futures+options risk. "
         "TIP: Call this on multiple flow_job_ids (baseline + different scenarios) to build a "
         "side-by-side comparison of risk metrics across scenarios."
     ),
@@ -2696,7 +2593,7 @@ async def download_flow_paths(
 
 @server.tool(
     name="delete_flow_job",
-    description="Delete a flow simulation job (baseline or constrained scenario). This is permanent.",
+    description="Delete a flow simulation job (baseline or constrained scenario). Permanent, cannot be undone.",
     annotations=ToolAnnotations(title="Delete Flow Job", destructiveHint=True),
 )
 async def delete_flow_job(
@@ -2714,12 +2611,254 @@ async def delete_flow_job(
         return _api_error(e)
 
 
+# ── Systematic Trading Rules ──────────────────────────────────────────────────
+
+@server.tool(
+    name="create_rule",
+    description=(
+        "Add a systematic trading rule to a portfolio. Rules are evaluated day-by-day on FLOW "
+        "forward paths during fortest_rules — not backtested on history.\n\n"
+        "TWO RULE TYPES:\n"
+        "  • Signal rules  (action.type='signal_weight') — continuous indicator → proportional position. For CTAs and trend-followers.\n"
+        "  • Binary rules  (all other action types) — trigger fires → discrete weight change. For risk overlays, hard stops, regime gates.\n\n"
+        "Use signal rules (priority 0) for the core strategy; binary rules (priority 1+) for risk overrides.\n\n"
+
+        "── SIGNAL RULE ──\n"
+        "trigger: {indicator, asset, params}  ← no operator/threshold\n"
+        "action:  {type:'signal_weight', asset, normalizer, max_weight, min_weight}\n"
+        "  normalizer = typical signal magnitude; clip(signal/normalizer, -1, 1) → position\n"
+        "  weight = scaled*max_weight if scaled≥0 else scaled*|min_weight|\n\n"
+        "  trigger={indicator:'macd_line', asset:'CL=F', params:{fast:12, slow:60}}\n"
+        "  action={type:'signal_weight', asset:'CL=F', normalizer:2.0, max_weight:0.6, min_weight:-0.3}\n\n"
+        "  trigger={indicator:'z_score', asset:'ZN=F', params:{window:60}}\n"
+        "  action={type:'signal_weight', asset:'ZN=F', normalizer:2.0, max_weight:0.5, min_weight:-0.5}\n\n"
+
+        "── BINARY RULE ──\n"
+        "trigger: {indicator, asset, params, operator, threshold}  OR  {combinator:'all'|'any', conditions:[...]}\n"
+        "  indicators: raw | moving_average | ema | rsi | bollinger_upper | bollinger_lower |\n"
+        "              bollinger_width | macd_line | macd_signal | rolling_std | rolling_volatility | rate_of_change | z_score\n"
+        "  asset: portfolio assets OR conditioning factors ('^VIX', 'DX-Y.NYB', 'T10Y2Y', 'ZN=F', ...)\n"
+        "  operator: '>' | '<' | '>=' | '<=' | '==' | 'crosses_above' | 'crosses_below'\n"
+        "action: exit | set_weight (exact value, negative=short) | scale_weight (multiplier) | reverse\n\n"
+        "  trigger={indicator:'rsi', asset:'CL=F', params:{period:14}, operator:'>', threshold:70}\n"
+        "  action={type:'exit', asset:'CL=F'}\n\n"
+        "  trigger={combinator:'all', conditions:[\n"
+        "    {indicator:'raw', asset:'^VIX', params:{}, operator:'>', threshold:30},\n"
+        "    {indicator:'rsi', asset:'CL=F', params:{period:14}, operator:'>', threshold:65}]}\n"
+        "  action={type:'scale_weight', asset:'CL=F', value:0.5}"
+    ),
+    annotations=ToolAnnotations(title="Create Trading Rule"),
+)
+async def create_rule(
+    portfolio_id: Annotated[str, Field(description="Portfolio UUID")],
+    name: Annotated[str, Field(description="Short descriptive name for the rule")],
+    trigger: Annotated[dict, Field(description="For BINARY rules: single condition {indicator,asset,params,operator,threshold} or multi-condition {combinator:'all'|'any', conditions:[...]}. For SIGNAL rules: just {indicator,asset,params} — no operator or threshold needed.")],
+    action: Annotated[dict, Field(description="Signal: {type:'signal_weight', asset, normalizer, max_weight, min_weight} OR binary: {type:'exit'|'set_weight'|'scale_weight'|'reverse', asset, value?}")],
+    description: Annotated[str | None, Field(description="Optional longer description")] = None,
+    is_active: Annotated[bool, Field(description="Whether the rule is active (default false)")] = False,
+    priority: Annotated[int, Field(description="Evaluation order when multiple rules fire (lower = first, default 0)")] = 0,
+) -> list | str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(portfolio_id, "portfolio_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.create_trading_rule(
+            portfolio_id=portfolio_id, name=name, trigger=trigger, action=action,
+            description=description, is_active=is_active, priority=priority,
+        )
+        return _fmt({
+            "rule_id": result.get("id"),
+            "name": name,
+            "is_active": is_active,
+            "trigger": trigger,
+            "action": action,
+            "message": f"Rule '{name}' created. Use fortest_rules to evaluate it on FLOW paths.",
+        })
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="list_rules",
+    description="List all systematic trading rules attached to a portfolio, including their trigger/action definitions, active status, and priority order.",
+    annotations=ToolAnnotations(title="List Trading Rules", readOnlyHint=True),
+)
+async def list_rules(
+    portfolio_id: Annotated[str, Field(description="Portfolio UUID")],
+) -> list | str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(portfolio_id, "portfolio_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.list_trading_rules(portfolio_id)
+        rules = result.get("rules", [])
+        return _fmt({
+            "portfolio_id": portfolio_id,
+            "count": len(rules),
+            "rules": [{
+                "rule_id": r["id"],
+                "name": r["name"],
+                "description": r.get("description"),
+                "is_active": r["is_active"],
+                "priority": r["priority"],
+                "trigger": r["trigger"],
+                "action": r["action"],
+            } for r in rules],
+        })
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="toggle_rule",
+    description="Activate or deactivate a systematic trading rule. Only active rules are included in fortest_rules by default.",
+    annotations=ToolAnnotations(title="Toggle Trading Rule"),
+)
+async def toggle_rule(
+    portfolio_id: Annotated[str, Field(description="Portfolio UUID")],
+    rule_id: Annotated[str, Field(description="Rule UUID")],
+    is_active: Annotated[bool, Field(description="True to activate, False to deactivate")],
+) -> list | str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        await client.update_trading_rule(portfolio_id, rule_id, is_active=is_active)
+        status = "activated" if is_active else "deactivated"
+        return _fmt({"rule_id": rule_id, "is_active": is_active, "message": f"Rule {status}."})
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="delete_rule",
+    description="Permanently delete a systematic trading rule from a portfolio.",
+    annotations=ToolAnnotations(title="Delete Trading Rule"),
+)
+async def delete_rule(
+    portfolio_id: Annotated[str, Field(description="Portfolio UUID")],
+    rule_id: Annotated[str, Field(description="Rule UUID")],
+) -> list | str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        await client.delete_trading_rule(portfolio_id, rule_id)
+        return _fmt({"rule_id": rule_id, "deleted": True})
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="fortest_rules",
+    description=(
+        "Forward-test systematic trading rules against FLOW-generated price paths. "
+        "Returns TWO levels of output:\n"
+        "  • combined_strategy — ALL rules applied together in priority order on every path. "
+        "This is your actual strategy performance vs the base static portfolio.\n"
+        "  • rule_attribution — each rule tested individually to show which rules help vs hurt.\n\n"
+        "How it works:\n"
+        "  1. Loads the FLOW price paths (same N paths for every evaluation — fair comparison)\n"
+        "  2. Steps through each path day-by-day, applies rules in priority order, tracks P&L\n"
+        "  3. Returns Sharpe, CVaR, max drawdown, return for combined strategy and each rule alone\n\n"
+        "Prerequisites: (1) create rules with create_rule; "
+        "(2) activate them with toggle_rule(is_active=True); "
+        "(3) generate FLOW paths with generate_flow_paths or generate_synthetic.\n"
+        "If rule_ids is omitted, tests all active rules."
+    ),
+    annotations=ToolAnnotations(title="Forward-Test Trading Rules"),
+)
+async def fortest_rules(
+    portfolio_id: Annotated[str, Field(description="Portfolio UUID")],
+    flow_job_id: Annotated[str, Field(description="Completed FLOW job ID")],
+    rule_ids: Annotated[list[str] | None, Field(description="Specific rule UUIDs to test. Omit to test all active rules.")] = None,
+) -> list | str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(portfolio_id, "portfolio_id"):
+        return err
+    if err := _validate_uuid(flow_job_id, "flow_job_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.fortest_rules(portfolio_id, flow_job_id, rule_ids)
+
+        base = result.get("base_strategy", {})
+        base_stats = base.get("summary_stats", {})
+
+        def _stats_row(stats, base_stats):
+            return {
+                "mean_return": stats.get("mean_return"),
+                "mean_sharpe": stats.get("mean_sharpe"),
+                "mean_max_drawdown": stats.get("mean_max_drawdown"),
+                "mean_volatility": stats.get("mean_volatility"),
+                "cvar_95": stats.get("cvar_95"),
+                "vs_base_return": round(stats.get("mean_return", 0) - base_stats.get("mean_return", 0), 4)
+                    if stats.get("mean_return") is not None else None,
+                "vs_base_sharpe": round(stats.get("mean_sharpe", 0) - base_stats.get("mean_sharpe", 0), 4)
+                    if stats.get("mean_sharpe") is not None else None,
+                "vs_base_drawdown": round(stats.get("mean_max_drawdown", 0) - base_stats.get("mean_max_drawdown", 0), 4)
+                    if stats.get("mean_max_drawdown") is not None else None,
+            }
+
+        # Combined strategy (all rules together — the actual strategy)
+        combined = result.get("combined_strategy")
+        combined_out = None
+        if combined:
+            combined_out = {
+                "rule_names": combined.get("rule_names"),
+                **_stats_row(combined.get("summary_stats", {}), base_stats),
+            }
+        elif result.get("combined_strategy_error"):
+            combined_out = {"error": result["combined_strategy_error"]}
+
+        # Individual rule attribution (each rule alone vs base)
+        attribution_rows = []
+        for r in result.get("rule_attribution", []):
+            if r.get("error"):
+                attribution_rows.append({"rule": r["rule_name"], "priority": r.get("priority"), "error": r["error"]})
+                continue
+            attribution_rows.append({
+                "rule": r["rule_name"],
+                "rule_id": r["rule_id"],
+                "priority": r.get("priority"),
+                **_stats_row(r.get("summary_stats", {}), base_stats),
+            })
+
+        out = {
+            "portfolio_id": portfolio_id,
+            "flow_job_id": flow_job_id,
+            "horizon_days": result.get("horizon_days"),
+            "n_rules": result.get("n_rules_tested"),
+            "base_strategy": _stats_row(base_stats, base_stats),
+            "combined_strategy": combined_out,
+            "rule_attribution": attribution_rows,
+            "tip": (
+                "combined_strategy shows performance with ALL rules applied together in priority order — "
+                "this is your actual strategy. rule_attribution shows each rule tested alone to identify "
+                "which rules help vs hurt. Negative vs_base_drawdown = less drawdown = better."
+            ),
+        }
+        warnings = result.get("warnings", [])
+        if warnings:
+            out["warnings"] = warnings
+        return _fmt(out)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
 @server.tool(
     name="get_flow_results",
     description=(
         "Get the full results of a completed Flow generation job (baseline or scenario). "
         "Returns per-asset summary statistics (mean return, percentiles, terminal values), "
         "percentile bands (P5/P25/P50/P75/P95 timeseries), and sample paths for downstream analysis. "
+        "Also returns price_history (dict of asset → list of historical prices before the paths start) "
+        "if the job was generated with price_history_length set — use this to seed indicator warmup in fortest_rules. "
         "Use check_flow_job first to verify the job is completed. "
         "For scenario jobs, also returns satisfaction_rate and constraint details. "
         "Use this to analyze simulation outputs, compare scenarios, or feed into custom analytics."
@@ -2732,7 +2871,7 @@ async def get_flow_results(
         description="Max sample paths to return per asset (default 10, max 50). More paths = more data for analysis.",
         default=10,
     )] = 10,
-) -> str:
+) -> list | str:
     if err := _require_auth():
         return err
     try:
@@ -2778,9 +2917,17 @@ async def get_flow_results(
             "n_paths": results.get("n_paths"),
             "per_asset": per_asset,
         }
+        if results.get("price_history"):
+            output["price_history"] = results["price_history"]
         if satisfaction_rate is not None:
             output["satisfaction_rate"] = satisfaction_rate
             output["constraints"] = results.get("constraints", [])
+        if results.get("scenario_probability") is not None:
+            output["scenario_probability"] = results["scenario_probability"]
+            output["scenario_probability_note"] = results.get("scenario_probability_note")
+        elif results.get("scenario_probability_note"):
+            # No baseline found — surface the warning
+            output["scenario_probability_note"] = results["scenario_probability_note"]
 
         try:
             chart_html = flow_fan_chart(summary, result_horizon, results.get("constraints"))
@@ -2869,6 +3016,181 @@ async def flow_validate(
         return str(e)
     except SablierAPIError as e:
         return _api_error(e)
+
+
+# ══════════════════════════════════════════════════
+# Derivatives Analysis
+# ══════════════════════════════════════════════════
+
+
+@server.tool(
+    name="analyze_derivatives",
+    description=(
+        "Run options risk analysis on FLOW-generated paths for a mixed futures + options portfolio. "
+        "Reprices each option at every timestep of every path using Black-76, then computes portfolio-level "
+        "risk metrics (VaR, CVaR, Sharpe, Sortino, max drawdown) and per-position Greeks (delta, gamma, vega, theta, rho). "
+        "Returns separate risk breakdowns for: combined portfolio, futures-only, and options-only components, "
+        "plus P&L timeseries percentile bands. "
+        "Requires a flow_job_id from generate_flow_paths or simulate_flow_scenario. "
+        "For scenario analysis: run simulate_flow_scenario first (e.g., 'VIX > 30 and crude drops 20%'), "
+        "then call this tool to see how your options hedge performs under that scenario."
+    ),
+    annotations=ToolAnnotations(title="Analyze Derivatives Risk", readOnlyHint=True, openWorldHint=True),
+)
+async def analyze_derivatives(
+    flow_job_id: Annotated[str, Field(
+        description="Flow generation job ID (from generate_flow_paths, generate_synthetic, or simulate_flow_scenario)"
+    )],
+    options_positions: Annotated[list[dict], Field(
+        description=(
+            "List of option positions. Each dict must have: "
+            "underlying (display_name of the futures, e.g. 'E-mini S&P 500 Futures'), "
+            "option_type ('call' or 'put'), strike (float), days_to_expiry (int), "
+            "quantity (int, negative for short), implied_vol (float, annualized e.g. 0.20). "
+            "Optional: entry_premium (float), multiplier (float, defaults to contract spec)."
+        )
+    )],
+    portfolio_id: Annotated[str | None, Field(
+        description="Portfolio UUID for underlying futures weights. Optional for standalone options analysis.",
+        default=None,
+    )] = None,
+    risk_free_rate: Annotated[float, Field(
+        description="Annualized risk-free rate (default 0.045 = 4.5%)",
+        default=0.045,
+    )] = 0.045,
+    capital: Annotated[float | None, Field(
+        description="Override portfolio capital. If None, uses portfolio's capital.",
+        default=None,
+    )] = None,
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(flow_job_id, "flow_job_id"):
+        return err
+    if portfolio_id:
+        if err := _validate_uuid(portfolio_id, "portfolio_id"):
+            return err
+
+    try:
+        client = get_client()
+        result = await client.analyze_derivatives(
+            flow_job_id=flow_job_id,
+            options_positions=options_positions,
+            portfolio_id=portfolio_id,
+            risk_free_rate=risk_free_rate,
+            capital=capital,
+        )
+
+        # Extract key metrics for compact output
+        portfolio = result.get("portfolio", {})
+        options_only = result.get("options_only", {})
+        positions = result.get("positions", [])
+        agg_greeks = result.get("aggregate_greeks", {})
+
+        output = {
+            "status": "completed",
+            "flow_job_id": flow_job_id,
+            "portfolio_id": portfolio_id,
+            "n_paths": result.get("n_paths"),
+            "horizon": result.get("horizon"),
+            "combined_portfolio": {
+                "expected_return": portfolio.get("expected_return"),
+                "volatility_ann": portfolio.get("volatility_ann"),
+                "sharpe_ratio": portfolio.get("sharpe_ratio"),
+                "sortino_ratio": portfolio.get("sortino_ratio"),
+                "var_95": portfolio.get("var_95"),
+                "cvar_95": portfolio.get("cvar_95"),
+                "max_drawdown_pct": portfolio.get("max_drawdown_pct"),
+                "profitability": portfolio.get("profitability"),
+                "terminal_pnl": portfolio.get("terminal_pnl"),
+            },
+            "options_only": {
+                "expected_return": options_only.get("expected_return"),
+                "var_95": options_only.get("var_95"),
+                "terminal_pnl": options_only.get("terminal_pnl"),
+            },
+            "aggregate_greeks": agg_greeks,
+            "per_position": [
+                {
+                    "position": p.get("position"),
+                    "greeks": p.get("greeks"),
+                    "terminal_payoff": p.get("terminal_payoff"),
+                }
+                for p in positions
+            ],
+        }
+
+        return _fmt(output)
+    except SablierAPIError as e:
+        return _api_error(e)
+    except Exception as e:
+        logger.error("analyze_derivatives failed: %s", e, exc_info=True)
+        return "Derivatives analysis failed unexpectedly. Please try again."
+
+
+@server.tool(
+    name="price_option",
+    description=(
+        "Price a single option on a futures contract using the Black-76 model. "
+        "Returns the option price, per-contract value (price × contract multiplier), "
+        "and analytical Greeks (delta, gamma, vega, theta, rho). "
+        "Supports all major futures: ES=F, NQ=F, CL=F, GC=F, SI=F, ZB=F, ZN=F, ZC=F, ZW=F, ZS=F, etc. "
+        "If a flow_job_id is provided, also computes an Esscher fair-value estimate from FLOW paths "
+        "(captures fat tails and vol clustering that Black-76 misses). "
+        "Use this for quick pricing checks; use analyze_derivatives for full portfolio risk."
+    ),
+    annotations=ToolAnnotations(title="Price Option", readOnlyHint=True),
+)
+async def price_option_tool(
+    underlying_ticker: Annotated[str, Field(
+        description="Ticker of the underlying futures (e.g. 'ES=F', 'CL=F', 'GC=F')"
+    )],
+    strike: Annotated[float, Field(
+        description="Option strike price"
+    )],
+    days_to_expiry: Annotated[int, Field(
+        description="Trading days until option expiration"
+    )],
+    option_type: Annotated[str, Field(
+        description="'call' or 'put'",
+        default="call",
+    )] = "call",
+    implied_vol: Annotated[float | None, Field(
+        description="Annualized implied volatility (e.g. 0.20 for 20%). If omitted, uses 20% default.",
+        default=None,
+    )] = None,
+    risk_free_rate: Annotated[float, Field(
+        description="Annualized risk-free rate (default 0.045 = 4.5%)",
+        default=0.045,
+    )] = 0.045,
+    flow_job_id: Annotated[str | None, Field(
+        description="Optional Flow job ID. If provided, also computes Esscher fair-value from FLOW paths.",
+        default=None,
+    )] = None,
+) -> str:
+    if err := _require_auth():
+        return err
+    if flow_job_id:
+        if err := _validate_uuid(flow_job_id, "flow_job_id"):
+            return err
+
+    try:
+        client = get_client()
+        result = await client.price_option(
+            underlying_ticker=underlying_ticker,
+            strike=strike,
+            days_to_expiry=days_to_expiry,
+            option_type=option_type,
+            implied_vol=implied_vol,
+            risk_free_rate=risk_free_rate,
+            flow_job_id=flow_job_id,
+        )
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+    except Exception as e:
+        logger.error("price_option failed: %s", e, exc_info=True)
+        return "Option pricing failed unexpectedly. Please try again."
 
 
 # ══════════════════════════════════════════════════
@@ -2985,8 +3307,8 @@ async def market_radar() -> str:
 @server.tool(
     name="whoami",
     description=(
-        "Get your account info: name, email, subscription tier, credit balance, and usage. "
-        "Useful to understand what you can do (credit limits, tier features) before running operations."
+        "Quick account summary: name, email, tier, credit balance, and billing period. "
+        "Use this first to orient yourself — single call covers identity and credit status."
     ),
     annotations=ToolAnnotations(title="Who Am I", readOnlyHint=True),
 )
@@ -3021,9 +3343,8 @@ async def whoami() -> str:
 @server.tool(
     name="get_credits",
     description=(
-        "Get your current credit balance: credits used, credits remaining, and overage status. "
-        "Credits are the unified currency — every operation costs credits based on its parameters. "
-        "Free: 100 one-time credits on signup (blocked at 0), Pro: 1000/mo (€0.50/credit overage monthly, €0.35/credit annual)."
+        "Credit balance details: used, remaining, purchased packs, and overage status. "
+        "Use whoami for a quick summary; use this when you need the full credit object."
     ),
     annotations=ToolAnnotations(title="Get Credits", readOnlyHint=True),
 )
@@ -3041,9 +3362,8 @@ async def get_credits() -> str:
 @server.tool(
     name="get_billing_info",
     description=(
-        "Get your current billing info: subscription tier, included limits, "
-        "overage rates, and usage for the current month. Use this to check "
-        "what operations are available and what they cost."
+        "Subscription plan details: tier limits, overage rates, and per-operation costs. "
+        "Use this to understand pricing before running expensive operations (not for credit balance — use whoami or get_credits)."
     ),
     annotations=ToolAnnotations(title="Get Billing Info", readOnlyHint=True),
 )
