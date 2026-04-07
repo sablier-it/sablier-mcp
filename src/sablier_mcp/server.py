@@ -602,6 +602,9 @@ async def create_derived_feature(
     if err := _require_auth():
         return err
     try:
+        if isinstance(parameters, str):
+            import json as _json
+            parameters = _json.loads(parameters)
         client = get_client()
         result = await client.create_derived_feature(
             name=name, base_feature=base_feature,
@@ -2990,6 +2993,8 @@ async def fortest_rules(
         "Get the full results of a completed Flow generation job (baseline or scenario). "
         "Returns per-asset summary statistics (mean return, percentiles, terminal values), "
         "percentile bands (P5/P25/P50/P75/P95 timeseries), and sample paths for downstream analysis. "
+        "Also returns price_history (dict of asset → list of historical prices before the paths start) "
+        "if the job was generated with price_history_length set — use this to seed indicator warmup in fortest_rules. "
         "Use check_flow_job first to verify the job is completed. "
         "For scenario jobs, also returns satisfaction_rate and constraint details. "
         "Use this to analyze simulation outputs, compare scenarios, or feed into custom analytics."
@@ -3048,6 +3053,8 @@ async def get_flow_results(
             "n_paths": results.get("n_paths"),
             "per_asset": per_asset,
         }
+        if results.get("price_history"):
+            output["price_history"] = results["price_history"]
         if satisfaction_rate is not None:
             output["satisfaction_rate"] = satisfaction_rate
             output["constraints"] = results.get("constraints", [])
