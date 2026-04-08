@@ -2675,7 +2675,10 @@ async def delete_flow_job(
         "  trigger={combinator:'all', conditions:[\n"
         "    {indicator:'raw', asset:'^VIX', params:{}, operator:'>', threshold:30},\n"
         "    {indicator:'rsi', asset:'CL=F', params:{period:14}, operator:'>', threshold:65}]}\n"
-        "  action={type:'scale_weight', asset:'CL=F', value:0.5}"
+        "  action={type:'scale_weight', asset:'CL=F', value:0.5}\n\n"
+        "IMPORTANT: Trigger assets can be portfolio assets OR conditioning factors (VIX, DXY, etc.). "
+        "For fortest_rules, the FLOW model must include ALL referenced features — missing features cause rules to silently fail. "
+        "For evaluate_rules (live data), any feature in training_data works with no model dependency."
     ),
     annotations=ToolAnnotations(title="Create Trading Rule"),
 )
@@ -2704,7 +2707,7 @@ async def create_rule(
             "is_active": is_active,
             "trigger": trigger,
             "action": action,
-            "message": f"Rule '{name}' created. Use fortest_rules to evaluate it on FLOW paths.",
+            "message": f"Rule '{name}' created. Use fortest_rules to test on FLOW paths, or evaluate_rules to check against live market data.",
         })
     except SablierAPIError as e:
         return _api_error(e)
@@ -2795,6 +2798,10 @@ async def delete_rule(
         "  1. Loads the FLOW price paths (same N paths for every evaluation — fair comparison)\n"
         "  2. Steps through each path day-by-day, applies rules in priority order, tracks P&L\n"
         "  3. Returns Sharpe, CVaR, max drawdown, return for combined strategy and each rule alone\n\n"
+        "IMPORTANT: The FLOW model must include paths for ALL features referenced in rule triggers "
+        "(both portfolio assets AND conditioning factors like VIX, DXY, etc.). Rules referencing features "
+        "not in the FLOW model will silently fail — check warnings in the response.\n"
+        "For checking rules against today's real market data (no FLOW dependency), use evaluate_rules instead.\n\n"
         "Prerequisites: (1) create rules with create_rule; "
         "(2) activate them with toggle_rule(is_active=True); "
         "(3) generate FLOW paths with generate_flow_paths or generate_synthetic.\n"
@@ -2877,6 +2884,64 @@ async def fortest_rules(
         if warnings:
             out["warnings"] = warnings
         return _fmt(out)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="evaluate_rules",
+    description=(
+        "Check which portfolio trading rules trigger on TODAY's real market data. "
+        "Unlike fortest_rules (which tests against simulated FLOW paths), this evaluates "
+        "rules against actual historical prices from training_data — no FLOW model needed.\n\n"
+        "Returns per-rule: triggered (bool), action prescribed, current indicator values. "
+        "Also returns recommended_weights (combined effect of all triggered rules) and weight_changes.\n\n"
+        "Data source: training_data (refreshed daily at 21:00 UTC after US market close). "
+        "On weekends/holidays, evaluates against the most recent trading day.\n\n"
+        "Use this for daily 'any rules fired?' monitoring. "
+        "For simulated forward-testing across 1000+ scenarios, use fortest_rules instead."
+    ),
+    annotations=ToolAnnotations(title="Evaluate Rules (Live Data)", readOnlyHint=True),
+)
+async def evaluate_rules(
+    portfolio_id: Annotated[str, Field(description="Portfolio UUID")],
+    rule_ids: Annotated[list[str] | None, Field(
+        description="Specific rule UUIDs to evaluate. Omit to evaluate all active rules.",
+        default=None,
+    )] = None,
+) -> list | str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(portfolio_id, "portfolio_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.evaluate_rules(portfolio_id, rule_ids)
+
+        rules = result.get("rules", [])
+        triggered = [r for r in rules if r.get("triggered")]
+        not_triggered = [r for r in rules if not r.get("triggered")]
+
+        output = {
+            "evaluation_date": result.get("evaluation_date"),
+            "n_rules_evaluated": len(rules),
+            "n_rules_triggered": len(triggered),
+            "triggered_rules": [{
+                "rule_name": r["rule_name"],
+                "rule_id": r["rule_id"],
+                "priority": r.get("priority"),
+                "action": r.get("action_prescribed"),
+                "indicator_values": r.get("indicator_values"),
+            } for r in triggered],
+            "not_triggered_rules": [r["rule_name"] for r in not_triggered],
+            "base_weights": result.get("base_weights"),
+            "recommended_weights": result.get("recommended_weights"),
+            "weight_changes": result.get("weight_changes"),
+        }
+        warnings = result.get("warnings", [])
+        if warnings:
+            output["warnings"] = warnings
+        return _fmt(output)
     except SablierAPIError as e:
         return _api_error(e)
 

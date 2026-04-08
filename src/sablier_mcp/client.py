@@ -1019,6 +1019,13 @@ class SablierClient:
             body["rule_ids"] = rule_ids
         return await self._post_long(f"/portfolios/{portfolio_id}/rules/fortest", json=body)
 
+    async def evaluate_rules(self, portfolio_id: str,
+                             rule_ids: list[str] | None = None) -> dict:
+        body: dict = {}
+        if rule_ids is not None:
+            body["rule_ids"] = rule_ids
+        return await self._post(f"/portfolios/{portfolio_id}/rules/evaluate", json=body)
+
     # ──────────────────────────────────────────────
     # Tests
     # ──────────────────────────────────────────────
