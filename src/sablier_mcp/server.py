@@ -2933,7 +2933,11 @@ async def evaluate_rules(
                 "action": r.get("action_prescribed"),
                 "indicator_values": r.get("indicator_values"),
             } for r in triggered],
-            "not_triggered_rules": [r["rule_name"] for r in not_triggered],
+            "not_triggered_rules": [{
+                "rule_name": r["rule_name"],
+                "rule_id": r["rule_id"],
+                "indicator_values": r.get("indicator_values"),
+            } for r in not_triggered],
             "base_weights": result.get("base_weights"),
             "recommended_weights": result.get("recommended_weights"),
             "weight_changes": result.get("weight_changes"),
