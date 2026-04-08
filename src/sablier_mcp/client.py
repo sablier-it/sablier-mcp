@@ -722,7 +722,7 @@ class SablierClient:
             body["horizon"] = horizon
         if price_history_length is not None:
             body["price_history_length"] = price_history_length
-        return await self._post("/flow/generate-paths", json=body)
+        return await self._post_long("/flow/generate-paths", json=body)
 
     async def flow_generate_constrained_paths(
         self,
@@ -744,7 +744,7 @@ class SablierClient:
             body["horizon"] = horizon
         if name is not None:
             body["name"] = name
-        return await self._post("/flow/generate-constrained-paths", json=body)
+        return await self._post_long("/flow/generate-constrained-paths", json=body)
 
     async def flow_get_results(self, job_id: str) -> dict:
         return await self._get(f"/flow/{job_id}/results")
@@ -1017,7 +1017,7 @@ class SablierClient:
         body: dict = {"flow_job_id": flow_job_id}
         if rule_ids is not None:
             body["rule_ids"] = rule_ids
-        return await self._post(f"/portfolios/{portfolio_id}/rules/fortest", json=body)
+        return await self._post_long(f"/portfolios/{portfolio_id}/rules/fortest", json=body)
 
     # ──────────────────────────────────────────────
     # Tests

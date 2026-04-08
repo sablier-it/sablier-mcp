@@ -216,12 +216,14 @@ def _portfolio_tickers(portfolio: dict) -> list[str]:
 def _build_per_asset_output(
     summary: dict,
     include_paths: bool = True,
+    summary_only: bool = False,
     baseline_summary: dict | None = None,
 ) -> dict:
     """Build per-asset output from backend summary, optionally including paths.
 
-    For target assets: includes percentile_bands + up to 10 sample paths.
-    For conditioning assets: includes only median_path.
+    summary_only=True: terminal statistics + percentile bands (no sample paths).
+      ~60% smaller than full output. Use download_flow_paths for raw path data.
+    include_paths=True (default): adds percentile_bands + sample paths for target assets.
     If baseline_summary is given, merges baseline scalar stats for comparison.
     """
     MAX_SAMPLE_PATHS = 10
@@ -256,12 +258,13 @@ def _build_per_asset_output(
                     for k in ("p5", "p25", "p50", "p75", "p95")
                     if k in ts
                 }
-                sample = ts.get("sample_paths") or []
-                if sample:
-                    # Subsample to MAX_SAMPLE_PATHS
-                    step = max(1, len(sample) // MAX_SAMPLE_PATHS)
-                    picked = sample[::step][:MAX_SAMPLE_PATHS]
-                    entry["sample_paths"] = [_maybe_downsample(p) for p in picked]
+                # Sample paths are the main output bloat — skip in summary_only mode
+                if not summary_only:
+                    sample = ts.get("sample_paths") or []
+                    if sample:
+                        step = max(1, len(sample) // MAX_SAMPLE_PATHS)
+                        picked = sample[::step][:MAX_SAMPLE_PATHS]
+                        entry["sample_paths"] = [_maybe_downsample(p) for p in picked]
             elif ts and not is_target:
                 p50 = ts.get("p50")
                 if p50:
@@ -301,15 +304,24 @@ def _flatten_betas(results: dict) -> dict:
         lb = data.get("linear_betas", {})
         alpha_dict = data.get("alpha", {}) or {}
         resid_dict = data.get("residual_std", {}) or {}
+        r2_dict = data.get("per_asset_r2", {}) or {}
 
         # Each model maps to one asset by display name
         for display_name, betas in lb.items():
-            assets[display_name] = {
+            asset_entry = {
                 "status": data.get("status"),
                 "linear_betas": betas if isinstance(betas, dict) else {},
                 "alpha": alpha_dict.get(display_name) if isinstance(alpha_dict, dict) else alpha_dict,
                 "residual_std": resid_dict.get(display_name) if isinstance(resid_dict, dict) else resid_dict,
             }
+            # Add per-asset R² (in-sample goodness-of-fit)
+            # r2_dict keys are target feature names (e.g. "AAPL_returns"), match by checking if display_name appears
+            for target_key, r2_vals in r2_dict.items():
+                asset_entry["r2"] = r2_vals.get("r2")
+                if r2_vals.get("gam_r2") is not None:
+                    asset_entry["gam_r2"] = r2_vals["gam_r2"]
+                break  # One target per model in batch mode
+            assets[display_name] = asset_entry
 
     # Convert parallel lists to dicts
     means_list = factor_stats.get("factor_means", [])
@@ -335,6 +347,14 @@ def _flatten_betas(results: dict) -> dict:
         "factor_means": factor_means,
         "factor_stds": factor_stds,
     }
+
+    # Rolling window used for beta estimation (trading days)
+    if results.get("rolling_window"):
+        out["rolling_window"] = results["rolling_window"]
+
+    # Per-factor data truncation: which factors had stale data and truncated the window
+    if results.get("data_truncated_by"):
+        out["data_truncated_by"] = results["data_truncated_by"]
 
     # Warn when factor data is stale — one stale feature truncates the entire beta window
     if factor_last_date_str:
@@ -1400,7 +1420,10 @@ async def list_simulations(
         "Use this when you already have a trained model_group_id (from analyze_quantitative or list_model_groups) "
         "and want to refresh betas with a different lookback window, or get a new simulation_batch_id. "
         "You do NOT need this if you just ran analyze_quantitative — it already includes this step. "
-        "Returns per-asset factor exposures, simulation_batch_id (for simulate_returns), and factor_last_values_raw."
+        "Returns per-asset factor exposures with R² (goodness-of-fit), rolling_window used, factor_last_date "
+        "(effective beta date), data_truncated_by (stale factors), and simulation_batch_id (for simulate_returns). "
+        "Key use: call with different lookback_days (e.g. 63, 126, 252) to compare betas across time horizons — "
+        "divergence signals regime changes. Check R² to gauge how well factors explain each asset."
     ),
     annotations=ToolAnnotations(title="Simulate Betas", readOnlyHint=True, openWorldHint=True),
 )
@@ -1694,7 +1717,11 @@ async def delete_scenario(
         "Uses a two-layer architecture: thematic factors (conditioning_set_id) + optional baseline factors "
         "(baseline_mode='us' absorbs market/value/growth variance via real-time ETF proxies before thematic factors). "
         "Pass either portfolio_id or tickers directly (auto-creates portfolio with equal weights). "
-        "Returns: factor exposures (betas), simulation_batch_id, and factor_last_values_raw. "
+        "Returns: factor exposures (betas), per-asset R² (in-sample goodness-of-fit — tells you how linear the relationship "
+        "actually is for the given window), rolling_window used, factor_last_date (effective beta date — may be truncated "
+        "if a factor has stale data), and data_truncated_by (which factors caused truncation). "
+        "Tip: vary rolling_window (e.g. 63 vs 126 vs 252) to detect regime changes — diverging betas across windows "
+        "signal non-stationarity. Low R² suggests nonlinear dynamics or missing factors. "
         "Next step: call simulate_returns with the simulation_batch_id to run what-if stress tests."
     ),
     annotations=ToolAnnotations(title="Analyze Quantitative", destructiveHint=True, openWorldHint=True),
@@ -2127,7 +2154,10 @@ async def check_flow_job(
                     f"to produce simulated price trajectories."
                 )
             elif job_type == "validate":
-                output["next_steps"] = "Validation complete. R² is available in the beta matrix."
+                output["next_steps"] = (
+                    f"Validation complete! Call get_flow_results(job_id='{job_id}', job_type='validate') "
+                    f"to see quality badge, pass rate, and per-feature metrics (Wasserstein, KS, coverage)."
+                )
             else:
                 mgid = result.get("model_group_id", "")
                 output["next_steps"] = (
@@ -2854,21 +2884,31 @@ async def fortest_rules(
 @server.tool(
     name="get_flow_results",
     description=(
-        "Get the full results of a completed Flow generation job (baseline or scenario). "
-        "Returns per-asset summary statistics (mean return, percentiles, terminal values), "
-        "percentile bands (P5/P25/P50/P75/P95 timeseries), and sample paths for downstream analysis. "
-        "Also returns price_history (dict of asset → list of historical prices before the paths start) "
-        "if the job was generated with price_history_length set — use this to seed indicator warmup in fortest_rules. "
-        "Use check_flow_job first to verify the job is completed. "
-        "For scenario jobs, also returns satisfaction_rate and constraint details. "
-        "Use this to analyze simulation outputs, compare scenarios, or feed into custom analytics."
+        "Get results of a completed Flow job (generation or validation). "
+        "For generation jobs (default): returns per-asset terminal statistics, "
+        "percentile bands (P5–P95 timeseries), sample paths, and price_history for indicator warmup. "
+        "Set summary_only=true to keep stats + bands but drop sample paths (~60%% smaller). "
+        "Use download_flow_paths to get full raw path data as CSV. "
+        "For scenario jobs: also returns satisfaction_rate and constraint details. "
+        "For validation jobs (job_type='validate'): returns quality badge, pass_rate, and per-feature metrics "
+        "(Wasserstein distance, KS tests, coverage, marginal checks). "
+        "Use check_flow_job first to verify the job is completed."
     ),
     annotations=ToolAnnotations(title="Get Flow Results", readOnlyHint=True),
 )
 async def get_flow_results(
-    job_id: Annotated[str, Field(description="Job ID from generate_flow_paths or simulate_flow_scenario")],
+    job_id: Annotated[str, Field(description="Job ID from generate_flow_paths, simulate_flow_scenario, or flow_validate")],
+    job_type: Annotated[str, Field(
+        description="Type of job: 'generate' (default) for path generation, or 'validate' for validation results.",
+        default="generate",
+    )] = "generate",
+    summary_only: Annotated[bool, Field(
+        description="If true, return terminal stats + percentile bands but skip individual sample paths. "
+        "~60%% smaller output. Use download_flow_paths to get full raw path data separately.",
+        default=False,
+    )] = False,
     max_sample_paths: Annotated[int, Field(
-        description="Max sample paths to return per asset (default 10, max 50). More paths = more data for analysis.",
+        description="Max sample paths to return per asset (default 10, max 50). Ignored if summary_only=true.",
         default=10,
     )] = 10,
 ) -> list | str:
@@ -2876,6 +2916,26 @@ async def get_flow_results(
         return err
     try:
         client = get_client()
+
+        # Validation jobs use a different endpoint and return different data
+        if job_type == "validate":
+            results = await client.flow_validate_results(job_id)
+            status = results.get("status", "unknown")
+            if status != "completed":
+                return _fmt({"error": f"Validation not completed (status: {status}). Use check_flow_job(job_id='{job_id}', job_type='validate') to monitor."})
+            output = {
+                "job_id": job_id,
+                "model_group_id": results.get("model_group_id", ""),
+                "status": "completed",
+                "quality": results.get("quality"),
+                "pass_rate": results.get("pass_rate"),
+                "n_paths": results.get("n_paths"),
+                "horizon": results.get("horizon"),
+                "feature_names": results.get("feature_names"),
+                "metrics": results.get("metrics"),
+            }
+            return _fmt(output)
+
         results = await client.flow_get_results(job_id)
         status = results.get("status", "unknown")
         if status != "completed":
@@ -2890,10 +2950,11 @@ async def get_flow_results(
         # Build per-asset output with configurable sample path count
         max_paths = min(max(1, max_sample_paths), 50)
         per_asset = _build_per_asset_output(
-            summary, include_paths=True, baseline_summary=baseline_summary,
+            summary, include_paths=True, summary_only=summary_only,
+            baseline_summary=baseline_summary,
         )
         # Adjust sample path count if requested beyond default 10
-        if max_paths != 10:
+        if max_paths != 10 and not summary_only:
             MAX_TS_POINTS = 60
             for name, data in summary.items():
                 if not isinstance(data, dict) or data.get("feature_type") != "target":
