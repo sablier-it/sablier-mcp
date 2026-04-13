@@ -2351,13 +2351,15 @@ async def simulate_flow_scenario(
     )],
     constraints: Annotated[list[dict], Field(
         description=(
-            "List of constraints. Each: "
-            "{'feature_name': 'Equity Volatility (VIX)', 'type': 'level', 'lower': 30, 'upper': null, 't_start': 10, 't_end': 25}. "
-            "Types: 'level' (absolute price bounds), 'return' (per-step return bounds). "
-            "feature_name must be from the training output's feature_names list. "
-            "ALWAYS set t_start/t_end to window the constraint. "
-            "Set t_start based on both duration AND current value: if the feature is far from the threshold today, "
-            "t_start must be large enough for a realistic transition (larger gap = later t_start)."
+            "List of constraints. Each MUST have 'lower' and/or 'upper' (NOT 'threshold'). "
+            "Required keys: feature_name, lower and/or upper. Optional: type, t_start, t_end. "
+            "Example: {'feature_name': 'Equity Volatility (VIX)', 'lower': 30, 't_start': 10, 't_end': 25} "
+            "(VIX > 30 from day 10 to 25). "
+            "For upper bound: {'feature_name': 'Apple Inc.', 'upper': 200, 't_start': 5, 't_end': 40} "
+            "(AAPL < 200). "
+            "Types: 'level' (default, absolute price) or 'return'. "
+            "feature_name must be DISPLAY NAME from feature_names (not ticker). "
+            "ALWAYS set t_start/t_end to window the constraint realistically."
         )
     )],
     portfolio_id: Annotated[str | None, Field(
