@@ -616,7 +616,7 @@ async def refresh_feature_data(
 )
 async def list_portfolios(
     limit: Annotated[int, Field(description="Max portfolios to return", default=100)] = 100,
-) -> list:
+) -> list | str:
     if err := _require_auth():
         return err
     try:
@@ -3069,34 +3069,6 @@ async def get_flow_results(
             logger.warning("Fan chart generation failed, returning text-only", exc_info=True)
 
         return _fmt(output)
-    except SablierAPIError as e:
-        return _api_error(e)
-
-
-@server.tool(
-    name="list_flow_baselines",
-    description=(
-        "List all completed baseline (unconstrained) simulations for a Flow model. "
-        "Returns job_id, n_paths, horizon, and created_at for each baseline. "
-        "Use get_flow_results(job_id) to fetch full data for any baseline. "
-        "Baselines are the reference distribution — compare scenarios against them."
-    ),
-    annotations=ToolAnnotations(title="List Flow Baselines", readOnlyHint=True),
-)
-async def list_flow_baselines(
-    model_group_id: Annotated[str, Field(description="UUID of the Flow model")],
-) -> str:
-    if err := _require_auth():
-        return err
-    if err := _validate_uuid(model_group_id, "model_group_id"):
-        return err
-    try:
-        client = get_client()
-        result = await client.flow_list_baselines(model_group_id)
-        baselines = result.get("baselines", [])
-        if not baselines:
-            return _fmt({"baselines": [], "message": "No baselines yet. Use generate_flow_paths to create one."})
-        return _fmt({"baselines": baselines, "count": len(baselines)})
     except SablierAPIError as e:
         return _api_error(e)
 
