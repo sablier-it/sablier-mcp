@@ -508,18 +508,18 @@ class SablierClient:
         }
         if historical_lookback_days is not None:
             body["historical_lookback_days"] = historical_lookback_days
-        return await self._post_long("/moment/simulate-betas/batch", json=body)
+        return await self._post_long("/moment/compute-betas/batch", json=body)
 
     async def get_betas_batch_results(self, simulation_batch_id: str) -> dict:
         return await self._get(
-            f"/moment/simulate-betas/batch/{simulation_batch_id}/results"
+            f"/moment/compute-betas/batch/{simulation_batch_id}/results"
         )
 
     async def portfolio_test(
         self, simulation_batch_id: str, weights: dict[str, float]
     ) -> dict:
         return await self._post(
-            f"/moment/simulate-betas/batch/{simulation_batch_id}/portfolio-test",
+            f"/moment/compute-betas/batch/{simulation_batch_id}/portfolio-test",
             json={"weights": weights},
         )
 
@@ -535,7 +535,7 @@ class SablierClient:
     ) -> dict:
         """Sample returns under stressed factor values. Synchronous."""
         return await self._post_long(
-            "/moment/simulate-returns/batch",
+            "/moment/compute-returns/batch",
             json={
                 "simulation_batch_id": simulation_batch_id,
                 "factors": factors,
@@ -546,7 +546,7 @@ class SablierClient:
 
     async def get_returns_batch_results(self, returns_batch_id: str) -> dict:
         return await self._get(
-            f"/moment/simulate-returns/batch/{returns_batch_id}/results"
+            f"/moment/compute-returns/batch/{returns_batch_id}/results"
         )
 
     # ──────────────────────────────────────────────
