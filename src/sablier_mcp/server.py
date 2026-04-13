@@ -785,7 +785,7 @@ async def get_portfolio_value(
 
 @server.tool(
     name="get_portfolio_analytics",
-    description="Get historical portfolio analytics: Sharpe ratio, volatility, expected return, max drawdown, and market beta (benchmarked vs SPY). Supports timeframes: 1W, 1M, 1Y, 2Y, 5Y. This is backward-looking — for forward-looking risk, use simulate_returns or test_flow_risk.",
+    description="Get historical portfolio analytics: Sharpe ratio, volatility, expected return, max drawdown, and market beta (benchmarked vs SPY). Supports timeframes: 1W, 1M, 1Y, 2Y, 5Y. This is backward-looking — for forward-looking risk, use compute_returns or test_flow_risk.",
     annotations=ToolAnnotations(title="Get Portfolio Analytics", readOnlyHint=True),
 )
 async def get_portfolio_analytics(
@@ -847,7 +847,7 @@ async def delete_portfolio(
 @server.tool(
     name="optimize_portfolio",
     description=(
-        "Find optimal portfolio weights using per-asset factor exposures from simulate_betas or analyze_quantitative. "
+        "Find optimal portfolio weights using per-asset factor exposures from compute_betas or analyze_quantitative. "
         "Requires simulation_batch_id (from their output). "
         "Objectives: 'max_sharpe' (maximize risk-adjusted return), 'min_variance' (minimize portfolio volatility), "
         "'max_return' (maximize expected return for given risk). "
@@ -861,7 +861,7 @@ async def delete_portfolio(
 )
 async def optimize_portfolio(
     portfolio_id: Annotated[str, Field(description="The portfolio UUID")],
-    simulation_batch_id: Annotated[str, Field(description="From simulate_betas or analyze_quantitative")],
+    simulation_batch_id: Annotated[str, Field(description="From compute_betas or analyze_quantitative")],
     objective: Annotated[str, Field(description="Optimization objective: 'max_sharpe' (default), 'min_variance', 'max_return', 'analytical_risk_parity' (equal risk contributions), 'expected_utility' (CRRA), 'risk_parity' (CVaR-based), 'mean_cvar' (minimize CVaR)", default="max_sharpe")] = "max_sharpe",
 ) -> str:
     if err := _require_auth():
@@ -1181,7 +1181,7 @@ async def delete_grain_analysis(
 
 @server.tool(
     name="list_model_groups",
-    description="List all model groups (each created by analyze_quantitative or generate_synthetic). A model group ties a portfolio to a conditioning set and contains per-asset models. Check model_type: null/absent = Moment (linear), 'flow_generative' = Flow. Use this to find model_group_ids for simulate_betas, simulate_returns, or generate_synthetic (resume).",
+    description="List all model groups (each created by analyze_quantitative or train_and_generate). A model group ties a portfolio to a conditioning set and contains per-asset models. Check model_type: null/absent = Moment (linear), 'flow_generative' = Flow. Use this to find model_group_ids for compute_betas, compute_returns, or train_and_generate (resume).",
     annotations=ToolAnnotations(title="List Model Groups", readOnlyHint=True),
 )
 async def list_model_groups() -> str:
@@ -1393,7 +1393,7 @@ async def get_residual_correlation(
 
 @server.tool(
     name="list_simulations",
-    description="List past beta computation runs for a Moment model group. Each entry is a simulate_betas invocation with its simulation_batch_id, date, and status. Use this to find older simulation_batch_ids for simulate_returns. NOT for Flow models — use list_flow_scenarios for those.",
+    description="List past beta computation runs for a Moment model group. Each entry is a compute_betas invocation with its simulation_batch_id, date, and status. Use this to find older simulation_batch_ids for compute_returns. NOT for Flow models — use list_flow_scenarios for those.",
     annotations=ToolAnnotations(title="List Simulations", readOnlyHint=True),
 )
 async def list_simulations(
@@ -1414,20 +1414,20 @@ async def list_simulations(
 
 
 @server.tool(
-    name="simulate_betas",
+    name="compute_betas",
     description=(
-        "Re-compute factor exposures (betas) for an already-trained model group. "
+        "Compute factor exposures (betas) for an already-trained model group. "
         "Use this when you already have a trained model_group_id (from analyze_quantitative or list_model_groups) "
         "and want to refresh betas with a different lookback window, or get a new simulation_batch_id. "
         "You do NOT need this if you just ran analyze_quantitative — it already includes this step. "
         "Returns per-asset factor exposures with R² (goodness-of-fit), rolling_window used, factor_last_date "
-        "(effective beta date), data_truncated_by (stale factors), and simulation_batch_id (for simulate_returns). "
+        "(effective beta date), data_truncated_by (stale factors), and simulation_batch_id (for compute_returns). "
         "Key use: call with different lookback_days (e.g. 63, 126, 252) to compare betas across time horizons — "
         "divergence signals regime changes. Check R² to gauge how well factors explain each asset."
     ),
-    annotations=ToolAnnotations(title="Simulate Betas", readOnlyHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(title="Compute Betas", readOnlyHint=True, openWorldHint=True),
 )
-async def simulate_betas(
+async def compute_betas(
     model_group_id: Annotated[str, Field(description="UUID of the trained model group (from analyze_quantitative or list_model_groups)")],
     lookback_days: Annotated[int | None, Field(description="Historical lookback window in trading days", default=None)] = None,
 ) -> list | str:
@@ -1438,13 +1438,13 @@ async def simulate_betas(
     try:
         client = get_client()
         # Synchronous — Moment returns results directly
-        results = await client.simulate_betas_batch(
+        results = await client.compute_betas_batch(
             model_group_id=model_group_id,
             historical_lookback_days=lookback_days,
         )
         sim_batch_id = results.get("simulation_batch_id")
         if not sim_batch_id:
-            return "Error: betas simulation did not return a simulation_batch_id."
+            return "Error: betas computation did not return a simulation_batch_id."
 
         flat = _flatten_betas(results)
         summary = {
@@ -1465,23 +1465,23 @@ async def simulate_betas(
 
 
 @server.tool(
-    name="simulate_returns",
+    name="compute_returns",
     description=(
         "Run an ad-hoc what-if stress test on a Moment (linear) model — the PRIMARY tool for quick scenario analysis. "
-        "Requires simulation_batch_id from analyze_quantitative or simulate_betas. "
+        "Requires simulation_batch_id from analyze_quantitative or compute_betas. "
         "Pass ALL conditioning_features as absolute price levels in the factors dict. "
         "BEFORE calling: read factor_last_values_raw from the betas output — these are today's values. "
         "Always state current vs stressed levels explicitly (e.g. 'Oil is at $82 today, stressing to $120'). "
         "Also check data_freshness_warning in betas output — if present, betas may be stale. "
         "Use factor_last_values_raw as baseline, then compute targets "
         "(e.g. oil currently 82, stress to 120: pass {'Crude Oil': 120.0}). "
-        "For saved/reusable scenarios, use create_scenario + run_scenario instead. "
+        "For saved/reusable scenarios, use create_scenario then compute_returns with the factor values. "
         "For Flow (generative) models, use simulate_flow_scenario instead."
     ),
-    annotations=ToolAnnotations(title="Simulate Returns", readOnlyHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(title="Compute Returns", readOnlyHint=True, openWorldHint=True),
 )
-async def simulate_returns(
-    simulation_batch_id: Annotated[str, Field(description="From analyze_quantitative or simulate_betas results")],
+async def compute_returns(
+    simulation_batch_id: Annotated[str, Field(description="From analyze_quantitative or compute_betas results")],
     factors: Annotated[dict[str, float], Field(
         description=(
             "Absolute target price levels for each factor. "
@@ -1499,7 +1499,7 @@ async def simulate_returns(
     try:
         client = get_client()
         # Synchronous — Moment returns results directly
-        results = await client.simulate_returns_batch(
+        results = await client.compute_returns_batch(
             simulation_batch_id=simulation_batch_id,
             factors=factors,
             n_samples=n_samples,
@@ -1547,8 +1547,8 @@ async def simulate_returns(
 @server.tool(
     name="create_scenario",
     description=(
-        "Save a named Moment scenario template for later reuse with run_scenario. "
-        "This does NOT run a simulation — use run_scenario to execute it, or simulate_returns for ad-hoc tests. "
+        "Save a named Moment scenario template for later reuse. "
+        "This does NOT run a simulation — use compute_returns with the factor values instead, or for ad-hoc tests. "
         "IMPORTANT: requires model_id — this is an individual per-asset model UUID from list_model_groups → models[].model_id, "
         "NOT the model_group_id. Each scenario is tied to one asset's model. "
         "Factor spec format: {'VIX': {'type': 'fixed', 'value': 35}}. "
@@ -1560,7 +1560,7 @@ async def create_scenario(
     model_id: Annotated[str, Field(description="UUID of the model this scenario applies to")],
     name: Annotated[str, Field(description="Scenario name (e.g. 'Recession', 'Tech Bubble')")],
     factor_values: Annotated[dict[str, dict], Field(description="Factor specs (e.g. {'VIX': {'type': 'fixed', 'value': 35}})")],
-    model_group_id: Annotated[str | None, Field(description="Model group UUID (required to run_scenario later)", default=None)] = None,
+    model_group_id: Annotated[str | None, Field(description="Model group UUID (optional, for reference)", default=None)] = None,
     description: Annotated[str, Field(description="Optional description", default="")] = "",
 ) -> str:
     if err := _require_auth():
@@ -1583,7 +1583,7 @@ async def create_scenario(
             "id": result["id"],
             "name": result["name"],
             "specs": result.get("specs"),
-            "message": "Scenario created. Use simulate_returns with the factor values to sample returns.",
+            "message": "Scenario created. Use compute_returns with the factor values to sample returns.",
         })
     except SablierAPIError as e:
         return _api_error(e)
@@ -1594,7 +1594,7 @@ async def create_scenario(
     description=(
         "List saved Moment scenario templates (created via create_scenario or clone_scenario). "
         "These are stored factor specs tied to individual model_ids — "
-        "to execute one, use run_scenario. For ad-hoc tests, use simulate_returns directly. "
+        "to execute one, use compute_returns with the factor values. For ad-hoc tests, use compute_returns directly. "
         "NOT for Flow scenarios — use list_flow_scenarios for those."
     ),
     annotations=ToolAnnotations(title="List Scenarios", readOnlyHint=True),
@@ -1722,7 +1722,7 @@ async def delete_scenario(
         "if a factor has stale data), and data_truncated_by (which factors caused truncation). "
         "Tip: vary rolling_window (e.g. 63 vs 126 vs 252) to detect regime changes — diverging betas across windows "
         "signal non-stationarity. Low R² suggests nonlinear dynamics or missing factors. "
-        "Next step: call simulate_returns with the simulation_batch_id to run what-if stress tests."
+        "Next step: call compute_returns with the simulation_batch_id to run what-if stress tests."
     ),
     annotations=ToolAnnotations(title="Analyze Quantitative", destructiveHint=True, openWorldHint=True),
 )
@@ -1790,17 +1790,17 @@ async def analyze_quantitative(
                 "details": train_result.get("results", []),
             })
 
-        # Step 3: Simulate betas (synchronous — Moment returns results directly)
-        results = await _retry_api_call(lambda: client.simulate_betas_batch(
+        # Step 3: Compute betas (synchronous — Moment returns results directly)
+        results = await _retry_api_call(lambda: client.compute_betas_batch(
             model_group_id=model_group_id,
         ))
         sim_batch_id = results.get("simulation_batch_id")
         if not sim_batch_id:
-            return "Error: betas simulation did not return a simulation_batch_id."
+            return "Error: betas computation did not return a simulation_batch_id."
 
         if not results.get("all_completed"):
             return _fmt({
-                "error": "Simulation did not complete.",
+                "error": "Computation did not complete.",
                 "model_group_id": model_group_id,
                 "simulation_batch_id": sim_batch_id,
             })
@@ -1815,7 +1815,7 @@ async def analyze_quantitative(
             "models_created": total_created,
             **flat,
             "next_steps": (
-                "To run a what-if scenario, call simulate_returns with simulation_batch_id "
+                "To run a what-if scenario, call compute_returns with simulation_batch_id "
                 f"and a factors dict containing ALL of these at your desired levels: "
                 f"{', '.join(flat.get('conditioning_features', []))}. "
                 "Use factor_last_values_raw above as current baseline values. "
@@ -2226,7 +2226,7 @@ async def generate_flow_paths(
         default=1000,
     )] = 1000,
     price_history_length: Annotated[int | None, Field(
-        description="Days of historical prices to include before the paths start. Defaults to horizon. Set higher (e.g. 120) to warm up indicators like MACD or z-score before fortest_rules.",
+        description="Days of historical prices to include before the paths start. Defaults to horizon. Set higher (e.g. 120) to warm up indicators like MACD or z-score before forward_test_rules.",
         default=None,
     )] = None,
 ) -> list | str:
@@ -2245,7 +2245,7 @@ async def generate_flow_paths(
 
 
 @server.tool(
-    name="generate_synthetic",
+    name="train_and_generate",
     description=(
         "Train a Flow model AND generate paths in one call. "
         "Convenience wrapper: equivalent to train_flow_model then generate_flow_paths. "
@@ -2254,9 +2254,9 @@ async def generate_flow_paths(
         "then tell the user to wait and check back. Do NOT poll automatically. "
         "(2) RESUME: pass model_group_id to retrieve existing results or generate new paths without retraining."
     ),
-    annotations=ToolAnnotations(title="Generate Synthetic Paths", destructiveHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(title="Train & Generate Paths", destructiveHint=True, openWorldHint=True),
 )
-async def generate_synthetic(
+async def train_and_generate(
     conditioning_set_id: Annotated[str | None, Field(
         description="UUID of the conditioning set. Required for new runs.",
         default=None,
@@ -2280,7 +2280,7 @@ async def generate_synthetic(
     horizon: Annotated[int, Field(description="Forecast horizon in trading days. Default 60.", default=60)] = 60,
     n_paths: Annotated[int, Field(description="Number of paths to generate. Default 1000.", default=1000)] = 1000,
     price_history_length: Annotated[int | None, Field(
-        description="Days of historical prices to include before the paths start. Defaults to horizon. Set higher (e.g. 120) to warm up indicators like MACD or z-score before fortest_rules.",
+        description="Days of historical prices to include before the paths start. Defaults to horizon. Set higher (e.g. 120) to warm up indicators like MACD or z-score before forward_test_rules.",
         default=None,
     )] = None,
 ) -> list | str:
@@ -2311,7 +2311,7 @@ async def generate_synthetic(
     except SablierAPIError as e:
         return _api_error(e)
     except Exception as e:
-        logger.error("generate_synthetic failed: %s", e, exc_info=True)
+        logger.error("train_and_generate failed: %s", e, exc_info=True)
         return "Flow analysis failed unexpectedly. Please try again."
 
 
@@ -2347,7 +2347,7 @@ async def generate_synthetic(
 )
 async def simulate_flow_scenario(
     model_group_id: Annotated[str, Field(
-        description="UUID of the model group with a trained Flow model (from train_flow_model or generate_synthetic)"
+        description="UUID of the model group with a trained Flow model (from train_flow_model or train_and_generate)"
     )],
     constraints: Annotated[list[dict], Field(
         description=(
@@ -2363,7 +2363,7 @@ async def simulate_flow_scenario(
         )
     )],
     portfolio_id: Annotated[str | None, Field(
-        description="UUID of the portfolio (from train_flow_model or generate_synthetic). Pass it through so test_flow_risk can be called directly on the results.",
+        description="UUID of the portfolio (from train_flow_model or train_and_generate). Pass it through so test_flow_risk can be called directly on the results.",
         default=None,
     )] = None,
     n_paths: Annotated[int, Field(
@@ -2420,7 +2420,7 @@ async def simulate_flow_scenario(
         if not job_id:
             return "Error: Constrained generation did not return a job_id."
 
-        pid_str = f"'{portfolio_id}'" if portfolio_id else "'<from generate_synthetic>'"
+        pid_str = f"'{portfolio_id}'" if portfolio_id else "'<from train_and_generate>'"
         output: dict = {
             "status": "generating",
             "model_group_id": model_group_id,
@@ -2457,7 +2457,7 @@ async def simulate_flow_scenario(
         "Run portfolio risk analytics on Flow-generated paths (FUTURES/EQUITIES ONLY — no options). "
         "Computes expected return, volatility, Sharpe ratio, Sortino ratio, Calmar ratio, "
         "VaR 95%, CVaR 95%, max drawdown, profitability rate, and return distribution percentiles. "
-        "Requires portfolio_id and flow_job_id from generate_flow_paths, generate_synthetic, or simulate_flow_scenario. "
+        "Requires portfolio_id and flow_job_id from generate_flow_paths, train_and_generate, or simulate_flow_scenario. "
         "If the user has OPTIONS positions, use analyze_derivatives instead — it reprices options "
         "on every path using Black-76 and shows combined futures+options risk. "
         "TIP: Call this on multiple flow_job_ids (baseline + different scenarios) to build a "
@@ -2467,10 +2467,10 @@ async def simulate_flow_scenario(
 )
 async def test_flow_risk(
     portfolio_id: Annotated[str, Field(
-        description="UUID of the portfolio (from generate_flow_paths, generate_synthetic, or list_portfolios)"
+        description="UUID of the portfolio (from generate_flow_paths, train_and_generate, or list_portfolios)"
     )],
     flow_job_id: Annotated[str, Field(
-        description="Flow generation job ID (from generate_flow_paths, generate_synthetic, or simulate_flow_scenario)"
+        description="Flow generation job ID (from generate_flow_paths, train_and_generate, or simulate_flow_scenario)"
     )],
 ) -> list | str:
     if err := _require_auth():
@@ -2538,7 +2538,7 @@ async def test_flow_risk(
 )
 async def list_flow_scenarios(
     model_group_id: Annotated[str, Field(
-        description="UUID of the Flow model group (from train_flow_model, generate_synthetic, or list_model_groups)"
+        description="UUID of the Flow model group (from train_flow_model, train_and_generate, or list_model_groups)"
     )],
 ) -> str:
     if err := _require_auth():
@@ -2649,7 +2649,7 @@ async def delete_flow_job(
     name="create_rule",
     description=(
         "Add a systematic trading rule to a portfolio. Rules are evaluated day-by-day on FLOW "
-        "forward paths during fortest_rules — not backtested on history.\n\n"
+        "forward paths during forward_test_rules — not backtested on history.\n\n"
         "TWO RULE TYPES:\n"
         "  • Signal rules  (action.type='signal_weight') — continuous indicator → proportional position. For CTAs and trend-followers.\n"
         "  • Binary rules  (all other action types) — trigger fires → discrete weight change. For risk overlays, hard stops, regime gates.\n\n"
@@ -2679,7 +2679,7 @@ async def delete_flow_job(
         "    {indicator:'rsi', asset:'CL=F', params:{period:14}, operator:'>', threshold:65}]}\n"
         "  action={type:'scale_weight', asset:'CL=F', value:0.5}\n\n"
         "IMPORTANT: Trigger assets can be portfolio assets OR conditioning factors (VIX, DXY, etc.). "
-        "For fortest_rules, the FLOW model must include ALL referenced features — missing features cause rules to silently fail. "
+        "For forward_test_rules, the FLOW model must include ALL referenced features — missing features cause rules to silently fail. "
         "For evaluate_rules (live data), any feature in training_data works with no model dependency."
     ),
     annotations=ToolAnnotations(title="Create Trading Rule"),
@@ -2709,7 +2709,7 @@ async def create_rule(
             "is_active": is_active,
             "trigger": trigger,
             "action": action,
-            "message": f"Rule '{name}' created. Use fortest_rules to test on FLOW paths, or evaluate_rules to check against live market data.",
+            "message": f"Rule '{name}' created. Use forward_test_rules to test on FLOW paths, or evaluate_rules to check against live market data.",
         })
     except SablierAPIError as e:
         return _api_error(e)
@@ -2750,7 +2750,7 @@ async def list_rules(
 
 @server.tool(
     name="toggle_rule",
-    description="Activate or deactivate a systematic trading rule. Only active rules are included in fortest_rules by default.",
+    description="Activate or deactivate a systematic trading rule. Only active rules are included in forward_test_rules by default.",
     annotations=ToolAnnotations(title="Toggle Trading Rule"),
 )
 async def toggle_rule(
@@ -2789,7 +2789,7 @@ async def delete_rule(
 
 
 @server.tool(
-    name="fortest_rules",
+    name="forward_test_rules",
     description=(
         "Forward-test systematic trading rules against FLOW-generated price paths. "
         "Returns TWO levels of output:\n"
@@ -2806,12 +2806,12 @@ async def delete_rule(
         "For checking rules against today's real market data (no FLOW dependency), use evaluate_rules instead.\n\n"
         "Prerequisites: (1) create rules with create_rule; "
         "(2) activate them with toggle_rule(is_active=True); "
-        "(3) generate FLOW paths with generate_flow_paths or generate_synthetic.\n"
+        "(3) generate FLOW paths with generate_flow_paths or train_and_generate.\n"
         "If rule_ids is omitted, tests all active rules."
     ),
     annotations=ToolAnnotations(title="Forward-Test Trading Rules"),
 )
-async def fortest_rules(
+async def forward_test_rules(
     portfolio_id: Annotated[str, Field(description="Portfolio UUID")],
     flow_job_id: Annotated[str, Field(description="Completed FLOW job ID")],
     rule_ids: Annotated[list[str] | None, Field(description="Specific rule UUIDs to test. Omit to test all active rules.")] = None,
@@ -2824,7 +2824,7 @@ async def fortest_rules(
         return err
     try:
         client = get_client()
-        result = await client.fortest_rules(portfolio_id, flow_job_id, rule_ids)
+        result = await client.forward_test_rules(portfolio_id, flow_job_id, rule_ids)
 
         base = result.get("base_strategy", {})
         base_stats = base.get("summary_stats", {})
@@ -2894,14 +2894,14 @@ async def fortest_rules(
     name="evaluate_rules",
     description=(
         "Check which portfolio trading rules trigger on TODAY's real market data. "
-        "Unlike fortest_rules (which tests against simulated FLOW paths), this evaluates "
+        "Unlike forward_test_rules (which tests against simulated FLOW paths), this evaluates "
         "rules against actual historical prices from training_data — no FLOW model needed.\n\n"
         "Returns per-rule: triggered (bool), action prescribed, current indicator values. "
         "Also returns recommended_weights (combined effect of all triggered rules) and weight_changes.\n\n"
         "Data source: training_data (refreshed daily at 21:00 UTC after US market close). "
         "On weekends/holidays, evaluates against the most recent trading day.\n\n"
         "Use this for daily 'any rules fired?' monitoring. "
-        "For simulated forward-testing across 1000+ scenarios, use fortest_rules instead."
+        "For simulated forward-testing across 1000+ scenarios, use forward_test_rules instead."
     ),
     annotations=ToolAnnotations(title="Evaluate Rules (Live Data)", readOnlyHint=True),
 )
@@ -3081,7 +3081,7 @@ async def get_flow_results(
         "Wasserstein distance, KS tests, coverage tests, and marginal distribution checks. "
         "Returns immediately with a job_id — validation runs asynchronously (~3-5 min). "
         "Use check_flow_job(job_id=..., job_type='validate') to monitor progress. "
-        "Requires a trained Flow model (run train_flow_model or generate_synthetic first)."
+        "Requires a trained Flow model (run train_flow_model or train_and_generate first)."
     ),
     annotations=ToolAnnotations(title="Validate Flow Model", destructiveHint=True, openWorldHint=True),
 )
@@ -3143,7 +3143,7 @@ async def flow_validate(
 )
 async def analyze_derivatives(
     flow_job_id: Annotated[str, Field(
-        description="Flow generation job ID (from generate_flow_paths, generate_synthetic, or simulate_flow_scenario)"
+        description="Flow generation job ID (from generate_flow_paths, train_and_generate, or simulate_flow_scenario)"
     )],
     options_positions: Annotated[list[dict], Field(
         description=(

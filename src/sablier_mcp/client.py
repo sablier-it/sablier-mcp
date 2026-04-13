@@ -497,7 +497,7 @@ class SablierClient:
     # Simulation — Betas (Moment — synchronous)
     # ──────────────────────────────────────────────
 
-    async def simulate_betas_batch(
+    async def compute_betas_batch(
         self,
         model_group_id: str,
         historical_lookback_days: int | None = None,
@@ -527,7 +527,7 @@ class SablierClient:
     # Simulation — Returns (Moment — synchronous)
     # ──────────────────────────────────────────────
 
-    async def simulate_returns_batch(
+    async def compute_returns_batch(
         self,
         simulation_batch_id: str,
         factors: dict[str, float],
@@ -919,7 +919,7 @@ class SablierClient:
 
         Args:
             portfolio_id: Portfolio defining assets and weights.
-            simulation_ids: {asset_ticker: returns_simulation_id} from simulate_returns_batch.
+            simulation_ids: {asset_ticker: returns_simulation_id} from compute_returns_batch.
             mode: 'single_shot_linear', 'single_shot_nonlinear', or 'rollout_nonlinear'.
 
         Returns:
@@ -1012,12 +1012,12 @@ class SablierClient:
     async def delete_trading_rule(self, portfolio_id: str, rule_id: str) -> dict:
         return await self._delete(f"/portfolios/{portfolio_id}/rules/{rule_id}")
 
-    async def fortest_rules(self, portfolio_id: str, flow_job_id: str,
-                            rule_ids: list[str] | None = None) -> dict:
+    async def forward_test_rules(self, portfolio_id: str, flow_job_id: str,
+                                rule_ids: list[str] | None = None) -> dict:
         body: dict = {"flow_job_id": flow_job_id}
         if rule_ids is not None:
             body["rule_ids"] = rule_ids
-        return await self._post_long(f"/portfolios/{portfolio_id}/rules/fortest", json=body)
+        return await self._post_long(f"/portfolios/{portfolio_id}/rules/forward-test", json=body)
 
     async def evaluate_rules(self, portfolio_id: str,
                              rule_ids: list[str] | None = None) -> dict:
