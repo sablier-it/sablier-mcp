@@ -294,7 +294,7 @@ def _flatten_betas(results: dict) -> dict:
     - factor_means / factor_stds are dicts {factor: float}
     """
     features = results.get("conditioning_features", [])
-    factor_stats = results.get("factor_stats", {})
+    factor_stats = results.get("factor_stats") or {}
     factor_names = factor_stats.get("factor_names", features)
 
     # Flatten per-asset data
