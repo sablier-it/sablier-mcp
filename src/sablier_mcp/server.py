@@ -347,12 +347,21 @@ async def get_portfolio_value(
 
 @server.tool(
     name="get_portfolio_analytics",
-    description="Get historical portfolio analytics: Sharpe ratio, volatility, expected return, max drawdown, and market beta (benchmarked vs SPY). Supports timeframes: 1W, 1M, 1Y, 2Y, 5Y. This is backward-looking — for forward-looking risk, use compute_returns or test_flow_risk.",
+    description=(
+        "Get historical portfolio analytics: Sharpe ratio, volatility, expected return, max drawdown, "
+        "and market beta (benchmarked vs SPY). Supports timeframes: 1W, 1M, 1Y, 2Y, 5Y. "
+        "This is backward-looking — for forward-looking risk, use compute_returns or test_flow_risk. "
+        "NEW: Pass model_group_id to also get factor return attribution — shows which factors "
+        "(VIX, rates, oil, etc.) drove your portfolio returns over the period. "
+        "Requires compute_betas to have been run first via analyze_quantitative."
+    ),
     annotations=ToolAnnotations(title="Get Portfolio Analytics", readOnlyHint=True),
 )
 async def get_portfolio_analytics(
     portfolio_id: Annotated[str, Field(description="The portfolio UUID")],
     timeframe: Annotated[str, Field(description="Timeframe: 1W, 1M, 1Y, 2Y, or 5Y (default 1Y)", default="1Y")] = "1Y",
+    model_group_id: Annotated[str | None, Field(description="Model group ID for factor return attribution. From analyze_quantitative or list_model_groups.", default=None)] = None,
+    rollup: Annotated[str, Field(description="Attribution period: 'daily', 'weekly', 'monthly' (default 'daily')", default="daily")] = "daily",
 ) -> str:
     if err := _require_auth():
         return err
@@ -360,7 +369,11 @@ async def get_portfolio_analytics(
         return err
     try:
         client = get_client()
-        result = await client.get_portfolio_analytics(portfolio_id, timeframe=timeframe)
+        params: dict = {"timeframe": timeframe}
+        if model_group_id:
+            params["model_group_id"] = model_group_id
+            params["rollup"] = rollup
+        result = await client.get_portfolio_analytics(portfolio_id, **params)
         return _fmt(result)
     except SablierAPIError as e:
         return _api_error(e)
@@ -2857,6 +2870,108 @@ async def price_option_tool(
     except Exception as e:
         logger.error("price_option failed: %s", e, exc_info=True)
         return "Option pricing failed unexpectedly. Please try again."
+
+
+# ══════════════════════════════════════════════════
+# Historical Backtesting
+# ══════════════════════════════════════════════════
+
+
+@server.tool(
+    name="backtest_rules",
+    description=(
+        "Run a historical backtest of trading rules on REAL market data — not simulated FLOW paths. "
+        "Tests how rules would have performed over a historical period. "
+        "Returns same structure as forward_test_rules (base vs combined vs per-rule attribution) "
+        "PLUS monthly returns table, drawdown series, turnover stats, and transaction cost analysis. "
+        "Prerequisites: create rules with create_rule (and activate them). "
+        "Transaction costs: configurable (default 10bps per trade). "
+        "Warmup period (default 252 days) pre-fills indicator state before the test period starts. "
+        "For forward-looking testing on synthetic FLOW paths, use forward_test_rules instead."
+    ),
+    annotations=ToolAnnotations(title="Backtest Rules (Historical)", readOnlyHint=True, openWorldHint=True),
+)
+async def backtest_rules(
+    portfolio_id: Annotated[str, Field(description="Portfolio UUID")],
+    start_date: Annotated[str, Field(description="Backtest start date (YYYY-MM-DD). E.g. '2020-01-01' for a COVID-era test.")],
+    end_date: Annotated[str | None, Field(description="End date (YYYY-MM-DD). Defaults to latest available data.")] = None,
+    rule_ids: Annotated[list[str] | None, Field(description="Specific rule UUIDs. Omit to test all active rules.")] = None,
+    warmup_days: Annotated[int, Field(description="Days of history before start_date for indicator seeding (default 252 = ~1 year)")] = 252,
+    cost_bps: Annotated[float, Field(description="Transaction cost in basis points per trade (default 10.0)")] = 10.0,
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(portfolio_id, "portfolio_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.backtest_rules(
+            portfolio_id=portfolio_id,
+            start_date=start_date,
+            end_date=end_date,
+            rule_ids=rule_ids,
+            warmup_days=warmup_days,
+            cost_bps=cost_bps,
+        )
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+    except Exception as e:
+        logger.error("backtest_rules failed: %s", e, exc_info=True)
+        return "Historical backtest failed unexpectedly. Please try again."
+
+
+# ══════════════════════════════════════════════════
+# Universe Screening
+# ══════════════════════════════════════════════════
+
+
+@server.tool(
+    name="screen_universe",
+    description=(
+        "Screen the asset universe by metadata (sector, region, asset type) and price-based metrics "
+        "(momentum, volatility, percentile rank, z-score, RSI, MA distance). "
+        "Only screens assets already in the Sablier catalog with training data. "
+        "Use search_features + add_feature first to expand the catalog if needed. "
+        "Metadata fields: sector, region, asset_type, category, source. "
+        "Price fields: momentum_20d/60d/252d, volatility_20d/60d, percentile_1y, z_score_60d, "
+        "ma_distance_50d/200d, rsi_14, current_price, change_1d_pct/1w_pct/1m_pct. "
+        "Operators: eq, neq, in (metadata); gt, gte, lt, lte, between (price). "
+        "Results include computed metrics per asset. Use top results to create a portfolio."
+    ),
+    annotations=ToolAnnotations(title="Screen Universe", readOnlyHint=True, openWorldHint=True),
+)
+async def screen_universe(
+    criteria: Annotated[list[dict], Field(
+        description=(
+            "List of filter criteria. Each: {field, operator, value}. "
+            "Examples: "
+            "{field: 'sector', operator: 'in', value: ['Technology', 'Healthcare']}, "
+            "{field: 'momentum_60d', operator: 'gt', value: 0.05}, "
+            "{field: 'volatility_20d', operator: 'lt', value: 0.30}, "
+            "{field: 'percentile_1y', operator: 'gt', value: 80}"
+        )
+    )],
+    sort_by: Annotated[str | None, Field(description="Field to sort results by (default: first price criterion or momentum_60d)")] = None,
+    sort_order: Annotated[str, Field(description="'desc' (default) or 'asc'")] = "desc",
+    limit: Annotated[int, Field(description="Max results (default 20)")] = 20,
+) -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        result = await client.screen_universe(
+            criteria=criteria,
+            sort_by=sort_by or "momentum_60d",
+            sort_order=sort_order,
+            limit=limit,
+        )
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+    except Exception as e:
+        logger.error("screen_universe failed: %s", e, exc_info=True)
+        return "Universe screening failed unexpectedly. Please try again."
 
 
 # ══════════════════════════════════════════════════

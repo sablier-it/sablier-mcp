@@ -206,10 +206,15 @@ class SablierClient:
         return await self._get(f"/portfolios/{portfolio_id}/live-value")
 
     async def get_portfolio_analytics(
-        self, portfolio_id: str, timeframe: str = "1Y"
+        self, portfolio_id: str, timeframe: str = "1Y",
+        model_group_id: str | None = None, rollup: str = "daily",
     ) -> dict:
+        params: dict = {"timeframe": timeframe}
+        if model_group_id:
+            params["model_group_id"] = model_group_id
+            params["rollup"] = rollup
         return await self._get(
-            f"/portfolios/{portfolio_id}/analytics", params={"timeframe": timeframe}
+            f"/portfolios/{portfolio_id}/analytics", params=params
         )
 
     async def get_asset_profiles(self, portfolio_id: str) -> dict:
@@ -1025,6 +1030,33 @@ class SablierClient:
         if rule_ids is not None:
             body["rule_ids"] = rule_ids
         return await self._post(f"/portfolios/{portfolio_id}/rules/evaluate", json=body)
+
+    async def backtest_rules(self, portfolio_id: str, start_date: str,
+                             end_date: str | None = None,
+                             rule_ids: list[str] | None = None,
+                             warmup_days: int = 252,
+                             cost_bps: float = 10.0) -> dict:
+        body: dict = {"start_date": start_date, "warmup_days": warmup_days, "cost_bps": cost_bps}
+        if end_date:
+            body["end_date"] = end_date
+        if rule_ids:
+            body["rule_ids"] = rule_ids
+        return await self._post_long(f"/portfolios/{portfolio_id}/rules/backtest", json=body)
+
+    # ──────────────────────────────────────────────
+    # Screening
+    # ──────────────────────────────────────────────
+
+    async def screen_universe(self, criteria: list[dict],
+                              sort_by: str | None = None,
+                              sort_order: str = "desc",
+                              limit: int = 50,
+                              include_metrics: bool = True) -> dict:
+        body: dict = {"criteria": criteria, "sort_order": sort_order,
+                      "limit": limit, "include_metrics": include_metrics}
+        if sort_by:
+            body["sort_by"] = sort_by
+        return await self._post("/features/screen", json=body)
 
     # ──────────────────────────────────────────────
     # Tests
