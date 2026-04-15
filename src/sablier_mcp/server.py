@@ -1,485 +1,47 @@
 """
-Sablier MCP Server
+Sablier MCP Server — tool definitions.
 
-Gives AI agents the ability to perform regime-dependent factor modeling,
-qualitative analysis, portfolio risk testing, and return simulation
-through the Sablier platform.
-
-Supports both local (stdio) and remote (streamable-http) transport.
-Remote mode uses OAuth 2.0 — Claude Desktop opens a browser for login.
+All 66 tools are registered here. Infrastructure (server setup, client
+management, helpers, retry logic) lives in _core.py.
 """
 
-import asyncio
-from contextlib import asynccontextmanager
-from datetime import date as _date
-import json
-import logging
-import os
-import re
-import urllib.parse
 from typing import Annotated, Any
 
-from mcp.server.fastmcp import FastMCP
-from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
-from mcp.types import (
-    EmbeddedResource,
-    Icon,
-    TextContent,
-    TextResourceContents,
-    ToolAnnotations,
-)
+from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from sablier_mcp.auth import SablierOAuthProvider, current_sablier_token, login_page, _pending_auth_redirect
-from sablier_mcp.client import SablierClient, SablierAPIError
-from sablier_mcp.widgets import (
+from sablier_mcp._core import (
+    # Server instance
+    server,
+    logger,
+    # Client
+    get_client,
+    SablierAPIError,
+    # Helpers
+    _fmt,
+    _validate_uuid,
+    _api_error,
+    _with_widget,
+    _require_auth,
+    _portfolio_tickers,
+    _build_per_asset_output,
+    _flatten_betas,
+    _ensure_portfolio,
+    _validate_conditioning_data,
+    # Flow helpers
+    _train_flow_model_impl,
+    _generate_flow_paths_impl,
+    _acquire_gpu,
+    _FlowGPUBusy,
+    _retry_api_call,
+    _retry_gpu_call,
+    # Widgets
     betas_heatmap,
     flow_fan_chart,
     flow_risk_card,
     grain_score_card,
     portfolio_overview,
 )
-
-
-logger = logging.getLogger("sablier-mcp")
-
-# ══════════════════════════════════════════════════
-# Server setup
-# ══════════════════════════════════════════════════
-
-# Default to stdio when API key is set (local/CLI mode), otherwise HTTP (Cloud Run)
-_transport = os.getenv("MCP_TRANSPORT", "stdio" if os.getenv("SABLIER_API_KEY") else "streamable-http")
-_oauth_provider: SablierOAuthProvider | None = None
-
-_ICONS = [
-    Icon(src="https://sablier.ai/logo-mcp.svg", mimeType="image/svg+xml"),
-]
-
-if _transport != "stdio":
-    # Remote mode: enable OAuth
-    _oauth_provider = SablierOAuthProvider()
-    _port = int(os.getenv("PORT", os.getenv("MCP_PORT", "8000")))
-    _issuer_url = os.getenv("MCP_ISSUER_URL", f"http://localhost:{_port}")
-    server = FastMCP(
-        name="Sablier",
-        icons=_ICONS,
-        host="0.0.0.0",
-        port=_port,
-        stateless_http=True,  # No server-side sessions — survives Cloud Run cold starts
-        auth_server_provider=_oauth_provider,
-        auth=AuthSettings(
-            issuer_url=_issuer_url,
-            resource_server_url=_issuer_url,
-            client_registration_options=ClientRegistrationOptions(enabled=True),
-            required_scopes=[],
-        ),
-    )
-else:
-    # Local/stdio mode: no auth (uses SABLIER_API_KEY from env)
-    server = FastMCP(name="Sablier", icons=_ICONS)
-
-
-# ── Custom routes (remote mode only) ─────────────
-
-if _oauth_provider is not None:
-    from starlette.responses import Response
-
-    @server.custom_route("/login", methods=["GET", "POST"])
-    async def _login_handler(request) -> Response:
-        return await login_page(request, _oauth_provider)
-
-
-# ══════════════════════════════════════════════════
-# Client management
-# ══════════════════════════════════════════════════
-
-_stdio_client: SablierClient | None = None
-_token_clients: dict[str, SablierClient] = {}
-
-# Global lock for Flow GPU jobs — the worker handles one job at a time.
-# Prevents the MCP from submitting concurrent train/generate/validate jobs.
-_flow_gpu_lock = asyncio.Lock()
-
-
-class _FlowGPUBusy(Exception):
-    """Raised when the GPU lock cannot be acquired (another Flow job is running)."""
-    pass
-
-
-@asynccontextmanager
-async def _acquire_gpu(timeout: float = 30.0):
-    """Acquire the Flow GPU lock with a timeout.
-
-    If another Flow job is already running, waits up to `timeout` seconds.
-    Raises _FlowGPUBusy if the lock isn't acquired in time.
-    """
-    try:
-        await asyncio.wait_for(_flow_gpu_lock.acquire(), timeout=timeout)
-    except asyncio.TimeoutError:
-        raise _FlowGPUBusy(
-            "Another Flow GPU job is already running. "
-            "Please wait for it to finish before starting a new one."
-        )
-    try:
-        yield
-    finally:
-        _flow_gpu_lock.release()
-
-
-def get_client() -> SablierClient:
-    """Get a SablierClient for the current user.
-
-    In remote (OAuth) mode: uses the API key from the authenticated session.
-    In stdio mode: uses SABLIER_API_KEY from the environment.
-    """
-    global _stdio_client
-
-    # Check for API key (set by load_access_token in auth middleware)
-    token = current_sablier_token.get(None)
-    if token:
-        if token not in _token_clients:
-            _token_clients[token] = SablierClient.from_token(token)
-        return _token_clients[token]
-
-    # Fallback: stdio mode with API key
-    if _stdio_client is None:
-        _stdio_client = SablierClient()
-    return _stdio_client
-
-
-# ══════════════════════════════════════════════════
-# Helpers
-# ══════════════════════════════════════════════════
-
-
-def _fmt(data) -> str:
-    """Format API response as readable JSON."""
-    return json.dumps(data, indent=2, default=str)
-
-
-_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
-
-
-def _validate_uuid(value: str, label: str = "ID") -> str | None:
-    """Return an error string if value is not a valid UUID, else None."""
-    if not _UUID_RE.match(value):
-        return f"Error: '{value}' is not a valid {label}. Expected a UUID like '8f3a1b2c-...'. Use the relevant list tool to find valid IDs."
-    return None
-
-
-def _api_error(e: SablierAPIError) -> str:
-    """Convert an API error into a friendly message for the LLM."""
-    if e.status_code == 404:
-        return f"Error: Not found — {e.detail}"
-    if e.status_code == 409:
-        return f"Already exists — {e.detail}"
-    if e.status_code == 422:
-        return f"Error: Invalid input — {e.detail}"
-    if e.status_code == 429:
-        return (
-            f"Credit limit reached — {e.detail}\n\n"
-            f"To check your balance, use the get_credits tool. "
-            f"To upgrade, use the subscribe tool or visit https://sablier.ai/app/billing"
-        )
-    return f"Error: API returned {e.status_code} — {e.detail}"
-
-
-def _with_widget(text: str, html: str) -> list:
-    """Return both a text summary (for the LLM) and an HTML widget (for visual clients)."""
-    return [
-        TextContent(type="text", text=text),
-        EmbeddedResource(
-            type="resource",
-            resource=TextResourceContents(
-                uri=f"data:text/html,{urllib.parse.quote(html)}",
-                mimeType="text/html",
-                text="[interactive chart]",
-            ),
-        ),
-    ]
-
-
-def _portfolio_tickers(portfolio: dict) -> list[str]:
-    """Extract ticker symbols from a portfolio response.
-
-    The API returns asset_names as {display_name: ticker} and weights as
-    {display_name: weight}.  Fall back to an 'assets' list if present.
-    """
-    asset_names = portfolio.get("asset_names", {})
-    if asset_names:
-        return list(asset_names.values())
-    # Fallback for list-style responses
-    assets = portfolio.get("assets", [])
-    return [a.get("ticker") for a in assets if a.get("ticker")]
-
-
-def _build_per_asset_output(
-    summary: dict,
-    include_paths: bool = True,
-    summary_only: bool = False,
-    baseline_summary: dict | None = None,
-) -> dict:
-    """Build per-asset output from backend summary, optionally including paths.
-
-    summary_only=True: terminal statistics + percentile bands (no sample paths).
-      ~60% smaller than full output. Use download_flow_paths for raw path data.
-    include_paths=True (default): adds percentile_bands + sample paths for target assets.
-    If baseline_summary is given, merges baseline scalar stats for comparison.
-    """
-    MAX_SAMPLE_PATHS = 10
-    MAX_TS_POINTS = 60  # downsample longer horizons
-
-    per_asset: dict = {}
-    for name, data in summary.items():
-        if not isinstance(data, dict):
-            continue
-        entry: dict = {
-            "last_price": data.get("last_price"),
-            "mean_return": data.get("mean_return"),
-            "median_terminal": data.get("median_terminal"),
-            "p5": data.get("p5"),
-            "p95": data.get("p95"),
-            "feature_type": data.get("feature_type"),
-        }
-
-        if include_paths:
-            ts = data.get("timeseries") or {}
-            is_target = data.get("feature_type") == "target"
-            if ts and is_target:
-                # Downsample if horizon is long
-                def _maybe_downsample(arr: list) -> list:
-                    if not arr or len(arr) <= MAX_TS_POINTS:
-                        return arr
-                    step = max(1, len(arr) // MAX_TS_POINTS)
-                    return arr[::step]
-
-                entry["percentile_bands"] = {
-                    k: _maybe_downsample(ts[k])
-                    for k in ("p5", "p25", "p50", "p75", "p95")
-                    if k in ts
-                }
-                # Sample paths are the main output bloat — skip in summary_only mode
-                if not summary_only:
-                    sample = ts.get("sample_paths") or []
-                    if sample:
-                        step = max(1, len(sample) // MAX_SAMPLE_PATHS)
-                        picked = sample[::step][:MAX_SAMPLE_PATHS]
-                        entry["sample_paths"] = [_maybe_downsample(p) for p in picked]
-            elif ts and not is_target:
-                p50 = ts.get("p50")
-                if p50:
-                    entry["median_path"] = p50
-
-        if baseline_summary:
-            bl = baseline_summary.get(name) or {}
-            if bl:
-                entry["baseline_mean_return"] = bl.get("mean_return")
-                entry["baseline_median_terminal"] = bl.get("median_terminal")
-
-        per_asset[name] = entry
-    return per_asset
-
-
-def _flatten_betas(results: dict) -> dict:
-    """Flatten the nested betas API response into a widget-friendly format.
-
-    The API returns per_asset_results keyed by model UUID, with nested dicts
-    for linear_betas ({display_name: {factor: float}}), alpha, residual_std.
-    Factor stats (means, stds) are returned as parallel lists.
-
-    This flattens everything so:
-    - assets is keyed by display name (e.g. "Apple Inc.")
-    - linear_betas is flat {factor: float}
-    - alpha / residual_std are plain floats
-    - factor_means / factor_stds are dicts {factor: float}
-    """
-    features = results.get("conditioning_features", [])
-    factor_stats = results.get("factor_stats") or {}
-    factor_names = factor_stats.get("factor_names", features)
-
-    # Flatten per-asset data
-    per_asset = results.get("per_asset_results", {})
-    assets = {}
-    for _model_id, data in per_asset.items():
-        lb = data.get("linear_betas", {})
-        alpha_dict = data.get("alpha", {}) or {}
-        resid_dict = data.get("residual_std", {}) or {}
-        r2_dict = data.get("per_asset_r2", {}) or {}
-
-        # Each model maps to one asset by display name
-        for display_name, betas in lb.items():
-            asset_entry = {
-                "status": data.get("status"),
-                "linear_betas": betas if isinstance(betas, dict) else {},
-                "alpha": alpha_dict.get(display_name) if isinstance(alpha_dict, dict) else alpha_dict,
-                "residual_std": resid_dict.get(display_name) if isinstance(resid_dict, dict) else resid_dict,
-            }
-            # Add per-asset R² (in-sample goodness-of-fit)
-            # r2_dict keys are target feature names (e.g. "AAPL_returns"), match by checking if display_name appears
-            for target_key, r2_vals in r2_dict.items():
-                asset_entry["r2"] = r2_vals.get("r2")
-                if r2_vals.get("gam_r2") is not None:
-                    asset_entry["gam_r2"] = r2_vals["gam_r2"]
-                break  # One target per model in batch mode
-            assets[display_name] = asset_entry
-
-    # Convert parallel lists to dicts
-    means_list = factor_stats.get("factor_means", [])
-    stds_list = factor_stats.get("factor_stds", [])
-    means_raw_list = factor_stats.get("factor_means_raw", [])
-    stds_raw_list = factor_stats.get("factor_stds_raw", [])
-    last_values_list = factor_stats.get("factor_last_values_raw", [])
-
-    factor_means = dict(zip(factor_names, means_list)) if means_list else {}
-    factor_stds = dict(zip(factor_names, stds_list)) if stds_list else {}
-    factor_means_raw = dict(zip(factor_names, means_raw_list)) if means_raw_list else {}
-    factor_stds_raw = dict(zip(factor_names, stds_raw_list)) if stds_raw_list else {}
-    factor_last_values_raw = dict(zip(factor_names, last_values_list)) if last_values_list else {}
-
-    factor_last_date_str = factor_stats.get("factor_last_date")
-    out = {
-        "conditioning_features": features,
-        "assets": assets,
-        "factor_last_values_raw": factor_last_values_raw,
-        "factor_last_date": factor_last_date_str,
-        "factor_means_raw": factor_means_raw,
-        "factor_stds_raw": factor_stds_raw,
-        "factor_means": factor_means,
-        "factor_stds": factor_stds,
-    }
-
-    # Rolling window used for beta estimation (trading days)
-    if results.get("rolling_window"):
-        out["rolling_window"] = results["rolling_window"]
-
-    # Per-factor data truncation: which factors had stale data and truncated the window
-    if results.get("data_truncated_by"):
-        out["data_truncated_by"] = results["data_truncated_by"]
-
-    # Warn when factor data is stale — one stale feature truncates the entire beta window
-    if factor_last_date_str:
-        try:
-            last_date = _date.fromisoformat(factor_last_date_str)
-            days_old = (_date.today() - last_date).days
-            business_days_old = round(days_old * 5 / 7)
-            if business_days_old > 5:
-                out["data_freshness_warning"] = (
-                    f"Factor data ends {factor_last_date_str} ({business_days_old} business days ago). "
-                    f"At least one conditioning feature has stale data — the beta estimation window "
-                    f"was truncated to this date for ALL features. Betas and factor_last_values_raw "
-                    f"may not reflect current market conditions. "
-                    f"Run refresh_feature_data on your conditioning set tickers to update."
-                )
-        except (ValueError, TypeError):
-            pass
-    if results.get("collinear_groups"):
-        out["collinear_groups"] = results["collinear_groups"]
-    return out
-
-
-async def _ensure_portfolio(
-    portfolio_id: str | None,
-    tickers: list[str] | None,
-    weights: list[float] | None,
-) -> tuple[dict, str | None]:
-    """Resolve or auto-create a portfolio.
-
-    Returns (portfolio_dict, error_string).  If error_string is not None
-    the caller should return it immediately.
-    """
-    client = get_client()
-
-    if portfolio_id:
-        if err := _validate_uuid(portfolio_id, "portfolio_id"):
-            return {}, err
-        portfolio = await client.get_portfolio(portfolio_id)
-        if not _portfolio_tickers(portfolio):
-            return {}, "Error: portfolio has no assets."
-        return portfolio, None
-
-    if not tickers:
-        return {}, (
-            "Error: provide either portfolio_id (from create_portfolio / list_portfolios) "
-            "or tickers (e.g. ['AAPL', 'MSFT'])."
-        )
-
-    # Auto-assign weights: explicit > equal
-    if not weights:
-        weights = [1.0 / len(tickers)] * len(tickers)
-    if len(weights) != len(tickers):
-        return {}, "Error: tickers and weights must have the same length."
-
-    # Auto-create portfolio — reuse existing if name already taken
-    name = ", ".join(tickers)
-    assets = [{"ticker": t, "weight": w} for t, w in zip(tickers, weights)]
-    try:
-        portfolio = await client.create_portfolio(name, assets)
-    except SablierAPIError as e:
-        if e.status_code == 409 or (e.status_code == 500 and "unique" in str(e).lower()):
-            # Duplicate name — find and reuse the existing portfolio
-            all_portfolios = await client.list_portfolios()
-            items = all_portfolios.get("portfolios", all_portfolios) if isinstance(all_portfolios, dict) else all_portfolios
-            match = next((p for p in items if p.get("name") == name), None)
-            if match:
-                portfolio = await client.get_portfolio(match["id"])
-                return portfolio, None
-        raise
-    return portfolio, None
-
-
-async def _validate_conditioning_data(conditioning_set_id: str) -> str | None:
-    """Ensure features in a conditioning set have training data.
-
-    If fetched_data_available is false, auto-refreshes the tickers.
-    Never blocks — if refresh fails, logs a warning and lets training
-    decide whether data is sufficient.
-    """
-    client = get_client()
-    feature_set = await client.get_feature_set(conditioning_set_id)
-
-    if feature_set.get("fetched_data_available") is not False:
-        return None  # Flag is true or absent — proceed
-
-    # Collect tickers that need data (skip computed indicators)
-    features = feature_set.get("features", [])
-    tickers = [
-        f.get("ticker")
-        for f in features
-        if isinstance(f, dict) and f.get("type") != "indicator" and f.get("ticker")
-    ]
-
-    if not tickers:
-        return None
-
-    # Auto-refresh so training has the best chance of succeeding
-    try:
-        logger.info("Auto-refreshing %d features for conditioning set %s", len(tickers), conditioning_set_id)
-        await client.refresh_feature_data(tickers)
-    except Exception:
-        logger.warning("Auto-refresh failed for conditioning set %s — proceeding anyway", conditioning_set_id, exc_info=True)
-
-    return None  # Never block — let training validate data sufficiency
-
-
-_NOT_LOGGED_IN = (
-    "Error: Not authenticated. "
-    "Set the SABLIER_API_KEY environment variable to your Sablier API key. "
-    "You can create one at https://sablier-ai.com."
-)
-
-
-def _require_auth() -> str | None:
-    """Return an error string if not authenticated, else None.
-
-    In remote (OAuth) mode the SDK middleware handles auth, so this
-    always passes.  In stdio mode it checks SABLIER_API_KEY.
-    """
-    if current_sablier_token.get(None):
-        return None  # OAuth-authenticated
-    client = get_client()
-    if not client.is_authenticated:
-        return _NOT_LOGGED_IN
-    return None
 
 
 # ══════════════════════════════════════════════════
@@ -785,12 +347,21 @@ async def get_portfolio_value(
 
 @server.tool(
     name="get_portfolio_analytics",
-    description="Get historical portfolio analytics: Sharpe ratio, volatility, expected return, max drawdown, and market beta (benchmarked vs SPY). Supports timeframes: 1W, 1M, 1Y, 2Y, 5Y. This is backward-looking — for forward-looking risk, use compute_returns or test_flow_risk.",
+    description=(
+        "Get historical portfolio analytics: Sharpe ratio, volatility, expected return, max drawdown, "
+        "and market beta (benchmarked vs SPY). Supports timeframes: 1W, 1M, 1Y, 2Y, 5Y. "
+        "This is backward-looking — for forward-looking risk, use compute_returns or test_flow_risk. "
+        "NEW: Pass model_group_id to also get factor return attribution — shows which factors "
+        "(VIX, rates, oil, etc.) drove your portfolio returns over the period. "
+        "Requires compute_betas to have been run first via analyze_quantitative."
+    ),
     annotations=ToolAnnotations(title="Get Portfolio Analytics", readOnlyHint=True),
 )
 async def get_portfolio_analytics(
     portfolio_id: Annotated[str, Field(description="The portfolio UUID")],
     timeframe: Annotated[str, Field(description="Timeframe: 1W, 1M, 1Y, 2Y, or 5Y (default 1Y)", default="1Y")] = "1Y",
+    model_group_id: Annotated[str | None, Field(description="Model group ID for factor return attribution. From analyze_quantitative or list_model_groups.", default=None)] = None,
+    rollup: Annotated[str, Field(description="Attribution period: 'daily', 'weekly', 'monthly' (default 'daily')", default="daily")] = "daily",
 ) -> str:
     if err := _require_auth():
         return err
@@ -798,7 +369,11 @@ async def get_portfolio_analytics(
         return err
     try:
         client = get_client()
-        result = await client.get_portfolio_analytics(portfolio_id, timeframe=timeframe)
+        params: dict = {"timeframe": timeframe}
+        if model_group_id:
+            params["model_group_id"] = model_group_id
+            params["rollup"] = rollup
+        result = await client.get_portfolio_analytics(portfolio_id, **params)
         return _fmt(result)
     except SablierAPIError as e:
         return _api_error(e)
@@ -3298,6 +2873,108 @@ async def price_option_tool(
 
 
 # ══════════════════════════════════════════════════
+# Historical Backtesting
+# ══════════════════════════════════════════════════
+
+
+@server.tool(
+    name="backtest_rules",
+    description=(
+        "Run a historical backtest of trading rules on REAL market data — not simulated FLOW paths. "
+        "Tests how rules would have performed over a historical period. "
+        "Returns same structure as forward_test_rules (base vs combined vs per-rule attribution) "
+        "PLUS monthly returns table, drawdown series, turnover stats, and transaction cost analysis. "
+        "Prerequisites: create rules with create_rule (and activate them). "
+        "Transaction costs: configurable (default 10bps per trade). "
+        "Warmup period (default 252 days) pre-fills indicator state before the test period starts. "
+        "For forward-looking testing on synthetic FLOW paths, use forward_test_rules instead."
+    ),
+    annotations=ToolAnnotations(title="Backtest Rules (Historical)", readOnlyHint=True, openWorldHint=True),
+)
+async def backtest_rules(
+    portfolio_id: Annotated[str, Field(description="Portfolio UUID")],
+    start_date: Annotated[str, Field(description="Backtest start date (YYYY-MM-DD). E.g. '2020-01-01' for a COVID-era test.")],
+    end_date: Annotated[str | None, Field(description="End date (YYYY-MM-DD). Defaults to latest available data.")] = None,
+    rule_ids: Annotated[list[str] | None, Field(description="Specific rule UUIDs. Omit to test all active rules.")] = None,
+    warmup_days: Annotated[int, Field(description="Days of history before start_date for indicator seeding (default 252 = ~1 year)")] = 252,
+    cost_bps: Annotated[float, Field(description="Transaction cost in basis points per trade (default 10.0)")] = 10.0,
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(portfolio_id, "portfolio_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.backtest_rules(
+            portfolio_id=portfolio_id,
+            start_date=start_date,
+            end_date=end_date,
+            rule_ids=rule_ids,
+            warmup_days=warmup_days,
+            cost_bps=cost_bps,
+        )
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+    except Exception as e:
+        logger.error("backtest_rules failed: %s", e, exc_info=True)
+        return "Historical backtest failed unexpectedly. Please try again."
+
+
+# ══════════════════════════════════════════════════
+# Universe Screening
+# ══════════════════════════════════════════════════
+
+
+@server.tool(
+    name="screen_universe",
+    description=(
+        "Screen the asset universe by metadata (sector, region, asset type) and price-based metrics "
+        "(momentum, volatility, percentile rank, z-score, RSI, MA distance). "
+        "Only screens assets already in the Sablier catalog with training data. "
+        "Use search_features + add_feature first to expand the catalog if needed. "
+        "Metadata fields: sector, region, asset_type, category, source. "
+        "Price fields: momentum_20d/60d/252d, volatility_20d/60d, percentile_1y, z_score_60d, "
+        "ma_distance_50d/200d, rsi_14, current_price, change_1d_pct/1w_pct/1m_pct. "
+        "Operators: eq, neq, in (metadata); gt, gte, lt, lte, between (price). "
+        "Results include computed metrics per asset. Use top results to create a portfolio."
+    ),
+    annotations=ToolAnnotations(title="Screen Universe", readOnlyHint=True, openWorldHint=True),
+)
+async def screen_universe(
+    criteria: Annotated[list[dict], Field(
+        description=(
+            "List of filter criteria. Each: {field, operator, value}. "
+            "Examples: "
+            "{field: 'sector', operator: 'in', value: ['Technology', 'Healthcare']}, "
+            "{field: 'momentum_60d', operator: 'gt', value: 0.05}, "
+            "{field: 'volatility_20d', operator: 'lt', value: 0.30}, "
+            "{field: 'percentile_1y', operator: 'gt', value: 80}"
+        )
+    )],
+    sort_by: Annotated[str | None, Field(description="Field to sort results by (default: first price criterion or momentum_60d)")] = None,
+    sort_order: Annotated[str, Field(description="'desc' (default) or 'asc'")] = "desc",
+    limit: Annotated[int, Field(description="Max results (default 20)")] = 20,
+) -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        result = await client.screen_universe(
+            criteria=criteria,
+            sort_by=sort_by or "momentum_60d",
+            sort_order=sort_order,
+            limit=limit,
+        )
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+    except Exception as e:
+        logger.error("screen_universe failed: %s", e, exc_info=True)
+        return "Universe screening failed unexpectedly. Please try again."
+
+
+# ══════════════════════════════════════════════════
 # Market Radar
 # ══════════════════════════════════════════════════
 
@@ -3621,86 +3298,18 @@ async def toggle_overage(
         return _api_error(e)
 
 
-async def _retry_api_call(coro_fn, max_retries: int = 2, delay: float = 3.0):
-    """Retry an async API call on transient server errors (5xx) and rate limits (429).
-
-    coro_fn must be a zero-arg callable that returns a coroutine, e.g.:
-        await _retry_api_call(lambda: client.train_batch(model_group_id=mgid))
-    """
-    last_exc = None
-    for attempt in range(max_retries + 1):
-        try:
-            return await coro_fn()
-        except SablierAPIError as e:
-            last_exc = e
-            retryable = e.status_code >= 500 or e.status_code == 429
-            if not retryable or attempt == max_retries:
-                raise
-            logger.warning("Transient %s on attempt %d/%d — retrying in %.0fs", e, attempt + 1, max_retries + 1, delay)
-            await asyncio.sleep(delay)
-            delay *= 2  # exponential backoff
-    raise last_exc  # unreachable, but keeps type checker happy
-
-
-async def _retry_gpu_call(coro_fn, max_wait: float = 300.0, initial_delay: float = 15.0):
-    """Retry a GPU worker call that may fail with 'Worker busy'.
-
-    GPU jobs (flow_train, flow_generate) use a single worker that can only process
-    one job at a time. This retries with exponential backoff up to max_wait seconds.
-    """
-    last_exc = None
-    delay = initial_delay
-    elapsed = 0.0
-    attempt = 0
-    while elapsed < max_wait:
-        try:
-            return await coro_fn()
-        except SablierAPIError as e:
-            last_exc = e
-            is_busy = e.status_code in (503, 429) or (e.status_code >= 500 and "busy" in str(e).lower())
-            if not is_busy:
-                raise  # not a worker-busy error, propagate immediately
-            attempt += 1
-            if elapsed + delay >= max_wait:
-                raise
-            logger.warning("GPU worker busy (attempt %d) — retrying in %.0fs", attempt, delay)
-            await asyncio.sleep(delay)
-            elapsed += delay
-            delay = min(delay * 1.5, 60.0)  # cap at 60s between retries
-    raise last_exc  # unreachable
-
-
-# ══════════════════════════════════════════════════
-# ASGI middleware — captures redirect_uri from /authorize
-# before the SDK's handler calls get_client().
-# ══════════════════════════════════════════════════
-
-
-class CaptureRedirectMiddleware:
-    """Pure ASGI middleware that sets _pending_auth_redirect contextvar."""
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope.get("path", "") == "/authorize":
-            qs = scope.get("query_string", b"").decode()
-            params = urllib.parse.parse_qs(qs)
-            redirect_uri = params.get("redirect_uri", [None])[0]
-            if redirect_uri:
-                _pending_auth_redirect.set(redirect_uri)
-        await self.app(scope, receive, send)
-
-
 # ══════════════════════════════════════════════════
 # Entry point
 # ══════════════════════════════════════════════════
 
 
 def main():
+    from sablier_mcp._core import _transport, _port, CaptureRedirectMiddleware
+
     if _transport == "stdio":
         server.run(transport="stdio")
     else:
+        import asyncio
         import uvicorn
 
         starlette_app = server.streamable_http_app()
@@ -3713,8 +3322,6 @@ def main():
             log_level="info",
         )
         uvicorn_server = uvicorn.Server(config)
-
-        import asyncio
         asyncio.run(uvicorn_server.serve())
 
 
