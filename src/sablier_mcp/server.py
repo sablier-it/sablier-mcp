@@ -1167,7 +1167,7 @@ async def create_scenario(
 @server.tool(
     name="list_scenarios",
     description=(
-        "List saved Moment scenario templates (created via create_scenario or clone_scenario). "
+        "List saved Moment scenario templates (created via create_scenario). "
         "These are stored factor specs tied to individual model_ids — "
         "to execute one, use compute_returns with the factor values. For ad-hoc tests, use compute_returns directly. "
         "NOT for Flow scenarios — use list_flow_scenarios for those."
