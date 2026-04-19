@@ -142,7 +142,6 @@ export SABLIER_API_KEY=sk_live_your_key_here
 | `train_flow_model` | Train a conditional flow-matching model on a model group |
 | `generate_flow_paths` | Generate baseline (unconstrained) synthetic price paths |
 | `simulate_flow_scenario` | Generate constrained paths (e.g., "gold above $3000 and VIX below 20") |
-| `train_and_generate` | Convenience: train a flow model and generate paths in one call |
 | `check_flow_job` | Poll status of a queued/running flow job |
 | `get_flow_results` | Pull paths + summary stats from a completed generation job |
 | `download_flow_paths` | Download raw paths as JSON or CSV |
@@ -244,13 +243,17 @@ You:   I want to see how a gold + bonds portfolio performs over the next quarter
        in scenarios where inflation stays high.
 
 Agent: 1. create_portfolio("Inflation Hedge", ["GLD", "TLT", "IAU"], [0.4, 0.4, 0.2])
-       2. train_and_generate(portfolio_id, conditioning_set_id, horizon=60, n_paths=500)
-          →  trains flow model (~5 min), generates 500 joint baseline price paths
-       3. simulate_flow_scenario(model_group_id, constraints=[
+       2. train_flow_model(model_group_id, horizon=60)
+          →  dispatches GPU training job (~5-15 min async)
+       3. check_flow_job(job_id) until completed; flow_validate(model_group_id)
+          →  confirms model quality before generating paths
+       4. generate_flow_paths(model_group_id, n_paths=500)
+          →  generates 500 joint baseline price paths
+       5. simulate_flow_scenario(model_group_id, constraints=[
             {"feature_name": "CPI", "type": "level", "lower": 3.5, "t_start": 0, "t_end": 60}
           ])
           →  generates paths conditioned on CPI > 3.5%
-       4. test_flow_risk(portfolio_id, job_id)
+       6. test_flow_risk(portfolio_id, job_id)
           →  distribution of Sharpe, max drawdown, total return across constrained paths
 
        Result: Median return = +4.2%, 5th percentile = -6.8%

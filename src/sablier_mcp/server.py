@@ -756,7 +756,7 @@ async def delete_grain_analysis(
 
 @server.tool(
     name="list_model_groups",
-    description="List all model groups (each created by analyze_quantitative or train_and_generate). A model group ties a portfolio to a conditioning set and contains per-asset models. Check model_type: null/absent = Moment (linear), 'flow_generative' = Flow. Use this to find model_group_ids for compute_betas, compute_returns, or train_and_generate (resume).",
+    description="List all model groups (each created by analyze_quantitative). A model group ties a portfolio to a conditioning set and contains per-asset models. Check model_type: null/absent = Moment (linear), 'flow_generative' = Flow. Use this to find model_group_ids for compute_betas, compute_returns, (resume).",
     annotations=ToolAnnotations(title="List Model Groups", readOnlyHint=True),
 )
 async def list_model_groups() -> str:
@@ -1819,75 +1819,14 @@ async def generate_flow_paths(
         return "Flow path generation failed unexpectedly. Please try again."
 
 
-@server.tool(
-    name="train_and_generate",
-    description=(
-        "Train a Flow model AND generate paths in one call. "
-        "Convenience wrapper: equivalent to train_flow_model then generate_flow_paths. "
-        "TWO MODES: "
-        "(1) NEW RUN: pass conditioning_set_id + tickers/portfolio_id. Dispatches training (~5-15 min async), "
-        "then tell the user to wait and check back. Do NOT poll automatically. "
-        "(2) RESUME: pass model_group_id to retrieve existing results or generate new paths without retraining."
-    ),
-    annotations=ToolAnnotations(title="Train & Generate Paths", destructiveHint=True, openWorldHint=True),
-)
-async def train_and_generate(
-    conditioning_set_id: Annotated[str | None, Field(
-        description="UUID of the conditioning set. Required for new runs.",
-        default=None,
-    )] = None,
-    model_group_id: Annotated[str | None, Field(
-        description="UUID of an existing Flow model group. Skips training if provided.",
-        default=None,
-    )] = None,
-    portfolio_id: Annotated[str | None, Field(
-        description="UUID of an existing portfolio. If omitted, provide tickers.",
-        default=None,
-    )] = None,
-    tickers: Annotated[list[str] | None, Field(
-        description="Tickers to analyze. Auto-creates a portfolio if portfolio_id is not given.",
-        default=None,
-    )] = None,
-    weights: Annotated[list[float] | None, Field(
-        description="Optional weights (must sum to 1.0). Defaults to equal weights.",
-        default=None,
-    )] = None,
-    horizon: Annotated[int, Field(description="Forecast horizon in trading days. Default 60.", default=60)] = 60,
-    n_paths: Annotated[int, Field(description="Number of paths to generate. Default 1000.", default=1000)] = 1000,
-    price_history_length: Annotated[int | None, Field(
-        description="Days of historical prices to include before the paths start. Defaults to horizon. Set higher (e.g. 120) to warm up indicators like MACD or z-score before forward_test_rules.",
-        default=None,
-    )] = None,
-) -> list | str:
-    if err := _require_auth():
-        return err
-    try:
-        client = get_client()
-
-        # Resume mode: skip training
-        if model_group_id:
-            return await _generate_flow_paths_impl(client, model_group_id, portfolio_id, horizon, n_paths, price_history_length)
-
-        # New run: train then generate
-        if not conditioning_set_id:
-            return "Error: conditioning_set_id is required for new runs. Use list_feature_set_templates to find one, or pass model_group_id to resume."
-
-        result, mgid, pid, fnames = await _train_flow_model_impl(
-            client, conditioning_set_id, portfolio_id, tickers, weights, horizon,
-        )
-        if isinstance(result, str):
-            return result  # error
-        if not mgid:
-            return _fmt(result)  # training output without model_group_id (shouldn't happen)
-
-        return await _generate_flow_paths_impl(client, mgid, pid, horizon, n_paths, price_history_length)
-    except _FlowGPUBusy as e:
-        return str(e)
-    except SablierAPIError as e:
-        return _api_error(e)
-    except Exception as e:
-        logger.error("train_and_generate failed: %s", e, exc_info=True)
-        return "Flow analysis failed unexpectedly. Please try again."
+# NOTE: `train_and_generate` was removed. The new-run mode dispatched
+# training (async, 5-15 min) and then immediately invoked
+# `_generate_flow_paths_impl` against an as-yet-untrained model — the
+# generate call could only return a misleading "no results yet" or
+# silently produce nothing useful. The resume mode was a pure rename of
+# `generate_flow_paths`. Use the explicit chain instead:
+#   train_flow_model -> check_flow_job -> flow_validate -> generate_flow_paths
+# The agent already drives this chain cleanly (see stress-test run 4).
 
 
 @server.tool(
@@ -1922,7 +1861,7 @@ async def train_and_generate(
 )
 async def simulate_flow_scenario(
     model_group_id: Annotated[str, Field(
-        description="UUID of the model group with a trained Flow model (from train_flow_model or train_and_generate)"
+        description="UUID of the model group with a trained Flow model (from train_flow_model)"
     )],
     constraints: Annotated[list[dict], Field(
         description=(
@@ -1938,7 +1877,7 @@ async def simulate_flow_scenario(
         )
     )],
     portfolio_id: Annotated[str | None, Field(
-        description="UUID of the portfolio (from train_flow_model or train_and_generate). Pass it through so test_flow_risk can be called directly on the results.",
+        description="UUID of the portfolio (from train_flow_model). Pass it through so test_flow_risk can be called directly on the results.",
         default=None,
     )] = None,
     n_paths: Annotated[int, Field(
@@ -1995,7 +1934,7 @@ async def simulate_flow_scenario(
         if not job_id:
             return "Error: Constrained generation did not return a job_id."
 
-        pid_str = f"'{portfolio_id}'" if portfolio_id else "'<from train_and_generate>'"
+        pid_str = f"'{portfolio_id}'" if portfolio_id else "'<find via list_portfolios>'"
         output: dict = {
             "status": "generating",
             "model_group_id": model_group_id,
@@ -2032,7 +1971,7 @@ async def simulate_flow_scenario(
         "Run portfolio risk analytics on Flow-generated paths (FUTURES/EQUITIES ONLY — no options). "
         "Computes expected return, volatility, Sharpe ratio, Sortino ratio, Calmar ratio, "
         "VaR 95%, CVaR 95%, max drawdown, profitability rate, and return distribution percentiles. "
-        "Requires portfolio_id and flow_job_id from generate_flow_paths, train_and_generate, or simulate_flow_scenario. "
+        "Requires portfolio_id and flow_job_id from generate_flow_paths, or simulate_flow_scenario. "
         "If the user has OPTIONS positions, use analyze_derivatives instead — it reprices options "
         "on every path using Black-76 and shows combined futures+options risk. "
         "TIP: Call this on multiple flow_job_ids (baseline + different scenarios) to build a "
@@ -2042,10 +1981,10 @@ async def simulate_flow_scenario(
 )
 async def test_flow_risk(
     portfolio_id: Annotated[str, Field(
-        description="UUID of the portfolio (from generate_flow_paths, train_and_generate, or list_portfolios)"
+        description="UUID of the portfolio (from generate_flow_paths, or list_portfolios)"
     )],
     flow_job_id: Annotated[str, Field(
-        description="Flow generation job ID (from generate_flow_paths, train_and_generate, or simulate_flow_scenario)"
+        description="Flow generation job ID (from generate_flow_paths, or simulate_flow_scenario)"
     )],
 ) -> list | str:
     if err := _require_auth():
@@ -2113,7 +2052,7 @@ async def test_flow_risk(
 )
 async def list_flow_scenarios(
     model_group_id: Annotated[str, Field(
-        description="UUID of the Flow model group (from train_flow_model, train_and_generate, or list_model_groups)"
+        description="UUID of the Flow model group (from train_flow_model, or list_model_groups)"
     )],
 ) -> str:
     if err := _require_auth():
@@ -2381,7 +2320,7 @@ async def delete_rule(
         "For checking rules against today's real market data (no FLOW dependency), use evaluate_rules instead.\n\n"
         "Prerequisites: (1) create rules with create_rule; "
         "(2) activate them with toggle_rule(is_active=True); "
-        "(3) generate FLOW paths with generate_flow_paths or train_and_generate.\n"
+        "(3) generate FLOW paths with generate_flow_paths.\n"
         "If rule_ids is omitted, tests all active rules."
     ),
     annotations=ToolAnnotations(title="Forward-Test Trading Rules"),
@@ -2656,7 +2595,7 @@ async def get_flow_results(
         "Wasserstein distance, KS tests, coverage tests, and marginal distribution checks. "
         "Returns immediately with a job_id — validation runs asynchronously (~3-5 min). "
         "Use check_flow_job(job_id=..., job_type='validate') to monitor progress. "
-        "Requires a trained Flow model (run train_flow_model or train_and_generate first)."
+        "Requires a trained Flow model (run train_flow_model first)."
     ),
     annotations=ToolAnnotations(title="Validate Flow Model", destructiveHint=True, openWorldHint=True),
 )
@@ -2718,7 +2657,7 @@ async def flow_validate(
 )
 async def analyze_derivatives(
     flow_job_id: Annotated[str, Field(
-        description="Flow generation job ID (from generate_flow_paths, train_and_generate, or simulate_flow_scenario)"
+        description="Flow generation job ID (from generate_flow_paths, or simulate_flow_scenario)"
     )],
     options_positions: Annotated[list[dict], Field(
         description=(
