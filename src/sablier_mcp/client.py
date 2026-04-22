@@ -148,32 +148,6 @@ class SablierClient:
         """Refresh training data for specific tickers."""
         return await self._post_long("/features/available/refresh", json={"tickers": tickers})
 
-    async def list_transformations(self) -> list[dict]:
-        """List available transformation types for derived features."""
-        return await self._get("/features/transformations")
-
-    async def create_derived_feature(
-        self,
-        name: str,
-        base_feature: str,
-        transformation: str,
-        parameters: dict,
-        display_name: str | None = None,
-        description: str | None = None,
-    ) -> dict:
-        """Create a derived feature."""
-        body: dict[str, Any] = {
-            "name": name,
-            "base_feature": base_feature,
-            "transformation": transformation,
-            "parameters": parameters,
-        }
-        if display_name:
-            body["display_name"] = display_name
-        if description:
-            body["description"] = description
-        return await self._post("/features/derived", json=body)
-
     # ──────────────────────────────────────────────
     # Portfolios
     # ──────────────────────────────────────────────
