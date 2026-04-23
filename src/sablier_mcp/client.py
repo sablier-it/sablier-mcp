@@ -509,15 +509,20 @@ class SablierClient:
     async def compute_returns_batch(
         self,
         simulation_batch_id: str,
-        factors: dict[str, float],
+        shocks: dict[str, float],
         n_samples: int = 1000,
     ) -> dict:
-        """Sample returns under stressed factor values. Synchronous."""
+        """Sample returns under stressed factor values. Synchronous.
+
+        ``shocks`` is the fractional change per factor (e.g. ``{"TLT":
+        -0.085}`` means TLT down 8.5%). Server converts to the absolute
+        target level using each factor's latest observed value.
+        """
         return await self._post_long(
             "/moment/compute-returns/batch",
             json={
                 "simulation_batch_id": simulation_batch_id,
-                "factors": factors,
+                "shocks": shocks,
                 "n_samples": n_samples,
                 "use_raw_values": True,
             },

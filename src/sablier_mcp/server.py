@@ -1044,27 +1044,37 @@ async def compute_betas(
 @server.tool(
     name="compute_returns",
     description=(
-        "Run an ad-hoc what-if stress test on a Moment (linear) model — the PRIMARY tool for quick scenario analysis. "
-        "Requires simulation_batch_id from analyze_quantitative or compute_betas. "
-        "Pass ALL conditioning_features as absolute price levels in the factors dict. "
-        "BEFORE calling: read factor_last_values_raw from the betas output — these are today's values. "
-        "Always state current vs stressed levels explicitly (e.g. 'Oil is at $82 today, stressing to $120'). "
-        "Also check data_freshness_warning in betas output — if present, betas may be stale. "
-        "Use factor_last_values_raw as baseline, then compute targets "
-        "(e.g. oil currently 82, stress to 120: pass {'Crude Oil': 120.0}). "
-        "For saved/reusable scenarios, use create_scenario then compute_returns with the factor values. "
+        "Run a what-if stress test on a Moment (linear) factor model — the "
+        "PRIMARY tool for scenario analysis. Requires simulation_batch_id "
+        "from analyze_quantitative or compute_betas. "
+        "Express stresses as FRACTIONAL CHANGES of each factor's current "
+        "value (shocks dict). The server translates to absolute levels "
+        "using each factor's latest observed value — you don't need to "
+        "look it up or do the arithmetic. "
+        "Examples: "
+        "• 'TLT down 8.5%' → {'TLT': -0.085}. "
+        "• '50bps rate cut on DGS10 (currently 5%)' → {'DGS10': -0.10} "
+        "(−50bps / 500bps of the current rate = −10%). "
+        "• 'VIX doubles (to ~40 from 20)' → {'VIX': 1.00}. "
+        "• 'SPY drops 20%' → {'SPY': -0.20}. "
+        "Omitted factors default to no shock. Include factor_last_values_raw "
+        "from the betas output in your narration so the user sees the "
+        "current level next to the stressed level. "
+        "Also check data_freshness_warning in betas output — if present, "
+        "betas may be stale. "
         "For Flow (generative) models, use simulate_flow_scenario instead."
     ),
     annotations=ToolAnnotations(title="Compute Returns", readOnlyHint=True, openWorldHint=True),
 )
 async def compute_returns(
     simulation_batch_id: Annotated[str, Field(description="From analyze_quantitative or compute_betas results")],
-    factors: Annotated[dict[str, float], Field(
+    shocks: Annotated[dict[str, float], Field(
         description=(
-            "Absolute target price levels for each factor. "
-            "Use factor_last_values_raw from betas output as current levels, "
-            "then compute target (e.g. US Market -5%: 682.39 * 0.95 = 648.27). "
-            "Keys must match conditioning_features exactly."
+            "Fractional change per factor. -0.10 = −10%, 0.25 = +25%. "
+            "Uniform convention for all feature types (prices, rates, "
+            "indices, volatilities). For a 50bps rate cut on a rate "
+            "currently at 5%: −50bps / 500bps = -0.10. For TLT down 8.5%: "
+            "-0.085. Keys must match conditioning_features."
         )
     )],
     n_samples: Annotated[int, Field(description="Number of Monte Carlo samples (default 1000)", default=1000)] = 1000,
@@ -1078,7 +1088,7 @@ async def compute_returns(
         # Synchronous — Moment returns results directly
         results = await client.compute_returns_batch(
             simulation_batch_id=simulation_batch_id,
-            factors=factors,
+            shocks=shocks,
             n_samples=n_samples,
         )
         returns_batch_id = results.get("returns_batch_id")
