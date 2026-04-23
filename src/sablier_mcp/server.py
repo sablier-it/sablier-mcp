@@ -96,14 +96,16 @@ async def search_features(
 @server.tool(
     name="add_feature",
     description=(
-        "Add a ticker to the feature catalog so it can be used in portfolios or conditioning sets. "
+        "Add a ticker to the feature catalog AND populate its historical data "
+        "in one call — the feature is ready to use in portfolios / conditioning "
+        "sets / models as soon as this tool returns. "
         "IMPORTANT: First use search_features to check if the ticker already exists — "
         "calling add_feature for an existing ticker returns a 409 error. "
         "Specify source ('yahoo' for stocks/ETFs/futures, 'fred' for rates/economic indicators). "
         "Validates the ticker exists on the source API and auto-populates metadata "
         "(display_name, category, units, etc.) from the API response. "
         "Set is_asset=true for assets that go into portfolios, false for conditioning factors. "
-        "After adding, call refresh_feature_data to populate its historical data."
+        "Note: takes a few seconds while the historical data is fetched."
     ),
     annotations=ToolAnnotations(title="Add Feature", destructiveHint=True, openWorldHint=True),
 )
@@ -136,7 +138,7 @@ async def add_feature(
             "data_type": result.get("data_type"),
             "units": result.get("units"),
             "source": result.get("source"),
-            "message": f"Feature '{ticker}' added to catalog. Call refresh_feature_data to populate historical data.",
+            "message": f"Feature '{ticker}' added to catalog with historical data populated; ready to use.",
         })
     except SablierAPIError as e:
         return _api_error(e)
