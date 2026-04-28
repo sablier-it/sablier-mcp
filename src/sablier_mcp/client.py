@@ -148,32 +148,6 @@ class SablierClient:
         """Refresh training data for specific tickers."""
         return await self._post_long("/features/available/refresh", json={"tickers": tickers})
 
-    async def list_transformations(self) -> list[dict]:
-        """List available transformation types for derived features."""
-        return await self._get("/features/transformations")
-
-    async def create_derived_feature(
-        self,
-        name: str,
-        base_feature: str,
-        transformation: str,
-        parameters: dict,
-        display_name: str | None = None,
-        description: str | None = None,
-    ) -> dict:
-        """Create a derived feature."""
-        body: dict[str, Any] = {
-            "name": name,
-            "base_feature": base_feature,
-            "transformation": transformation,
-            "parameters": parameters,
-        }
-        if display_name:
-            body["display_name"] = display_name
-        if description:
-            body["description"] = description
-        return await self._post("/features/derived", json=body)
-
     # ──────────────────────────────────────────────
     # Portfolios
     # ──────────────────────────────────────────────
@@ -206,10 +180,15 @@ class SablierClient:
         return await self._get(f"/portfolios/{portfolio_id}/live-value")
 
     async def get_portfolio_analytics(
-        self, portfolio_id: str, timeframe: str = "1Y"
+        self, portfolio_id: str, timeframe: str = "1Y",
+        model_group_id: str | None = None, rollup: str = "daily",
     ) -> dict:
+        params: dict = {"timeframe": timeframe}
+        if model_group_id:
+            params["model_group_id"] = model_group_id
+            params["rollup"] = rollup
         return await self._get(
-            f"/portfolios/{portfolio_id}/analytics", params={"timeframe": timeframe}
+            f"/portfolios/{portfolio_id}/analytics", params=params
         )
 
     async def get_asset_profiles(self, portfolio_id: str) -> dict:
@@ -497,7 +476,7 @@ class SablierClient:
     # Simulation — Betas (Moment — synchronous)
     # ──────────────────────────────────────────────
 
-    async def simulate_betas_batch(
+    async def compute_betas_batch(
         self,
         model_group_id: str,
         historical_lookback_days: int | None = None,
@@ -508,18 +487,18 @@ class SablierClient:
         }
         if historical_lookback_days is not None:
             body["historical_lookback_days"] = historical_lookback_days
-        return await self._post_long("/moment/simulate-betas/batch", json=body)
+        return await self._post_long("/moment/compute-betas/batch", json=body)
 
     async def get_betas_batch_results(self, simulation_batch_id: str) -> dict:
         return await self._get(
-            f"/moment/simulate-betas/batch/{simulation_batch_id}/results"
+            f"/moment/compute-betas/batch/{simulation_batch_id}/results"
         )
 
     async def portfolio_test(
         self, simulation_batch_id: str, weights: dict[str, float]
     ) -> dict:
         return await self._post(
-            f"/moment/simulate-betas/batch/{simulation_batch_id}/portfolio-test",
+            f"/moment/compute-betas/batch/{simulation_batch_id}/portfolio-test",
             json={"weights": weights},
         )
 
@@ -527,18 +506,23 @@ class SablierClient:
     # Simulation — Returns (Moment — synchronous)
     # ──────────────────────────────────────────────
 
-    async def simulate_returns_batch(
+    async def compute_returns_batch(
         self,
         simulation_batch_id: str,
-        factors: dict[str, float],
+        shocks: dict[str, float],
         n_samples: int = 1000,
     ) -> dict:
-        """Sample returns under stressed factor values. Synchronous."""
+        """Sample returns under stressed factor values. Synchronous.
+
+        ``shocks`` is the fractional change per factor (e.g. ``{"TLT":
+        -0.085}`` means TLT down 8.5%). Server converts to the absolute
+        target level using each factor's latest observed value.
+        """
         return await self._post_long(
-            "/moment/simulate-returns/batch",
+            "/moment/compute-returns/batch",
             json={
                 "simulation_batch_id": simulation_batch_id,
-                "factors": factors,
+                "shocks": shocks,
                 "n_samples": n_samples,
                 "use_raw_values": True,
             },
@@ -546,7 +530,7 @@ class SablierClient:
 
     async def get_returns_batch_results(self, returns_batch_id: str) -> dict:
         return await self._get(
-            f"/moment/simulate-returns/batch/{returns_batch_id}/results"
+            f"/moment/compute-returns/batch/{returns_batch_id}/results"
         )
 
     # ──────────────────────────────────────────────
@@ -919,7 +903,7 @@ class SablierClient:
 
         Args:
             portfolio_id: Portfolio defining assets and weights.
-            simulation_ids: {asset_ticker: returns_simulation_id} from simulate_returns_batch.
+            simulation_ids: {asset_ticker: returns_simulation_id} from compute_returns_batch.
             mode: 'single_shot_linear', 'single_shot_nonlinear', or 'rollout_nonlinear'.
 
         Returns:
@@ -1012,12 +996,12 @@ class SablierClient:
     async def delete_trading_rule(self, portfolio_id: str, rule_id: str) -> dict:
         return await self._delete(f"/portfolios/{portfolio_id}/rules/{rule_id}")
 
-    async def fortest_rules(self, portfolio_id: str, flow_job_id: str,
-                            rule_ids: list[str] | None = None) -> dict:
+    async def forward_test_rules(self, portfolio_id: str, flow_job_id: str,
+                                rule_ids: list[str] | None = None) -> dict:
         body: dict = {"flow_job_id": flow_job_id}
         if rule_ids is not None:
             body["rule_ids"] = rule_ids
-        return await self._post_long(f"/portfolios/{portfolio_id}/rules/fortest", json=body)
+        return await self._post_long(f"/portfolios/{portfolio_id}/rules/forward-test", json=body)
 
     async def evaluate_rules(self, portfolio_id: str,
                              rule_ids: list[str] | None = None) -> dict:
@@ -1025,6 +1009,33 @@ class SablierClient:
         if rule_ids is not None:
             body["rule_ids"] = rule_ids
         return await self._post(f"/portfolios/{portfolio_id}/rules/evaluate", json=body)
+
+    async def backtest_rules(self, portfolio_id: str, start_date: str,
+                             end_date: str | None = None,
+                             rule_ids: list[str] | None = None,
+                             warmup_days: int = 252,
+                             cost_bps: float = 10.0) -> dict:
+        body: dict = {"start_date": start_date, "warmup_days": warmup_days, "cost_bps": cost_bps}
+        if end_date:
+            body["end_date"] = end_date
+        if rule_ids:
+            body["rule_ids"] = rule_ids
+        return await self._post_long(f"/portfolios/{portfolio_id}/rules/backtest", json=body)
+
+    # ──────────────────────────────────────────────
+    # Screening
+    # ──────────────────────────────────────────────
+
+    async def screen_universe(self, criteria: list[dict],
+                              sort_by: str | None = None,
+                              sort_order: str = "desc",
+                              limit: int = 50,
+                              include_metrics: bool = True) -> dict:
+        body: dict = {"criteria": criteria, "sort_order": sort_order,
+                      "limit": limit, "include_metrics": include_metrics}
+        if sort_by:
+            body["sort_by"] = sort_by
+        return await self._post("/features/screen", json=body)
 
     # ──────────────────────────────────────────────
     # Tests

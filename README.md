@@ -8,7 +8,7 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that l
 
 ## What This Does
 
-Connect Sablier to Claude, ChatGPT, or any MCP-compatible AI assistant. The agent gets 53 tools to:
+Connect Sablier to Claude, ChatGPT, or any MCP-compatible AI assistant. The agent gets ~70 tools to:
 
 **Scan SEC filings & earnings calls** — AI reads every company's 10-K, 10-Q filings and earnings call transcripts, then scores how exposed each holding is to any theme you ask about (0-100 scale with evidence). _"How exposed is my portfolio to China supply chain risk?"_ — scored, evidenced, and ranked in seconds.
 
@@ -71,7 +71,7 @@ claude mcp add sablier -- uv --directory /path/to/sablier-mcp run sablier-mcp
 export SABLIER_API_KEY=sk_live_your_key_here
 ```
 
-## Tools (53)
+## Tools (~70)
 
 ### Market Intelligence
 
@@ -116,53 +116,86 @@ export SABLIER_API_KEY=sk_live_your_key_here
 | `list_feature_sets` | List all accessible feature sets |
 | `get_feature_set` | Get details of a specific feature set |
 | `delete_feature_set` | Delete a custom feature set |
-| `simulate_betas` | Compute per-asset factor betas from a trained model group |
-| `run_model_validation` | Validate model quality: R-squared, autocorrelation, regime sensitivity |
-| `get_model_validation` | Get cached validation results |
-| `get_residual_correlation` | Cross-asset residual correlation matrix |
+| `compute_betas` | Compute per-asset factor betas from a trained model group |
+| `compute_returns` | Sample forward asset returns under user-specified factor levels (Monte Carlo) |
+| `get_residual_correlation` | Cross-asset residual correlation matrix (post-factor) |
 | `list_simulations` | List all simulations for a model group |
+| `optimize_portfolio` | Find optimal weights from a trained MOMENT batch (analytical objectives) |
+| `get_optimization_history` | Browse past optimization runs for a portfolio |
 | `delete_model_group` | Delete a model group and all associated data |
 
 ### Stress Testing & Scenarios
 
 | Tool | Description |
 |------|-------------|
-| `simulate_returns` | Monte Carlo what-if: per-asset VaR, ES, expected return under custom factor levels |
-| `run_scenario` | Run a saved scenario template |
+| `compute_returns` | Monte Carlo what-if: per-asset VaR, ES, expected return under custom factor levels |
 | `create_scenario` | Save a named what-if scenario (fixed value, percentile, or shock) |
 | `list_scenarios` | List saved scenarios |
 | `get_scenario` | Get scenario details |
 | `update_scenario` | Update a scenario's factors or description |
 | `delete_scenario` | Delete a saved scenario |
-| `clone_scenario` | Clone a scenario template for editing |
 
 ### Generative Simulation (Flow)
 
 | Tool | Description |
 |------|-------------|
-| `generate_synthetic` | One-shot: train a flow model and generate multi-step synthetic market paths |
+| `train_flow_model` | Train a conditional flow-matching model on a model group |
+| `generate_flow_paths` | Generate baseline (unconstrained) synthetic price paths |
 | `simulate_flow_scenario` | Generate constrained paths (e.g., "gold above $3000 and VIX below 20") |
+| `check_flow_job` | Poll status of a queued/running flow job |
+| `get_flow_results` | Pull paths + summary stats from a completed generation job |
+| `download_flow_paths` | Download raw paths as JSON or CSV |
+| `list_flow_baselines` | List baseline path generations for a model group |
+| `list_flow_scenarios` | List scenario-conditioned generations for a model group |
+| `delete_flow_job` | Delete a flow job and its outputs |
 | `test_flow_risk` | Compute portfolio risk metrics across generated paths |
-| `flow_validate` | Validate flow model quality against historical data |
+| `flow_validate` | Validate flow model quality against historical data (calibration, dependence, tails) |
 
 ### Feature Catalog
 
 | Tool | Description |
 |------|-------------|
+| `search_features` | Search the catalog for available tickers / macro series |
 | `add_feature` | Add a ticker to the catalog (Yahoo Finance or FRED) |
 | `refresh_feature_data` | Fetch/update historical data for tickers |
-| `create_derived_feature` | Create derived features (moving averages, spreads, ratios) |
-| `list_transformations` | List available transformation types |
 
-### API Keys & Billing
+### Trading Rules
 
 | Tool | Description |
 |------|-------------|
-| `set_api_key` | Store a third-party API key (FRED, Finnhub) |
-| `list_api_keys` | List stored API key providers |
-| `delete_api_key` | Remove a stored API key |
+| `create_rule` | Create a trigger-action rule on a portfolio (VIX spike, drawdown, regime, etc.) |
+| `list_rules` | List rules attached to a portfolio |
+| `toggle_rule` | Activate or deactivate a rule |
+| `delete_rule` | Permanently delete a rule |
+| `evaluate_rules` | Check which rules would fire on the latest market data |
+| `backtest_rules` | Historical backtest of rules against real prices |
+| `forward_test_rules` | Forward-test rules against generated FLOW paths |
+
+### Derivatives
+
+| Tool | Description |
+|------|-------------|
+| `analyze_derivatives` | Greeks aggregation + scenario P&L for portfolio options positions |
+| `price_option_tool` | Price a single equity / futures option (Black-76) with Greeks |
+
+### Market Data
+
+| Tool | Description |
+|------|-------------|
+| `market_radar` | 60+ regime indicators (VIX, yield curve, credit, sector rotation, RORO) |
+| `screen_universe` | Cross-sectional screening across the equity catalog |
+
+### Account & Billing
+
+| Tool | Description |
+|------|-------------|
+| `whoami` | Current user, tier, and feature flags |
+| `get_credits` | Current credit balance and tier monthly allocation |
+| `list_credit_packs` | Browse one-off credit packs available for purchase |
+| `buy_credit_pack` | Purchase a credit pack via Stripe Checkout |
 | `get_billing_info` | View current subscription tier and limits |
 | `get_billing_usage` | View usage across metered buckets |
+| `toggle_overage` | Enable/disable per-call overage spending |
 | `subscribe` | Subscribe or upgrade via Stripe Checkout |
 | `manage_subscription` | Open Stripe Customer Portal |
 
@@ -178,7 +211,7 @@ Agent: 1. create_portfolio("Tech Portfolio", ["AAPL", "MSFT", "NVDA"], [0.4, 0.3
        2. list_feature_set_templates()  →  picks "Macro + Volatility" set
        3. analyze_quantitative(portfolio_id, conditioning_set_id)
           →  trains models, computes factor betas per asset
-       4. simulate_returns(sim_batch_id, {"VIX": 35, "US 10Y": 5.5, "SPY": 380})
+       4. compute_returns(sim_batch_id, {"VIX": 35, "US 10Y": 5.5, "SPY": 380})
           →  per-asset expected returns, VaR (95%), Expected Shortfall
 
        Result: Portfolio expected return = -8.2%, VaR(95%) = -14.5%
@@ -210,13 +243,17 @@ You:   I want to see how a gold + bonds portfolio performs over the next quarter
        in scenarios where inflation stays high.
 
 Agent: 1. create_portfolio("Inflation Hedge", ["GLD", "TLT", "IAU"], [0.4, 0.4, 0.2])
-       2. generate_synthetic(portfolio_id, conditioning_set_id, horizon=60, n_paths=500)
-          →  trains flow model (~5 min), generates 500 joint price paths
-       3. simulate_flow_scenario(model_group_id, constraints=[
+       2. train_flow_model(model_group_id, horizon=60)
+          →  dispatches GPU training job (~5-15 min async)
+       3. check_flow_job(job_id) until completed; flow_validate(model_group_id)
+          →  confirms model quality before generating paths
+       4. generate_flow_paths(model_group_id, n_paths=500)
+          →  generates 500 joint baseline price paths
+       5. simulate_flow_scenario(model_group_id, constraints=[
             {"feature_name": "CPI", "type": "level", "lower": 3.5, "t_start": 0, "t_end": 60}
           ])
           →  generates paths conditioned on CPI > 3.5%
-       4. test_flow_risk(portfolio_id, job_id)
+       6. test_flow_risk(portfolio_id, job_id)
           →  distribution of Sharpe, max drawdown, total return across constrained paths
 
        Result: Median return = +4.2%, 5th percentile = -6.8%
@@ -239,7 +276,7 @@ Agent: 1. market_radar()
 
        Result: Markets are risk-off (VIX +15% this week, credit spreads widening).
        Your tech portfolio is down -2.3% today, concentrated in high-beta names.
-       Consider: stress-test with simulate_returns to quantify downside risk.
+       Consider: stress-test with compute_returns to quantify downside risk.
 ```
 
 ## Authentication
