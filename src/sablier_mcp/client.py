@@ -98,9 +98,10 @@ class SablierClient:
 
     async def search_features(
         self,
-        query: str,
+        query: str = "",
         is_asset: bool | None = None,
         source: str | None = None,
+        category: str | None = None,
         limit: int = 50,
     ) -> list[dict]:
         params: dict[str, Any] = {"q": query, "limit": limit}
@@ -108,6 +109,8 @@ class SablierClient:
             params["is_asset"] = is_asset
         if source:
             params["source"] = source
+        if category:
+            params["category"] = category
         return await self._get("/features/search", params=params)
 
     async def add_feature(
@@ -643,9 +646,10 @@ class SablierClient:
         range: str = "1M",
         start_date: str | None = None,
         end_date: str | None = None,
+        frequency: str = "daily",
     ) -> list[dict]:
-        """Daily OHLC bars for a ticker over a date range."""
-        params: dict[str, Any] = {"range": range}
+        """OHLC bars for a ticker over a date range, at the requested frequency."""
+        params: dict[str, Any] = {"range": range, "frequency": frequency}
         if start_date:
             params["start_date"] = start_date
         if end_date:
