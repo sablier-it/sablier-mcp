@@ -1356,9 +1356,19 @@ async def delete_scenario(
         "Pass either portfolio_id or tickers directly (auto-creates portfolio with equal weights). "
         "Returns: factor exposures (betas), per-asset R² (in-sample goodness-of-fit — tells you how linear the relationship "
         "actually is for the given window), rolling_window used, factor_last_date (effective beta date — may be truncated "
-        "if a factor has stale data), and data_truncated_by (which factors caused truncation). "
-        "Tip: vary rolling_window (e.g. 63 vs 126 vs 252) to detect regime changes — diverging betas across windows "
-        "signal non-stationarity. Low R² suggests nonlinear dynamics or missing factors. "
+        "if a factor has stale data), and data_truncated_by (which factors caused truncation).\n\n"
+        "Important: there is NO regime-conditional or 'calm vs stress' beta API. If a user asks for "
+        "regime decomposition, do NOT invent it — the right substitute is to RE-RUN this tool with a "
+        "shorter rolling_window (e.g. 90 days vs the 252-day default) and compare the betas to the long-window "
+        "fit. Where (a) a beta shifted meaningfully AND (b) R² stayed reasonable in the short window, that's a "
+        "real shift to talk about. Where R² collapsed in the short window, the apparent shift is noise from "
+        "thin degrees of freedom — say so explicitly to the user. Do NOT pick rolling_window < 90 unless you "
+        "have very few factors: each per-asset regression has (n_factors + n_baseline_etfs) RHS variables, "
+        "and you need at least ~10 obs per parameter for stable betas (so rolling_window=90 supports up to "
+        "~9 RHS variables, rolling_window=60 supports ~6).\n\n"
+        "Low R² (e.g. < 0.2) suggests nonlinear dynamics or missing factors — flag the asset, don't claim "
+        "a precise beta decomposition. R² in this Moment model is per-asset (each asset gets its own "
+        "regression on the conditioning set), so a low R² for one name doesn't impeach the others. "
         "Next step: call compute_returns with the simulation_batch_id to run what-if stress tests."
     ),
     annotations=ToolAnnotations(title="Analyze Quantitative", destructiveHint=True, openWorldHint=True),
@@ -2019,6 +2029,19 @@ async def simulate_flow_scenario(
         description="Override horizon (defaults to training horizon).",
         default=None,
     )] = None,
+    skip_feasibility_gate: Annotated[bool, Field(
+        description=(
+            "Bypass the backend's pre-flight feasibility gate. DEFAULT FALSE. The gate "
+            "refuses scenarios whose natural probability is below ~0.5%, preventing "
+            "latent-mode rare-event distortions that produce unusable summary stats "
+            "(we shipped a real prod case where a 0% joint scenario fell through to "
+            "latent and returned expected_return=-91%). Set True ONLY after running "
+            "check_scenario_probability and consciously committing to a rare-event "
+            "regime — and then frame the result to the user as conditional on the "
+            "rare event, not as a marginal forecast."
+        ),
+        default=False,
+    )] = False,
 ) -> list | str:
     if err := _require_auth():
         return err
@@ -2054,12 +2077,14 @@ async def simulate_flow_scenario(
                 if bl_result.get("status") == "failed":
                     logger.warning("Auto-baseline generation failed, proceeding with scenario anyway")
 
-        # Dispatch constrained generation
+        # Dispatch constrained generation. skip_baseline=False (the
+        # default) lets the backend's feasibility gate fire.
         job = await _retry_gpu_call(lambda: client.flow_generate_constrained_paths(
             model_group_id=model_group_id,
             constraints=constraints,
             n_paths=n_paths,
             horizon=horizon,
+            skip_baseline=skip_feasibility_gate,
         ))
         job_id = job.get("job_id")
         if not job_id:

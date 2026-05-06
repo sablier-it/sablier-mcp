@@ -825,9 +825,20 @@ class SablierClient:
         n_paths: int = 1000,
         horizon: int | None = None,
         name: str | None = None,
-        skip_baseline: bool = True,
+        skip_baseline: bool = False,
     ) -> dict:
-        """Start async constrained path generation job (latent optimization)."""
+        """Start async constrained path generation job.
+
+        ``skip_baseline=False`` (the default) makes the backend run its
+        feasibility gate: a 1000-path probe of the unconstrained
+        distribution that refuses scenarios whose natural probability is
+        below ~0.5%. This is the safety net that prevents latent-mode
+        rare-event distortions (we shipped a real prod case where a 0%
+        joint scenario fell through to latent and produced an
+        ``expected_return = -91%`` artefact). Pass ``skip_baseline=True``
+        only when the caller has already run check_scenario_probability
+        and is consciously committing to a rare-event regime.
+        """
         body: dict[str, Any] = {
             "model_group_id": model_group_id,
             "constraints": constraints,
