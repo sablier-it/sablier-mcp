@@ -368,6 +368,36 @@ async def get_portfolio_value(
 
 
 @server.tool(
+    name="get_portfolio_fact_sheet",
+    description=(
+        "One-call printable portfolio summary. Returns:\n"
+        "  • allocation — per-position ticker, name, current price, current value, current weight, target weight\n"
+        "  • returns — MTD, QTD, YTD, 1Y period returns\n"
+        "  • growth_of_10k — $10K invested 1Y ago, portfolio vs benchmark ending value\n"
+        "  • risk_stats — Sharpe, Sortino, vol, max drawdown, beta, alpha, risk-free rate (1Y window)\n"
+        "  • benchmark_return_1y, as_of, n_data_points\n\n"
+        "Use this when the user asks for 'a one-pager', 'portfolio summary', 'how is my portfolio doing'. "
+        "Single call, ~1-2s, free. Default benchmark SPY; pass any ticker to override."
+    ),
+    annotations=ToolAnnotations(title="Get Portfolio Fact Sheet", readOnlyHint=True),
+)
+async def get_portfolio_fact_sheet(
+    portfolio_id: Annotated[str, Field(description="The portfolio UUID")],
+    benchmark_symbol: Annotated[str, Field(description="Benchmark ticker for growth-of-$10K + beta/alpha (default 'SPY')", default="SPY")] = "SPY",
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(portfolio_id, "portfolio_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.get_portfolio_fact_sheet(portfolio_id, benchmark_symbol=benchmark_symbol)
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
     name="get_portfolio_analytics",
     description=(
         "Get historical portfolio analytics: Sharpe ratio, volatility, expected return, max drawdown, "
@@ -1862,28 +1892,97 @@ async def generate_flow_paths(
 
 
 @server.tool(
+    name="check_scenario_probability",
+    description=(
+        "Pre-flight feasibility check for a constrained FLOW scenario. ALWAYS call this BEFORE "
+        "simulate_flow_scenario when you have ≥2 constraints, or whenever you're unsure if a "
+        "scenario is in the model's natural distribution.\n\n"
+        "Probes the trained model with up to n_baseline unconstrained paths and reports what "
+        "fraction satisfy your constraints, plus a recommended generation method:\n"
+        "  • probability ≥5%   → 'rejection' (fast, exact samples)\n"
+        "  • probability 1-5%  → 'hybrid'    (rejection + latent fallback)\n"
+        "  • probability <1%   → 'latent'    (paths satisfy by construction; mild dynamics distortion)\n"
+        "  • probability <0.1% → infeasibility floor — refuse or relax constraints\n\n"
+        "Cheap (~1-15s) compared to a full scenario (minutes + GPU credits). Reuses today's "
+        "baseline if generate_flow_paths has already been called; if not, auto_generate_baseline=True "
+        "(default) creates one in the same call.\n\n"
+        "Workflow when probability is low: report it back to the user, then iterate — try each "
+        "constraint individually to identify the binding one, relax magnitudes, widen t_start/t_end "
+        "windows, or drop the least-essential constraint. Only commit to simulate_flow_scenario once "
+        "probability is in a usable band, OR the user has explicitly accepted latent-mode distortion.\n\n"
+        "feature_name in constraints must be the DISPLAY NAME from the trained model's feature_names "
+        "(e.g. 'Apple Inc.', 'SPDR S&P 500 ETF Trust'), NOT ticker symbols."
+    ),
+    annotations=ToolAnnotations(title="Check Scenario Probability", readOnlyHint=True, openWorldHint=True),
+)
+async def check_scenario_probability(
+    model_group_id: Annotated[str, Field(
+        description="UUID of the model group with a trained Flow model (from train_flow_model)"
+    )],
+    constraints: Annotated[list[dict], Field(
+        description=(
+            "Same shape as simulate_flow_scenario constraints. Each MUST have 'lower' and/or 'upper'. "
+            "Required keys: feature_name, lower and/or upper. Optional: type, t_start, t_end. "
+            "Example: [{'feature_name': 'Equity Volatility (VIX)', 'lower': 30, 't_start': 10, 't_end': 25}]"
+        )
+    )],
+    n_paths_target: Annotated[int, Field(
+        description="Number of paths the eventual scenario would generate (used for the method recommendation). Default 1000.",
+        default=1000,
+    )] = 1000,
+    auto_generate_baseline: Annotated[bool, Field(
+        description="If no same-day baseline exists, generate one (~30s extra). Default True.",
+        default=True,
+    )] = True,
+    n_baseline: Annotated[int, Field(
+        description="Probe size when generating a baseline. Larger = better resolution (1/n_baseline = floor) but slower. Default 1000.",
+        default=1000,
+    )] = 1000,
+) -> str:
+    if err := _require_auth():
+        return err
+    if err := _validate_uuid(model_group_id, "model_group_id"):
+        return err
+    try:
+        client = get_client()
+        result = await client.flow_check_scenario_probability(
+            model_group_id=model_group_id,
+            constraints=constraints,
+            n_paths_target=n_paths_target,
+            auto_generate_baseline=auto_generate_baseline,
+            n_baseline=n_baseline,
+        )
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
     name="simulate_flow_scenario",
     description=(
         "Start constrained what-if scenario generation from a trained Flow model. "
         "Returns immediately with a job_id — use check_flow_job(job_id, job_type='generate') to poll for results. "
-        "IMPORTANT: Always run generate_flow_paths FIRST on the same day before running any scenarios. "
-        "This establishes a same-day baseline — when you retrieve results via get_flow_results, "
-        "scenario_probability is automatically computed: the fraction of unconstrained baseline paths "
-        "that naturally satisfy your constraints, telling you how likely the scenario is. "
-        "≥5% = within normal range | 1-5% = rare | <1% = outside training distribution. "
-        "scenario_probability is measured from the baseline n_paths (default 1000), giving a resolution floor of 0.1% — "
-        "0% means below measurable threshold, not necessarily impossible. "
-        "THREE WAYS TO GET 0% PROBABILITY — avoid all: "
+        "PREREQ: Always run generate_flow_paths FIRST on the same day to establish a baseline.\n\n"
+        "REQUIRED for any scenario with ≥2 constraints: call check_scenario_probability FIRST and "
+        "verify probability ≥0.1% before invoking this tool. Two constraints multiply joint probability "
+        "(e.g. oil ≥155 alone ~2%, VIX ≥40 alone ~3% → joint ~0.06%, below the resolution floor). "
+        "Skipping the pre-check wastes GPU credits on infeasible scenarios and surfaces 0% results that "
+        "are confusing to the user. The pre-check is ~1-15s; the full scenario is minutes.\n\n"
+        "After this tool runs, scenario_probability comes back in get_flow_results — interpret it as: "
+        "≥5% within normal range | 1-5% rare | <1% outside training distribution | 0% below measurable "
+        "(not necessarily impossible — could be rare-event paths from latent mode). When latent mode "
+        "produced the paths, surface that to the user verbatim — those paths satisfy constraints by "
+        "construction but represent rare-event distortions, not unconditional samples.\n\n"
+        "THREE WAYS TO GET 0% PROBABILITY — avoid all:\n"
         "(1) DURATION: mean-reverting features (VIX, spreads, rates) spike for days to weeks, not months. "
-        "Always use t_start/t_end to window constraints (e.g. t_start=10, t_end=20), not the full horizon. "
-        "(2) JUMP TOO ABRUPT: if today's value is far from the threshold, t_start must give enough time to get there. "
-        "(3) MULTIPLE CONSTRAINTS: joint probability multiplies — if oil ≥155 is 2% and VIX ≥40 is 3%, the joint is ~0.06%, below the 0.1% resolution floor. "
-        "With 2+ constraints, check scenario_probability first and consider testing each constraint individually before combining. "
+        "Always use t_start/t_end to window constraints (e.g. t_start=10, t_end=20), not the full horizon.\n"
+        "(2) JUMP TOO ABRUPT: if today's value is far from the threshold, t_start must give enough time to get there.\n"
+        "(3) MULTIPLE CONSTRAINTS: joint probability multiplies. With 2+ constraints, ALWAYS check_scenario_probability first.\n\n"
         "Check last_price from generate_flow_paths first — if VIX is at 15 and you constrain it above 30 from day 5, "
         "that's a 2x move in 5 days (essentially never happens). Set t_start large enough for a realistic transition: "
         "the bigger the gap between current value and threshold, the later t_start should be. "
-        "VIX all-time high ~89, never sustained above 30 for more than a few weeks. "
-        "IMPORTANT: feature_name in constraints must be the DISPLAY NAME from feature_names "
+        "VIX all-time high ~89, never sustained above 30 for more than a few weeks.\n\n"
+        "feature_name in constraints must be the DISPLAY NAME from feature_names "
         "(e.g. 'Apple Inc.', 'SPDR S&P 500 ETF Trust'), NOT ticker symbols. "
         "Constraint types: 'level' (absolute price bounds), 'return' (per-step return bounds). "
         "Pass portfolio_id through so test_flow_risk can be called directly on results. "
@@ -2330,6 +2429,85 @@ async def delete_rule(
         client = get_client()
         await client.delete_trading_rule(portfolio_id, rule_id)
         return _fmt({"rule_id": rule_id, "deleted": True})
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="update_rule",
+    description=(
+        "Edit an existing systematic trading rule. Only fields you pass are updated; omit a field to leave it untouched. "
+        "Use to retune a trigger threshold, change the action, rename, reprioritize, or flip activation. "
+        "For just toggling active/inactive, prefer toggle_rule (clearer intent). "
+        "live_mode controls broker deployment: null = paper-only, 'observe' = log live signals without trading, "
+        "'auto' = execute via connected broker. Live deployment requires a connected broker (see platform UI)."
+    ),
+    annotations=ToolAnnotations(title="Update Trading Rule"),
+)
+async def update_rule(
+    portfolio_id: Annotated[str, Field(description="Portfolio UUID")],
+    rule_id: Annotated[str, Field(description="Rule UUID")],
+    name: Annotated[str | None, Field(description="New rule name", default=None)] = None,
+    description: Annotated[str | None, Field(description="New description", default=None)] = None,
+    trigger: Annotated[dict | None, Field(description="New trigger spec (same shape as create_rule)", default=None)] = None,
+    action: Annotated[dict | None, Field(description="New action spec (same shape as create_rule)", default=None)] = None,
+    is_active: Annotated[bool | None, Field(description="Activate / deactivate", default=None)] = None,
+    priority: Annotated[int | None, Field(description="Execution priority (lower runs first when multiple rules fire)", default=None)] = None,
+    live_mode: Annotated[str | None, Field(description="Broker deployment: null / 'observe' / 'auto'", default=None)] = None,
+) -> list | str:
+    if err := _require_auth():
+        return err
+    fields: dict[str, Any] = {}
+    if name is not None:
+        fields["name"] = name
+    if description is not None:
+        fields["description"] = description
+    if trigger is not None:
+        fields["trigger"] = trigger
+    if action is not None:
+        fields["action"] = action
+    if is_active is not None:
+        fields["is_active"] = is_active
+    if priority is not None:
+        fields["priority"] = priority
+    if live_mode is not None:
+        fields["live_mode"] = live_mode
+    if not fields:
+        return "Error: at least one field must be provided to update"
+    try:
+        client = get_client()
+        result = await client.update_trading_rule(portfolio_id, rule_id, **fields)
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="validate_rules",
+    description=(
+        "Preflight validation of stored rules: schema-checks each rule's trigger and action grammar, "
+        "verifies referenced assets exist in the portfolio, and (if flow_job_id given) confirms every feature "
+        "the rules reference is covered by the FLOW model's feature set. "
+        "Run this before backtest_rules / forward_test_rules to surface bad rules cheaply (~200ms, free) "
+        "instead of letting them silently fail mid-backtest. "
+        "Returns ok=true with empty error lists if all clean; otherwise lists missing_portfolio_assets, "
+        "missing_rule_features, and per-rule grammar errors so the agent can patch and retry."
+    ),
+    annotations=ToolAnnotations(title="Validate Rules", readOnlyHint=True),
+)
+async def validate_rules(
+    portfolio_id: Annotated[str, Field(description="Portfolio UUID")],
+    rule_ids: Annotated[list[str] | None, Field(description="Specific rules to check (default: all rules in the portfolio)", default=None)] = None,
+    flow_job_id: Annotated[str | None, Field(description="FLOW generation job to feature-coverage-check against (optional)", default=None)] = None,
+) -> list | str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        result = await client.validate_trading_rules(
+            portfolio_id=portfolio_id, rule_ids=rule_ids, flow_job_id=flow_job_id,
+        )
+        return _fmt(result)
     except SablierAPIError as e:
         return _api_error(e)
 
@@ -3050,6 +3228,274 @@ async def market_radar() -> str:
     except Exception as e:
         logger.error("market_radar failed: %s", e, exc_info=True)
         return f"Market radar failed: {e}"
+
+
+# ══════════════════════════════════════════════════
+# Market Data — quotes, history, news, fundamentals
+# ══════════════════════════════════════════════════
+
+
+@server.tool(
+    name="get_quotes",
+    description=(
+        "Live price snapshot for one or more tickers (Alpha Vantage). "
+        "Pass up to 100 tickers in one call. Returns current price, change, change_pct per symbol; "
+        "unresolved tickers (typos, delistings) come back as error stubs without failing the batch. "
+        "Use for 'what's X trading at right now?' or to seed a quick position-level P&L calc."
+    ),
+    annotations=ToolAnnotations(title="Get Quotes", readOnlyHint=True, openWorldHint=True),
+)
+async def get_quotes(
+    tickers: Annotated[list[str], Field(description="Tickers to quote (e.g. ['AAPL', 'MSFT', 'NVDA']). Max 100.")],
+) -> str:
+    if err := _require_auth():
+        return err
+    if not tickers:
+        return "Error: tickers cannot be empty"
+    try:
+        client = get_client()
+        result = await client.get_quotes(tickers[:100])
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="get_history",
+    description=(
+        "Daily OHLC bars for a single ticker over a date range. "
+        "Use range='1W'/'1M'/'3M'/'6M'/'1Y'/'2Y'/'5Y'/'ALL' for canned windows, OR pass start_date/end_date "
+        "(YYYY-MM-DD) for a custom slice. Returns one row per trading day with open/high/low/close/adj_close/volume. "
+        "Use for ad-hoc time-series analysis the trained models don't already cover (return distributions, "
+        "drawdown curves, custom regression windows, event studies around specific dates)."
+    ),
+    annotations=ToolAnnotations(title="Get History", readOnlyHint=True, openWorldHint=True),
+)
+async def get_history(
+    ticker: Annotated[str, Field(description="Single ticker symbol (e.g. 'AAPL')")],
+    range: Annotated[str, Field(description="Canned window: 1W / 1M / 3M / 6M / 1Y / 2Y / 5Y / ALL", default="1M")] = "1M",
+    start_date: Annotated[str | None, Field(description="Start date YYYY-MM-DD (overrides range)", default=None)] = None,
+    end_date: Annotated[str | None, Field(description="End date YYYY-MM-DD (overrides range)", default=None)] = None,
+) -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        result = await client.get_history(ticker, range=range, start_date=start_date, end_date=end_date)
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="get_news",
+    description=(
+        "News feed with per-ticker sentiment scores (Alpha Vantage NEWS_SENTIMENT). "
+        "Filter by tickers (per-name news + sentiment) or topics (e.g. 'earnings', 'mergers_and_acquisitions', "
+        "'financial_markets', 'economy_macro'). Returns headlines, source, summary, sentiment label/score, "
+        "and per-ticker sentiment within multi-ticker articles. "
+        "Strong for 'any news on X?', 'what's driving X today?', or a portfolio-wide news roll-up "
+        "(pass the portfolio's tickers). Pair with market_radar for the full 'what's happening' briefing."
+    ),
+    annotations=ToolAnnotations(title="Get News", readOnlyHint=True, openWorldHint=True),
+)
+async def get_news(
+    tickers: Annotated[list[str] | None, Field(description="Filter by tickers (e.g. ['AAPL', 'MSFT'])", default=None)] = None,
+    topics: Annotated[list[str] | None, Field(description="Filter by topics (e.g. ['earnings', 'economy_macro'])", default=None)] = None,
+    limit: Annotated[int, Field(description="Max items (1-200, default 30)", default=30, ge=1, le=200)] = 30,
+) -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        result = await client.get_news(tickers=tickers, topics=topics, limit=limit)
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="get_fundamentals",
+    description=(
+        "Company fundamentals for a single US equity: P/E, PEG, P/B, P/S, EV/EBITDA, EV/Revenue, EPS, "
+        "revenue TTM, EBITDA, profit margin, operating margin, ROE, ROA, dividend yield, beta, "
+        "52-week high/low, 50/200-day moving averages, market cap, shares outstanding, analyst target price, "
+        "analyst ratings, quarterly earnings/revenue growth YoY. "
+        "Source: Alpha Vantage OVERVIEW (verified data provider, 24h cache — fundamentals change at most "
+        "quarterly so caching is safe). Only US equities with SEC filings; ETFs / futures / crypto return 404."
+    ),
+    annotations=ToolAnnotations(title="Get Fundamentals", readOnlyHint=True, openWorldHint=True),
+)
+async def get_fundamentals(
+    ticker: Annotated[str, Field(description="US equity ticker (e.g. 'AAPL')")],
+) -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        result = await client.get_fundamentals(ticker)
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+# ══════════════════════════════════════════════════
+# Market Data — context (rates, vol, earnings, movers)
+# ══════════════════════════════════════════════════
+
+
+@server.tool(
+    name="get_yield_curve",
+    description=(
+        "Current US Treasury yield curve (2y / 5y / 10y / 30y) plus 2s10s spread. "
+        "Use for rates context, curve-shape regime, or to feed a duration scenario."
+    ),
+    annotations=ToolAnnotations(title="Get Yield Curve", readOnlyHint=True),
+)
+async def get_yield_curve() -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        result = await client.get_yield_curve()
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="get_vix_panel",
+    description=(
+        "VIX level + term structure (VIX vs VIX3M vs VIX6M) + implied vol regime. "
+        "Backwardation = stress (front > back), contango = calm. Use for vol-regime context "
+        "before running stress scenarios or sizing options overlays."
+    ),
+    annotations=ToolAnnotations(title="Get VIX Panel", readOnlyHint=True),
+)
+async def get_vix_panel() -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        result = await client.get_vix_panel()
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="get_earnings_calendar",
+    description=(
+        "Upcoming earnings reports sorted chronologically. Filter by single symbol, by date window "
+        "(start_date/end_date YYYY-MM-DD), or by horizon ('3month'/'6month'/'12month'). "
+        "Returns symbol, company name, report date, report time (BMO/AMC), estimate EPS, actual EPS where reported. "
+        "Use to flag earnings-event risk in a portfolio over the next N days."
+    ),
+    annotations=ToolAnnotations(title="Get Earnings Calendar", readOnlyHint=True, openWorldHint=True),
+)
+async def get_earnings_calendar(
+    symbol: Annotated[str | None, Field(description="Single ticker filter", default=None)] = None,
+    horizon: Annotated[str, Field(description="Window: '3month' / '6month' / '12month'", default="3month")] = "3month",
+    start_date: Annotated[str | None, Field(description="Start date YYYY-MM-DD (overrides horizon)", default=None)] = None,
+    end_date: Annotated[str | None, Field(description="End date YYYY-MM-DD (overrides horizon)", default=None)] = None,
+    limit: Annotated[int, Field(description="Max rows (1-500, default 50)", default=50, ge=1, le=500)] = 50,
+) -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        result = await client.get_earnings_calendar(
+            symbol=symbol, horizon=horizon, start_date=start_date, end_date=end_date, limit=limit,
+        )
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="get_top_movers",
+    description=(
+        "Top gainers, top losers, and most-active stocks for the day. "
+        "Use for 'what moved today' context — pair with get_news to explain why."
+    ),
+    annotations=ToolAnnotations(title="Get Top Movers", readOnlyHint=True),
+)
+async def get_top_movers() -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        result = await client.get_top_movers()
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="get_indices",
+    description=(
+        "Major US equity indices snapshot (S&P 500, Nasdaq 100, Dow, Russell 2000) sourced from ETF proxies. "
+        "Returns symbol, name, price, change, change_pct. Quick orient before deeper analysis."
+    ),
+    annotations=ToolAnnotations(title="Get Indices", readOnlyHint=True),
+)
+async def get_indices() -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        result = await client.get_indices()
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="get_sectors",
+    description=(
+        "S&P 500 sector ETF performance over a window: 1D / 1W / 1M / YTD. "
+        "Returns one row per sector with performance_pct + change_pct. "
+        "Use for sector-rotation reads ('which sectors are leading this week?')."
+    ),
+    annotations=ToolAnnotations(title="Get Sectors", readOnlyHint=True, openWorldHint=True),
+)
+async def get_sectors(
+    window: Annotated[str, Field(description="Lookback window: '1D' / '1W' / '1M' / 'YTD'", default="1D")] = "1D",
+) -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        result = await client.get_sectors(window=window)
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
+    name="compute_correlations",
+    description=(
+        "Pairwise correlation matrix + annualized volatility from daily returns over a window. "
+        "Pass 2-20 tickers and a timeframe ('1W'/'1M'/'3M'/'6M'/'1Y'/'2Y'/'5Y'/'ALL', default '1Y'). "
+        "Returns the matrix, per-asset annualized vol, and the top-correlated pairs. "
+        "Lighter than analyze_quantitative when you just want raw pairwise structure without a factor model."
+    ),
+    annotations=ToolAnnotations(title="Compute Correlations", readOnlyHint=True, openWorldHint=True),
+)
+async def compute_correlations(
+    tickers: Annotated[list[str], Field(description="2-20 tickers (e.g. ['AAPL', 'MSFT', 'NVDA', 'GOOGL'])")],
+    timeframe: Annotated[str, Field(description="Window: '1W' / '1M' / '3M' / '6M' / '1Y' / '2Y' / '5Y' / 'ALL'", default="1Y")] = "1Y",
+) -> str:
+    if err := _require_auth():
+        return err
+    if len(tickers) < 2 or len(tickers) > 20:
+        return "Error: tickers must be a list of 2-20 symbols"
+    try:
+        client = get_client()
+        result = await client.get_correlations(tickers=tickers, timeframe=timeframe)
+        return _fmt(result)
+    except SablierAPIError as e:
+        return _api_error(e)
 
 
 # ══════════════════════════════════════════════════

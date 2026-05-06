@@ -633,6 +633,92 @@ class SablierClient:
         """Get comprehensive market radar snapshot with 50+ indicators and regime signals."""
         return await self._get("/market/radar")
 
+    async def get_quotes(self, tickers: list[str]) -> list[dict]:
+        """Live price snapshot for one or more tickers (Alpha Vantage)."""
+        return await self._get("/market/quote", params={"tickers": ",".join(tickers)})
+
+    async def get_history(
+        self,
+        ticker: str,
+        range: str = "1M",
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> list[dict]:
+        """Daily OHLC bars for a ticker over a date range."""
+        params: dict[str, Any] = {"range": range}
+        if start_date:
+            params["start_date"] = start_date
+        if end_date:
+            params["end_date"] = end_date
+        return await self._get(f"/market/history/{ticker}", params=params)
+
+    async def get_news(
+        self,
+        tickers: list[str] | None = None,
+        topics: list[str] | None = None,
+        limit: int = 30,
+    ) -> list[dict]:
+        """News feed with per-ticker sentiment scores."""
+        params: dict[str, Any] = {"limit": limit}
+        if tickers:
+            params["tickers"] = ",".join(tickers)
+        if topics:
+            params["topics"] = ",".join(topics)
+        return await self._get("/market/news", params=params)
+
+    async def get_fundamentals(self, ticker: str) -> dict:
+        """Company fundamentals (P/E, P/B, margins, ROE, analyst targets)."""
+        return await self._get(f"/market/fundamentals/{ticker}")
+
+    async def get_yield_curve(self) -> dict:
+        """Current US Treasury yield curve plus 2s10s spread."""
+        return await self._get("/market/yield-curve")
+
+    async def get_vix_panel(self) -> dict:
+        """VIX level + term structure (VIX/VIX3M/VIX6M) + regime."""
+        return await self._get("/market/vix-panel")
+
+    async def get_earnings_calendar(
+        self,
+        symbol: str | None = None,
+        horizon: str = "3month",
+        start_date: str | None = None,
+        end_date: str | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Upcoming earnings reports."""
+        params: dict[str, Any] = {"horizon": horizon, "limit": limit}
+        if symbol:
+            params["symbol"] = symbol
+        if start_date:
+            params["start_date"] = start_date
+        if end_date:
+            params["end_date"] = end_date
+        return await self._get("/market/earnings-calendar", params=params)
+
+    async def get_top_movers(self) -> dict:
+        """Top gainers, losers, most-active for the day."""
+        return await self._get("/market/movers")
+
+    async def get_indices(self) -> list[dict]:
+        """Major US equity indices snapshot via ETF proxies."""
+        return await self._get("/market/indices")
+
+    async def get_sectors(self, window: str = "1D") -> list[dict]:
+        """S&P 500 sector ETF performance over a window."""
+        return await self._get("/market/sectors", params={"window": window})
+
+    async def get_correlations(
+        self,
+        tickers: list[str],
+        timeframe: str = "1Y",
+    ) -> dict:
+        """Pairwise correlation matrix + annualized volatility from daily returns."""
+        return await self._get(
+            "/market/correlations",
+            params={"tickers": ",".join(tickers), "range": timeframe},
+        )
+
     # ──────────────────────────────────────────────
     # Flow (Generative Time Series)
     # ──────────────────────────────────────────────
@@ -707,6 +793,30 @@ class SablierClient:
         if price_history_length is not None:
             body["price_history_length"] = price_history_length
         return await self._post_long("/flow/generate-paths", json=body)
+
+    async def flow_check_scenario_probability(
+        self,
+        model_group_id: str,
+        constraints: list[dict],
+        n_paths_target: int = 1000,
+        auto_generate_baseline: bool = True,
+        n_baseline: int = 1000,
+    ) -> dict:
+        """Pre-flight probability check for a constrained FLOW scenario.
+
+        Returns the fraction of unconstrained baseline paths that satisfy
+        the proposed constraints + a recommended generation method
+        (rejection / hybrid / latent). Reuses a same-day baseline if one
+        exists (~1s), otherwise can auto-generate one.
+        """
+        body: dict[str, Any] = {
+            "model_group_id": model_group_id,
+            "constraints": constraints,
+            "n_paths_target": n_paths_target,
+            "auto_generate_baseline": auto_generate_baseline,
+            "n_baseline": n_baseline,
+        }
+        return await self._post_long("/flow/check-scenario-probability", json=body)
 
     async def flow_generate_constrained_paths(
         self,
@@ -1009,6 +1119,31 @@ class SablierClient:
         if rule_ids is not None:
             body["rule_ids"] = rule_ids
         return await self._post(f"/portfolios/{portfolio_id}/rules/evaluate", json=body)
+
+    async def validate_trading_rules(
+        self,
+        portfolio_id: str,
+        rule_ids: list[str] | None = None,
+        flow_job_id: str | None = None,
+    ) -> dict:
+        """Preflight validation of stored rules against schema + optional FLOW feature coverage."""
+        body: dict = {}
+        if rule_ids is not None:
+            body["rule_ids"] = rule_ids
+        if flow_job_id is not None:
+            body["flow_job_id"] = flow_job_id
+        return await self._post(f"/portfolios/{portfolio_id}/rules/validate", json=body)
+
+    async def get_portfolio_fact_sheet(
+        self,
+        portfolio_id: str,
+        benchmark_symbol: str = "SPY",
+    ) -> dict:
+        """One-call portfolio summary: allocation, period returns, growth-of-$10K, risk stats."""
+        return await self._get(
+            f"/portfolios/{portfolio_id}/fact-sheet",
+            params={"benchmark_symbol": benchmark_symbol},
+        )
 
     async def backtest_rules(self, portfolio_id: str, start_date: str,
                              end_date: str | None = None,
