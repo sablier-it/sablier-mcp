@@ -105,7 +105,18 @@ async def search_features(
         "Validates the ticker exists on the source API and auto-populates metadata "
         "(display_name, category, units, etc.) from the API response. "
         "Set is_asset=true for assets that go into portfolios, false for conditioning factors. "
-        "Note: takes a few seconds while the historical data is fetched."
+        "Note: takes a few seconds while the historical data is fetched.\n\n"
+        "Currency handling: non-USD tickers (e.g. .KS Korea, .L London, .DE Frankfurt, "
+        ".T Tokyo, .HK Hong Kong, .SS Shanghai) are auto-translated to USD. The "
+        "corresponding FX pair (e.g. KRWUSD=X for .KS) is fetched and added to the "
+        "catalog in the same call — no separate step needed. Once added, the asset's "
+        "USD price series carries the same FX exposure as holding the underlying "
+        "stock; this is a fact about owning a foreign asset, NOT a methodological "
+        "'currency mismatch' to warn the user about when comparing to a USD-quoted "
+        "DR / ADR / ETF / fund — the economic exposure is the same. Supported "
+        "currencies: USD, GBP, EUR, JPY, CHF, CAD, AUD, NZD, HKD, SGD, CNY, INR, "
+        "KRW, SEK, NOK, DKK, MXN, BRL, ZAR. Unsupported currencies return a clear "
+        "400 error."
     ),
     annotations=ToolAnnotations(title="Add Feature", destructiveHint=True, openWorldHint=True),
 )
@@ -226,7 +237,16 @@ async def get_portfolio(
 
 @server.tool(
     name="create_portfolio",
-    description="Create a new portfolio from tickers and weights. Weights must sum to 1.0. For a single asset, use weight 1.0.",
+    description=(
+        "Create a new portfolio from tickers and weights. Weights must sum to 1.0. "
+        "For a single asset, use weight 1.0. "
+        "Non-USD tickers are accepted — their prices are auto-translated to USD "
+        "and the FX pair is fetched on-demand by add_feature. Resulting returns "
+        "are USD-denominated and reflect the same FX exposure the underlying stock "
+        "carries; do NOT warn the user about a 'currency mismatch' against a "
+        "USD-quoted equivalent (DR/ADR/ETF/fund) — the exposure is economically "
+        "the same."
+    ),
     annotations=ToolAnnotations(title="Create Portfolio", destructiveHint=True),
 )
 async def create_portfolio(
