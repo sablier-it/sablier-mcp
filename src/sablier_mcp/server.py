@@ -51,19 +51,39 @@ from sablier_mcp._core import (
 
 @server.tool(
     name="search_features",
-    description="Search for tickers (stocks, ETFs) and market indicators (VIX, DXY, rates). Returns matching symbols with descriptions. Use this to validate tickers before creating a portfolio.",
+    description=(
+        "Find tickers and market indicators in the catalog. Three usable shapes:\n"
+        "  1. ``query='gold'`` — keyword search across ticker / name / description\n"
+        "  2. ``category='fx'`` (no query) — list every FX feature in the catalog. "
+        "Same for 'commodity', 'rates', 'volatility', 'economic', 'crypto', 'equity'\n"
+        "  3. ``query='ETF', category='commodity', is_asset=True`` — narrow by both\n\n"
+        "PREFER browsing by category to keyword-spam: one ``category='fx'`` call beats "
+        "ten ``query='euro currency'`` / ``query='FXY yen'`` / etc. searches when you "
+        "want every instrument in a class. Browsing is also more reliable — catalog "
+        "rows are tagged with category at ingest, so you don't depend on the keyword "
+        "matching the description."
+    ),
     annotations=ToolAnnotations(title="Search Features", readOnlyHint=True, openWorldHint=True),
 )
 async def search_features(
-    query: Annotated[str, Field(description="Search term (e.g. 'AAPL', 'technology', 'volatility', 'gold')")],
+    query: Annotated[str, Field(
+        description="Search term (e.g. 'AAPL', 'technology', 'volatility', 'gold'). Optional — leave empty to browse by category alone.",
+        default="",
+    )] = "",
     is_asset: Annotated[bool | None, Field(description="If True, only assets. If False, only indicators.", default=None)] = None,
+    category: Annotated[str | None, Field(
+        description="Filter by category: 'equity' | 'commodity' | 'fx' | 'rates' | 'volatility' | 'economic' | 'crypto'. Combine with is_asset for further narrowing.",
+        default=None,
+    )] = None,
     limit: Annotated[int, Field(description="Max results (default 50)", default=50)] = 50,
 ) -> str:
     if err := _require_auth():
         return err
     try:
         client = get_client()
-        results = await client.search_features(query, is_asset=is_asset, limit=limit)  # source filter available via client
+        results = await client.search_features(
+            query, is_asset=is_asset, category=category, limit=limit,
+        )
         summary = []
         for f in results:
             entry = {
@@ -289,10 +309,19 @@ async def create_portfolio(
 @server.tool(
     name="update_portfolio",
     description=(
-        "Update an existing portfolio. Can change name, description, weights, capital, and/or options_positions. "
-        "Only pass the fields you want to update — omitted fields stay unchanged. "
-        "Weights must sum to 1.0 if provided. "
-        "options_positions sets the options overlay for derivatives analysis (persisted on the portfolio)."
+        "Update an existing portfolio. Can change name, description, weights, capital, "
+        "and/or options_positions. Only pass the fields you want to update — omitted "
+        "fields stay unchanged. Weights must sum to 1.0 if provided.\n\n"
+        "ASSET MUTATION: passing a weights dict that includes a ticker not currently "
+        "in the portfolio's target set is supported — update_portfolio AUTO-EXPANDS "
+        "the target set as long as the new ticker is in the global feature catalog. "
+        "If the ticker isn't in the catalog yet, call add_feature first, then retry "
+        "this update. (You don't need to create a new portfolio to add an asset.) "
+        "Removing assets is not supported via this path — drop a weight to 0.0 to "
+        "zero a position; only create_portfolio_from_assets can produce a portfolio "
+        "with a strictly smaller asset universe.\n\n"
+        "options_positions sets the options overlay for derivatives analysis "
+        "(persisted on the portfolio)."
     ),
     annotations=ToolAnnotations(title="Update Portfolio", destructiveHint=True),
 )
@@ -3288,11 +3317,19 @@ async def get_quotes(
 @server.tool(
     name="get_history",
     description=(
-        "Daily OHLC bars for a single ticker over a date range. "
-        "Use range='1W'/'1M'/'3M'/'6M'/'1Y'/'2Y'/'5Y'/'ALL' for canned windows, OR pass start_date/end_date "
-        "(YYYY-MM-DD) for a custom slice. Returns one row per trading day with open/high/low/close/adj_close/volume. "
-        "Use for ad-hoc time-series analysis the trained models don't already cover (return distributions, "
-        "drawdown curves, custom regression windows, event studies around specific dates)."
+        "OHLC bars for a single ticker. range='1W'/'1M'/'3M'/'6M'/'1Y'/'2Y'/'5Y'/'ALL' "
+        "for canned windows, OR pass start_date/end_date (YYYY-MM-DD) for a custom slice.\n\n"
+        "frequency='daily' (default) | 'weekly' | 'monthly' | 'quarterly' | 'annual' "
+        "(alias: 'year_end'). For multi-year analysis, USE A COARSER FREQUENCY rather "
+        "than 50 point queries. A 20-year ``range='ALL', frequency='annual'`` request "
+        "returns ~20 rows; the equivalent in daily granularity is ~5,000 rows that "
+        "exceed the agent-side response clamp and force you into the dozens-of-calls "
+        "year-end-extraction pattern that costs credits and time. The downsampler "
+        "keeps the LAST trading day of each period (week-end / month-end / etc.), "
+        "which is what return / drawdown / vol calcs actually want.\n\n"
+        "Use for ad-hoc time-series analysis the trained models don't already cover "
+        "(return distributions, drawdown curves, custom regression windows, event "
+        "studies around specific dates)."
     ),
     annotations=ToolAnnotations(title="Get History", readOnlyHint=True, openWorldHint=True),
 )
@@ -3301,12 +3338,18 @@ async def get_history(
     range: Annotated[str, Field(description="Canned window: 1W / 1M / 3M / 6M / 1Y / 2Y / 5Y / ALL", default="1M")] = "1M",
     start_date: Annotated[str | None, Field(description="Start date YYYY-MM-DD (overrides range)", default=None)] = None,
     end_date: Annotated[str | None, Field(description="End date YYYY-MM-DD (overrides range)", default=None)] = None,
+    frequency: Annotated[str, Field(
+        description="Bar granularity: 'daily' | 'weekly' | 'monthly' | 'quarterly' | 'annual'. Default 'daily'.",
+        default="daily",
+    )] = "daily",
 ) -> str:
     if err := _require_auth():
         return err
     try:
         client = get_client()
-        result = await client.get_history(ticker, range=range, start_date=start_date, end_date=end_date)
+        result = await client.get_history(
+            ticker, range=range, start_date=start_date, end_date=end_date, frequency=frequency,
+        )
         return _fmt(result)
     except SablierAPIError as e:
         return _api_error(e)
