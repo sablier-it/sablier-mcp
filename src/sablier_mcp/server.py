@@ -7,6 +7,7 @@ management, helpers, retry logic) lives in _core.py.
 
 from typing import Annotated, Any
 
+import httpx
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
@@ -2055,9 +2056,27 @@ async def train_flow_model(
         return str(e)
     except SablierAPIError as e:
         return _api_error(e)
+    except httpx.TimeoutException as e:
+        # Surface the actual timeout instead of a generic message —
+        # most often it's batch_create_models on a huge portfolio (the
+        # backend keeps working but the MCP client has moved on, leaving
+        # an orphan model_group with no models). Tell the user what
+        # happened so they don't burn a second 5-15 minute training try.
+        logger.warning("train_flow_model HTTP timeout: %s", e)
+        return (
+            "Error: the training request timed out before the backend "
+            "could finish setting up the model group. This usually happens "
+            "on portfolios with 500+ assets where the per-asset model "
+            "creation runs long. The backend may have completed the work "
+            "anyway — check list_model_groups before retrying so you don't "
+            "create a duplicate."
+        )
+    except httpx.HTTPError as e:
+        logger.warning("train_flow_model HTTP error: %s", e, exc_info=True)
+        return f"Error: HTTP failure while contacting Sablier API ({type(e).__name__}): {str(e)[:200]}"
     except Exception as e:
         logger.error("train_flow_model failed: %s", e, exc_info=True)
-        return "Flow training failed unexpectedly. Please try again."
+        return f"Flow training failed unexpectedly ({type(e).__name__}): {str(e)[:200]}"
 
 
 @server.tool(

@@ -443,7 +443,12 @@ class SablierClient:
             body["parent_target_set_id"] = parent_target_set_id
         if group_name:
             body["group_name"] = group_name
-        return await self._post("/models/batch", json=body)
+        # Use long timeout: at 500+ tickers the backend has to insert
+        # per-asset feature_sets + models rows. Even with the in-house
+        # bulk-INSERT optimization that brings 60-120s down to ~10s,
+        # we keep the long timeout as defense in depth so a slower
+        # Cloud SQL instance can't crash the chain.
+        return await self._post_long("/models/batch", json=body)
 
     # ──────────────────────────────────────────────
     # Feature Sets
