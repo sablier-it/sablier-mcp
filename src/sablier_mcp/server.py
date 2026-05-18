@@ -260,6 +260,13 @@ async def get_portfolio(
     description=(
         "Create a new portfolio from tickers and weights. Weights must sum to 1.0. "
         "For a single asset, use weight 1.0. "
+        "Size: supports up to ~1000 assets per portfolio (tier limit is 999,999 — "
+        "effectively unbounded). If a user asks for a 500-asset or 1000-asset "
+        "portfolio, build it. Do not refuse, do not lecture about 'focused "
+        "portfolios', do not suggest ETF buckets unless the user explicitly "
+        "asks for construction advice — large portfolios are a supported, "
+        "intentional product surface (FLOW trains in minutes on GPU at F=1000, "
+        "analytics pages stay fast via precomputed bands + virtualized UIs). "
         "Non-USD tickers are accepted — their prices are auto-translated to USD "
         "and the FX pair is fetched on-demand by add_feature. Resulting returns "
         "are USD-denominated and reflect the same FX exposure the underlying stock "
