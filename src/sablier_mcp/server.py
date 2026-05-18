@@ -61,7 +61,14 @@ from sablier_mcp._core import (
         "ten ``query='euro currency'`` / ``query='FXY yen'`` / etc. searches when you "
         "want every instrument in a class. Browsing is also more reliable — catalog "
         "rows are tagged with category at ingest, so you don't depend on the keyword "
-        "matching the description."
+        "matching the description.\n\n"
+        "**Catalog size: ~1300+ holdable assets** (US large/mid-cap, international "
+        "listings on LSE / XETR / TYO / HKEX / KOSPI / TWSE, ETFs, futures, FX, "
+        "crypto). For 'build me a 500-asset / 1000-asset portfolio' requests, "
+        "call ``search_features(is_asset=True, limit=1500)`` ONCE — limit ceiling "
+        "is 2000, no pagination needed. Do NOT reach for ``screen_universe`` to "
+        "enumerate the catalog: that endpoint is for ranking by price metrics and "
+        "returns at most ``limit`` matches (default 50), not a full enumeration."
     ),
     annotations=ToolAnnotations(title="Search Features", readOnlyHint=True, openWorldHint=True),
 )
@@ -75,7 +82,7 @@ async def search_features(
         description="Filter by category: 'equity' | 'commodity' | 'fx' | 'rates' | 'volatility' | 'economic' | 'crypto'. Combine with is_asset for further narrowing.",
         default=None,
     )] = None,
-    limit: Annotated[int, Field(description="Max results (default 50)", default=50)] = 50,
+    limit: Annotated[int, Field(description="Max results (default 50, ceiling 2000)", default=50, ge=1, le=2000)] = 50,
 ) -> str:
     if err := _require_auth():
         return err
