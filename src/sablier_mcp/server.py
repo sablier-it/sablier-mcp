@@ -254,6 +254,113 @@ async def add_feature(
 
 
 @server.tool(
+    name="add_features_batch",
+    description=(
+        "Batch-add multiple tickers to the catalog in one call. Parallel "
+        "ingest with a 10-wide semaphore — much faster than looping "
+        "`add_feature` from the model side, and avoids the per-call "
+        "tool-use overhead.\n\n"
+        "Returns a three-bucket breakdown:\n"
+        "  • `added`: tickers newly inserted (catalog + training_data populated)\n"
+        "  • `already_existed`: tickers that were already in the catalog "
+        "(409s from the single-add path; not a failure)\n"
+        "  • `failed`: [{ticker, reason}] for symbols yfinance/FRED rejected\n\n"
+        "Use this when you want to register a research universe in the "
+        "catalog without committing to a portfolio — e.g. 'add the S&P 500 "
+        "constituents' or 'add these 200 tickers from my CSV'. For "
+        "portfolio-bound bulk imports prefer `create_portfolio` with "
+        "`auto_add=true` — same parallel ingest, but the result also "
+        "creates the portfolio in one round-trip.\n\n"
+        "Per-ticker taxonomy fields (category, sector, asset_type, region) "
+        "apply uniformly to every ticker in the batch. For heterogeneous "
+        "batches leave them unset so each ticker gets its own auto-detected "
+        "taxonomy from yfinance.\n\n"
+        "Typical wall-time: 100 tickers ≈ 10-30s, 1000 tickers ≈ 2-5 min."
+    ),
+    annotations=ToolAnnotations(title="Add Features (Batch)", destructiveHint=True, openWorldHint=True),
+)
+async def add_features_batch(
+    tickers: Annotated[list[str], Field(description="Ticker symbols to add (e.g. ['AAPL', 'MSFT', 'NVDA', ...]). Up to 2000 per call.")],
+    source: Annotated[str, Field(
+        description="Applied uniformly. 'yahoo' for stocks/ETFs/futures, 'fred' for rates/economic.",
+        default="yahoo",
+    )] = "yahoo",
+    is_asset: Annotated[bool | None, Field(
+        description=(
+            "Leave unset for yfinance auto-detection (recommended for "
+            "heterogeneous batches). Pass True/False only to override for "
+            "every ticker in the batch."
+        ),
+        default=None,
+    )] = None,
+    category: Annotated[str | None, Field(
+        description=(
+            "Required when is_asset=true. Same enum as add_feature: "
+            "'equity', 'fixed_income', 'credit', 'rates', 'fx', 'commodity', "
+            "'volatility', 'economic', 'crypto', 'inflation', 'employment', "
+            "'growth', 'corporate', 'thematic', 'sector', 'region'."
+        ),
+        default=None,
+    )] = None,
+    sector: Annotated[str | None, Field(
+        description=(
+            "Required when is_asset=true. Valid values: 'Technology', "
+            "'Healthcare', 'Financials', 'Consumer Discretionary', "
+            "'Consumer Staples', 'Industrials', 'Energy', 'Materials', "
+            "'Communication Services', 'Utilities', 'Real Estate', "
+            "'Fixed Income', 'FX', 'Commodities', 'Cryptocurrency', "
+            "'Alternatives', 'Broad Market', 'International Equity', 'Factor'."
+        ),
+        default=None,
+    )] = None,
+    asset_type: Annotated[str | None, Field(
+        description=(
+            "Required when is_asset=true. Valid values: 'Stock', 'ETF', "
+            "'Bond ETF', 'Crypto', 'Commodity', 'Currency ETF', 'Futures'."
+        ),
+        default=None,
+    )] = None,
+    region: Annotated[str | None, Field(
+        description=(
+            "Optional. Valid values: 'US', 'Europe', 'Global', 'Asia', "
+            "'EM', 'Japan', 'China', 'Brazil', 'India', 'Korea', 'Taiwan', "
+            "'Vietnam', 'Latin America', 'Australia'."
+        ),
+        default=None,
+    )] = None,
+) -> str:
+    if err := _require_auth():
+        return err
+    try:
+        client = get_client()
+        result = await client.add_features_batch(
+            tickers=tickers, source=source, is_asset=is_asset,
+            category=category, sector=sector, asset_type=asset_type, region=region,
+        )
+        added = result.get("added") or []
+        existed = result.get("already_existed") or []
+        failed = result.get("failed") or []
+        return _fmt({
+            "added": added,
+            "already_existed": existed,
+            "failed": failed,
+            "summary": {
+                "requested": len(tickers),
+                "added": len(added),
+                "already_existed": len(existed),
+                "failed": len(failed),
+            },
+            "message": (
+                f"Batch add complete: {len(added)} new, {len(existed)} already "
+                f"existed, {len(failed)} failed. Tickers in `added` + "
+                f"`already_existed` are now usable in portfolios / models."
+            ),
+        })
+    except SablierAPIError as e:
+        return _api_error(e)
+
+
+@server.tool(
     name="refresh_feature_data",
     description=(
         "Fetch/update historical training data for specific tickers from Yahoo Finance or FRED. "

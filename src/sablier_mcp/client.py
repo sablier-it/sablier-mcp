@@ -113,6 +113,29 @@ class SablierClient:
             params["category"] = category
         return await self._get("/features/search", params=params)
 
+    async def add_features_batch(
+        self,
+        tickers: list[str],
+        source: str = "yahoo",
+        is_asset: bool | None = None,
+        category: str | None = None,
+        sector: str | None = None,
+        asset_type: str | None = None,
+        region: str | None = None,
+    ) -> dict:
+        body: dict[str, Any] = {"tickers": tickers, "source": source}
+        if is_asset is not None:
+            body["is_asset"] = is_asset
+        if category:
+            body["category"] = category
+        if sector:
+            body["sector"] = sector
+        if asset_type:
+            body["asset_type"] = asset_type
+        if region:
+            body["region"] = region
+        return await self._post("/features/available-batch", json=body)
+
     async def add_feature(
         self,
         ticker: str,
