@@ -130,9 +130,26 @@ async def search_features(
         "calling add_feature for an existing ticker returns a 409 error. "
         "Specify source ('yahoo' for stocks/ETFs/futures, 'fred' for rates/economic indicators). "
         "Validates the ticker exists on the source API and auto-populates metadata "
-        "(display_name, category, units, etc.) from the API response. "
-        "Set is_asset=true for assets that go into portfolios, false for conditioning factors. "
-        "Note: takes a few seconds while the historical data is fetched.\n\n"
+        "(display_name, category, units, etc.) from the API response.\n\n"
+        "**is_asset handling**: leave UNSET for auto-detection (yfinance fills "
+        "category / sector / asset_type / region from the API response). Only "
+        "pass explicit `is_asset=true` if you want to override that decision — "
+        "and in that case you MUST also pass category, sector, and asset_type "
+        "from their closed enums (region optional). Listing the valid values:\n"
+        "  - category: 'equity', 'fixed_income', 'credit', 'rates', 'fx', "
+        "'commodity', 'volatility', 'economic', 'crypto', 'inflation', "
+        "'employment', 'growth', 'corporate', 'thematic', 'sector', 'region'\n"
+        "  - sector: 'Technology', 'Healthcare', 'Financials', 'Consumer "
+        "Discretionary', 'Consumer Staples', 'Industrials', 'Energy', "
+        "'Materials', 'Communication Services', 'Utilities', 'Real Estate', "
+        "'Fixed Income', 'FX', 'Commodities', 'Cryptocurrency', "
+        "'Alternatives', 'Broad Market', 'International Equity', 'Factor'\n"
+        "  - asset_type: 'Stock', 'ETF', 'Bond ETF', 'Crypto', 'Commodity', "
+        "'Currency ETF', 'Futures'\n"
+        "  - region: 'US', 'Europe', 'Global', 'Asia', 'EM', 'Japan', "
+        "'China', 'Brazil', 'India', 'Korea', 'Taiwan', 'Vietnam', "
+        "'Latin America', 'Australia'\n"
+        "Takes a few seconds while historical data is fetched.\n\n"
         "Currency handling: non-USD tickers (e.g. .KS Korea, .L London, .DE Frankfurt, "
         ".T Tokyo, .HK Hong Kong, .SS Shanghai) are auto-translated to USD. The "
         "corresponding FX pair (e.g. KRWUSD=X for .KS) is fetched and added to the "
@@ -152,10 +169,62 @@ async def add_feature(
     source: Annotated[str, Field(description="Data source: 'yahoo' (stocks, ETFs, futures) or 'fred' (rates, economic)")],
     display_name: Annotated[str | None, Field(description="Human-readable name (e.g. 'Apple Inc.'). Auto-detected if omitted.", default=None)] = None,
     description: Annotated[str | None, Field(description="Brief description", default=None)] = None,
-    category: Annotated[str | None, Field(description="Category: equity, rates, fx, commodity, volatility, economic, etc. Auto-detected if omitted.", default=None)] = None,
-    is_asset: Annotated[bool | None, Field(description="True for portfolio assets, False for conditioning factors. Auto-detected if omitted.", default=None)] = None,
-    data_type: Annotated[str | None, Field(description="Data type: price, rate, index, level. Auto-detected if omitted.", default=None)] = None,
+    category: Annotated[str | None, Field(
+        description=(
+            "Required when is_asset=true. Valid values: 'equity', "
+            "'fixed_income', 'credit', 'rates', 'fx', 'commodity', "
+            "'volatility', 'economic', 'crypto', 'inflation', 'employment', "
+            "'growth', 'corporate', 'thematic', 'sector', 'region'. "
+            "Auto-detected when is_asset is left unset."
+        ),
+        default=None,
+    )] = None,
+    is_asset: Annotated[bool | None, Field(
+        description=(
+            "True for portfolio assets, False for conditioning factors. "
+            "**Auto-detected when left UNSET** — recommended for most adds. "
+            "If you pass True explicitly, category + sector + asset_type "
+            "become required (closed enums)."
+        ),
+        default=None,
+    )] = None,
+    data_type: Annotated[str | None, Field(
+        description=(
+            "Optional. Valid values: 'price', 'rate', 'index', 'level', "
+            "'volume', 'bounded', 'ratio', 'spread', 'volatility'. "
+            "Auto-detected if omitted."
+        ),
+        default=None,
+    )] = None,
     units: Annotated[str | None, Field(description="Units (e.g. 'USD', 'percent', 'index'). Auto-detected if omitted.", default=None)] = None,
+    sector: Annotated[str | None, Field(
+        description=(
+            "Required when is_asset=true. Valid values: 'Technology', "
+            "'Healthcare', 'Financials', 'Consumer Discretionary', "
+            "'Consumer Staples', 'Industrials', 'Energy', 'Materials', "
+            "'Communication Services', 'Utilities', 'Real Estate', "
+            "'Fixed Income', 'FX', 'Commodities', 'Cryptocurrency', "
+            "'Alternatives', 'Broad Market', 'International Equity', "
+            "'Factor'. Auto-detected when is_asset is unset."
+        ),
+        default=None,
+    )] = None,
+    asset_type: Annotated[str | None, Field(
+        description=(
+            "Required when is_asset=true. Valid values: 'Stock', 'ETF', "
+            "'Bond ETF', 'Crypto', 'Commodity', 'Currency ETF', 'Futures'. "
+            "Auto-detected when is_asset is unset."
+        ),
+        default=None,
+    )] = None,
+    region: Annotated[str | None, Field(
+        description=(
+            "Optional geographic bucket. Valid values: 'US', 'Europe', "
+            "'Global', 'Asia', 'EM', 'Japan', 'China', 'Brazil', 'India', "
+            "'Korea', 'Taiwan', 'Vietnam', 'Latin America', 'Australia'."
+        ),
+        default=None,
+    )] = None,
     skip_validation: Annotated[bool, Field(description="Skip ticker validation against source API", default=False)] = False,
 ) -> str:
     if err := _require_auth():
@@ -165,7 +234,9 @@ async def add_feature(
         result = await client.add_feature(
             ticker=ticker, source=source, display_name=display_name,
             description=description, category=category, is_asset=is_asset,
-            data_type=data_type, units=units, skip_validation=skip_validation,
+            data_type=data_type, units=units, sector=sector,
+            asset_type=asset_type, region=region,
+            skip_validation=skip_validation,
         )
         return _fmt({
             "id": result.get("id"),
@@ -265,15 +336,31 @@ async def get_portfolio(
 @server.tool(
     name="create_portfolio",
     description=(
-        "Create a new portfolio from tickers and weights. Weights must sum to 1.0. "
-        "For a single asset, use weight 1.0. "
-        "Size: supports up to ~1000 assets per portfolio (tier limit is 999,999 — "
-        "effectively unbounded). If a user asks for a 500-asset or 1000-asset "
-        "portfolio, build it. Do not refuse, do not lecture about 'focused "
-        "portfolios', do not suggest ETF buckets unless the user explicitly "
-        "asks for construction advice — large portfolios are a supported, "
-        "intentional product surface (FLOW trains in minutes on GPU at F=1000, "
-        "analytics pages stay fast via precomputed bands + virtualized UIs). "
+        "Create a new portfolio from tickers. Two payload shapes:\n"
+        "  • Explicit weights: pass `tickers` AND `weights` (parallel arrays, "
+        "weights must sum to 1.0).\n"
+        "  • Equal weight: pass `tickers` only with `equal_weight=True` — "
+        "server applies 1/N each.\n\n"
+        "**Use equal_weight=True for ANY portfolio over ~50 assets.** The "
+        "parallel-array shape blows past LLM tool-call output budgets "
+        "around 60-100 entries: one array gets truncated mid-generation "
+        "and you'll see 'tickers and weights must have the same length' "
+        "even though you generated them at the same size. A 500-ticker "
+        "single-list call is ~10× smaller and reliable.\n\n"
+        "**For CSV-paste / large-portfolio flows**: combine `equal_weight=True` "
+        "with `auto_add=True` to have the server auto-ingest unknown tickers "
+        "via Yahoo Finance, and `skip_missing=True` to drop the ones yfinance "
+        "rejects. The result includes `import_summary` with added_from_catalog "
+        "/ newly_ingested / dropped (with reasons) — report all three counts "
+        "back to the user.\n\n"
+        "Size: up to ~1000 assets per portfolio (tier limit is 999,999 — "
+        "effectively unbounded). If a user asks for a 500-asset or "
+        "1000-asset portfolio, build it. Do not refuse, do not lecture about "
+        "'focused portfolios', do not suggest ETF buckets unless the user "
+        "explicitly asks for construction advice. Large portfolios are a "
+        "supported, intentional product surface (F=1000 FLOW models train "
+        "in minutes on GPU; analytics stay fast via precomputed bands + "
+        "virtualized UIs).\n\n"
         "Non-USD tickers are accepted — their prices are auto-translated to USD "
         "and the FX pair is fetched on-demand by add_feature. Resulting returns "
         "are USD-denominated and reflect the same FX exposure the underlying stock "
@@ -286,24 +373,85 @@ async def get_portfolio(
 async def create_portfolio(
     name: Annotated[str, Field(description="Portfolio name (e.g. 'Tech Portfolio')")],
     tickers: Annotated[list[str], Field(description="Ticker symbols (e.g. ['AAPL', 'MSFT', 'NVDA'])")],
-    weights: Annotated[list[float], Field(description="Corresponding weights summing to 1.0 (e.g. [0.4, 0.3, 0.3])")],
+    weights: Annotated[list[float] | None, Field(
+        description=(
+            "Corresponding weights summing to 1.0 (e.g. [0.4, 0.3, 0.3]). "
+            "Omit (or pass null) together with equal_weight=True to apply "
+            "1/N each — required for portfolios over ~50 assets to avoid "
+            "LLM tool-call output truncation."
+        ),
+        default=None,
+    )] = None,
+    equal_weight: Annotated[bool, Field(
+        description="If true, server applies 1/N weight to each ticker (mutually exclusive with `weights`).",
+        default=False,
+    )] = False,
+    auto_add: Annotated[bool, Field(
+        description="Auto-ingest unknown tickers via Yahoo Finance before classifying as missing. Use with CSV-paste flows.",
+        default=False,
+    )] = False,
+    skip_missing: Annotated[bool, Field(
+        description="Drop tickers that aren't in the catalog (and aren't ingested by auto_add) instead of failing the call.",
+        default=False,
+    )] = False,
     capital: Annotated[float, Field(description="Total capital allocation in USD (default $100,000)", default=100_000.0)] = 100_000.0,
     description: Annotated[str, Field(description="Optional description", default="")] = "",
 ) -> str:
     if err := _require_auth():
         return err
-    if len(tickers) != len(weights):
-        return "Error: tickers and weights must have the same length"
-    weight_sum = sum(weights)
-    if abs(weight_sum - 1.0) > 0.01:
-        return f"Error: weights must sum to 1.0 (got {weight_sum:.4f})"
+    # Validate exactly one weight-providing shape.
+    if equal_weight and weights:
+        return (
+            "Error: pass either `weights` (explicit) or `equal_weight=True` "
+            "(1/N), not both."
+        )
+    if not equal_weight:
+        if weights is None:
+            return (
+                "Error: provide `weights` (parallel array summing to 1.0) "
+                "OR pass `equal_weight=True` to apply 1/N. For portfolios "
+                "over ~50 assets prefer equal_weight=True — the parallel-"
+                "array shape silently truncates at LLM output limits."
+            )
+        if len(tickers) != len(weights):
+            shorter, longer = sorted([len(tickers), len(weights)])
+            return (
+                f"Error: tickers ({len(tickers)}) and weights ({len(weights)}) "
+                f"have different lengths. This usually means one array was "
+                f"truncated by the LLM tool-call output budget (the shorter "
+                f"one stopped at {shorter} entries, the longer is {longer}). "
+                f"For large portfolios pass `equal_weight=True` with the full "
+                f"tickers list and omit weights — much smaller payload."
+            )
+        weight_sum = sum(weights)
+        if abs(weight_sum - 1.0) > 0.01:
+            return f"Error: weights must sum to 1.0 (got {weight_sum:.4f})"
 
     try:
-        assets = [{"ticker": t, "weight": w} for t, w in zip(tickers, weights)]
         client = get_client()
-        result = await client.create_portfolio(name, assets, description=description or None, capital=capital)
+        if equal_weight:
+            # Use the backend's tickers-shorthand path (server applies 1/N).
+            result = await client.create_portfolio(
+                name,
+                tickers=tickers,
+                description=description or None,
+                capital=capital,
+                auto_add=auto_add,
+                skip_missing=skip_missing,
+            )
+        else:
+            # weights is non-None and length-matched here.
+            assets = [{"ticker": t, "weight": w} for t, w in zip(tickers, weights)]  # type: ignore[arg-type]
+            result = await client.create_portfolio(
+                name,
+                assets=assets,
+                description=description or None,
+                capital=capital,
+                auto_add=auto_add,
+                skip_missing=skip_missing,
+            )
         portfolio_id = result["id"]
-        return _fmt({
+        out: dict[str, Any] = {
             "portfolio_id": portfolio_id,
             "name": result["name"],
             "tickers": _portfolio_tickers(result),
@@ -315,7 +463,10 @@ async def create_portfolio(
                 "Next: use this portfolio_id with analyze_quantitative "
                 "and/or analyze_qualitative (thematic) for a full risk picture."
             ),
-        })
+        }
+        if result.get("import_summary"):
+            out["import_summary"] = result["import_summary"]
+        return _fmt(out)
     except SablierAPIError as e:
         return _api_error(e)
 

@@ -126,6 +126,9 @@ class SablierClient:
         frequency: str = "daily",
         metadata: dict | None = None,
         skip_validation: bool = False,
+        sector: str | None = None,
+        asset_type: str | None = None,
+        region: str | None = None,
     ) -> dict:
         """Add a feature to the available_features catalog with validation and auto-enrichment."""
         body: dict[str, Any] = {"ticker": ticker, "source": source, "frequency": frequency}
@@ -141,6 +144,12 @@ class SablierClient:
             body["data_type"] = data_type
         if units:
             body["units"] = units
+        if sector:
+            body["sector"] = sector
+        if asset_type:
+            body["asset_type"] = asset_type
+        if region:
+            body["region"] = region
         if metadata:
             body["metadata"] = metadata
         if skip_validation:
@@ -162,12 +171,31 @@ class SablierClient:
         return await self._get(f"/portfolios/{portfolio_id}")
 
     async def create_portfolio(
-        self, name: str, assets: list[dict], description: str | None = None,
+        self,
+        name: str,
+        *,
+        assets: list[dict] | None = None,
+        tickers: list[str] | None = None,
+        description: str | None = None,
         capital: float = 100_000.0,
+        auto_add: bool = False,
+        skip_missing: bool = False,
     ) -> dict:
-        body: dict[str, Any] = {"name": name, "assets": assets, "capital": capital}
+        """Create a portfolio. Pass EITHER `assets` (explicit weights) OR
+        `tickers` (equal weight 1/N). auto_add + skip_missing route through
+        the backend's three-way classification for large CSV-paste imports.
+        """
+        body: dict[str, Any] = {"name": name, "capital": capital}
         if description:
             body["description"] = description
+        if assets is not None:
+            body["assets"] = assets
+        if tickers is not None:
+            body["tickers"] = tickers
+        if auto_add:
+            body["auto_add"] = True
+        if skip_missing:
+            body["skip_missing"] = True
         return await self._post("/portfolios/from-assets", json=body)
 
     async def update_portfolio(
