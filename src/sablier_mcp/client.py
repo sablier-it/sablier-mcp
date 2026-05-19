@@ -798,12 +798,10 @@ class SablierClient:
         denoiser_d_model: int | None = None,
         denoiser_n_layers: int | None = None,
     ) -> dict:
-        """Start async OT-CFM flow model training job.
+        """Start async Flow model training job.
 
-        All hyperparameters are optional — the backend applies sensible defaults
-        (horizon=120, obs_length=200, max_epochs=500, lr=1e-4, batch_size=64,
-        patience=80, context_dim=96, encoder_d_model=192, encoder_n_layers=2,
-        denoiser_d_model=192, denoiser_n_layers=6).
+        All hyperparameters are optional — the backend applies sensible defaults.
+        Advanced fields are internal and should be left unset by callers.
         """
         body: dict[str, Any] = {"model_group_id": model_group_id}
         for key, val in [
