@@ -840,8 +840,14 @@ class SablierClient:
         n_paths: int = 1000,
         horizon: int | None = None,
         price_history_length: int | None = None,
+        as_of_date: str | None = None,
     ) -> dict:
-        """Start async path generation job."""
+        """Start async path generation job.
+
+        ``as_of_date`` (ISO ``YYYY-MM-DD``) anchors the conditioning window
+        at a historical date so paths represent synthetic alternative
+        histories starting from that state. Defaults to None (latest data).
+        """
         body: dict[str, Any] = {
             "model_group_id": model_group_id,
             "n_paths": n_paths,
@@ -850,6 +856,8 @@ class SablierClient:
             body["horizon"] = horizon
         if price_history_length is not None:
             body["price_history_length"] = price_history_length
+        if as_of_date is not None:
+            body["as_of_date"] = as_of_date
         return await self._post_long("/flow/generate-paths", json=body)
 
     async def flow_check_scenario_probability(
@@ -884,6 +892,7 @@ class SablierClient:
         horizon: int | None = None,
         name: str | None = None,
         skip_baseline: bool = False,
+        as_of_date: str | None = None,
     ) -> dict:
         """Start async constrained path generation job.
 
@@ -907,6 +916,8 @@ class SablierClient:
             body["horizon"] = horizon
         if name is not None:
             body["name"] = name
+        if as_of_date is not None:
+            body["as_of_date"] = as_of_date
         return await self._post_long("/flow/generate-constrained-paths", json=body)
 
     async def flow_get_results(self, job_id: str) -> dict:

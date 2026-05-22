@@ -1859,8 +1859,14 @@ async def _train_flow_model_impl(
 async def _generate_flow_paths_impl(
     client, model_group_id: str, portfolio_id: str | None,
     horizon: int, n_paths: int, price_history_length: int | None = None,
+    *,
+    as_of_date: str | None = None,
 ) -> list | str:
-    """Generate paths from a trained model. Returns formatted output."""
+    """Generate paths from a trained model. Returns formatted output.
+
+    ``as_of_date`` (ISO ``YYYY-MM-DD``) anchors generation at a historical
+    state; when set, cached today-anchored results are bypassed.
+    """
     if err := _validate_uuid(model_group_id, "model_group_id"):
         return err
 
@@ -1888,7 +1894,9 @@ async def _generate_flow_paths_impl(
 
     # Try existing results first — skip if caller explicitly set price_history_length
     # (they want fresh paths with specific indicator seeding, not stale cached results)
-    if price_history_length is None:
+    # Also skip when an historical as_of_date is requested — cached "latest"
+    # results are anchored at today's state, not the requested date.
+    if price_history_length is None and as_of_date is None:
         try:
             results = await client.flow_get_latest_results(model_group_id)
             summary = results.get("summary") or {}
@@ -1958,6 +1966,7 @@ async def _generate_flow_paths_impl(
             n_paths=n_paths,
             horizon=horizon,
             price_history_length=price_history_length,
+            as_of_date=as_of_date,
         ))
         gen_job_id = gen_job.get("job_id")
         if not gen_job_id:
@@ -2172,7 +2181,16 @@ async def check_flow_job(
         "Requires model_group_id from train_flow_model or list_model_groups. "
         "If paths already exist, returns cached results instantly. "
         "Path generation takes ~1-3 min on GPU. "
-        "Defaults: horizon=60 (~1 quarter), n_paths=1000."
+        "Defaults: horizon=60 (~1 quarter), n_paths=1000.\n\n"
+        "Optional as_of_date (ISO YYYY-MM-DD) anchors the conditioning window "
+        "at a historical date so the paths are synthetic alternative histories "
+        "from the same trained model, starting at that date's state instead "
+        "of today. Useful for stress tests anchored at a specific regime "
+        "(e.g. pre-COVID, GFC, dot-com peak). The model has already seen "
+        "this data during training (FLOW is a DGP estimator, not a forecaster), "
+        "so the result represents diversified samples consistent with the "
+        "learned dynamics — frame it to the user as alternative histories, "
+        "not an out-of-sample backtest."
     ),
     annotations=ToolAnnotations(title="Generate Flow Paths", destructiveHint=True, openWorldHint=True),
 )
@@ -2196,12 +2214,25 @@ async def generate_flow_paths(
         description="Days of historical prices to include before the paths start. Defaults to horizon. Set higher (e.g. 120) to warm up indicators like MACD or z-score before forward_test_rules.",
         default=None,
     )] = None,
+    as_of_date: Annotated[str | None, Field(
+        description=(
+            "Optional ISO date (YYYY-MM-DD) to anchor path generation. When "
+            "set, paths start from the asset prices on that date and the "
+            "model's conditioning window pulls the trading days immediately "
+            "before it. Defaults to None (latest available data). Cached "
+            "same-day results are bypassed when as_of_date is provided."
+        ),
+        default=None,
+    )] = None,
 ) -> list | str:
     if err := _require_auth():
         return err
     try:
         client = get_client()
-        return await _generate_flow_paths_impl(client, model_group_id, portfolio_id, horizon, n_paths, price_history_length)
+        return await _generate_flow_paths_impl(
+            client, model_group_id, portfolio_id, horizon, n_paths,
+            price_history_length, as_of_date=as_of_date,
+        )
     except _FlowGPUBusy as e:
         return str(e)
     except SablierAPIError as e:
@@ -2316,7 +2347,13 @@ async def check_scenario_probability(
         "(e.g. 'Apple Inc.', 'SPDR S&P 500 ETF Trust'), NOT ticker symbols. "
         "Constraint types: 'level' (absolute price bounds), 'return' (per-step return bounds). "
         "Pass portfolio_id through so test_flow_risk can be called directly on results. "
-        "Run scenarios SEQUENTIALLY (one at a time), not in parallel, to avoid GPU queue contention."
+        "Run scenarios SEQUENTIALLY (one at a time), not in parallel, to avoid GPU queue contention.\n\n"
+        "Optional as_of_date (ISO YYYY-MM-DD) anchors the scenario at a "
+        "historical state — paths and constraint thresholds start from that "
+        "date's asset prices instead of today. The auto-baseline run reuses "
+        "the same anchor so the feasibility check is consistent. This gives "
+        "synthetic alternative histories conditioned on a known regime "
+        "(useful for 'what would Lehman Brothers' 2008 have looked like if X')."
     ),
     annotations=ToolAnnotations(title="Simulate Flow Scenario", readOnlyHint=True, openWorldHint=True),
 )
@@ -2362,6 +2399,16 @@ async def simulate_flow_scenario(
         ),
         default=False,
     )] = False,
+    as_of_date: Annotated[str | None, Field(
+        description=(
+            "Optional ISO date (YYYY-MM-DD) to anchor the scenario at a "
+            "historical state. When set, constraints are evaluated against "
+            "paths that start from the asset prices on that date, and the "
+            "auto-baseline run inherits the same anchor. Defaults to None "
+            "(latest available data)."
+        ),
+        default=None,
+    )] = None,
 ) -> list | str:
     if err := _require_auth():
         return err
@@ -2370,25 +2417,33 @@ async def simulate_flow_scenario(
     try:
         client = get_client()
 
-        # Auto-check: if no baseline exists for today, generate one first
+        # Auto-check: if no baseline exists for today, generate one first.
+        # When as_of_date is set we always generate a fresh anchored
+        # baseline — the same-day cache is anchored at today's state,
+        # not the requested historical date, so reusing it would
+        # produce an apples-to-oranges feasibility check.
         from datetime import date
         today = date.today().isoformat()
-        try:
-            baselines = await client.flow_list_baselines(model_group_id)
-            has_today_baseline = any(
-                b.get("created_at", "")[:10] == today
-                for b in (baselines.get("baselines") or [])
-            )
-        except Exception:
-            has_today_baseline = False
+        has_today_baseline = False
+        if as_of_date is None:
+            try:
+                baselines = await client.flow_list_baselines(model_group_id)
+                has_today_baseline = any(
+                    b.get("created_at", "")[:10] == today
+                    for b in (baselines.get("baselines") or [])
+                )
+            except Exception:
+                has_today_baseline = False
 
         baseline_job_id = None
         if not has_today_baseline:
-            logger.info("No baseline for today — auto-generating before scenario")
+            anchor_label = f"as_of_date={as_of_date}" if as_of_date else "today"
+            logger.info(f"No baseline for {anchor_label} — auto-generating before scenario")
             bl_job = await _retry_gpu_call(lambda: client.flow_generate_paths(
                 model_group_id=model_group_id,
                 n_paths=n_paths,
                 horizon=horizon,
+                as_of_date=as_of_date,
             ))
             baseline_job_id = bl_job.get("job_id")
             if baseline_job_id:
@@ -2405,6 +2460,7 @@ async def simulate_flow_scenario(
             n_paths=n_paths,
             horizon=horizon,
             skip_baseline=skip_feasibility_gate,
+            as_of_date=as_of_date,
         ))
         job_id = job.get("job_id")
         if not job_id:
