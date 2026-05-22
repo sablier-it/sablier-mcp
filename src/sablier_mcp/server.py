@@ -2006,6 +2006,8 @@ async def _generate_flow_paths_impl(
             f"list_flow_scenarios(model_group_id='{model_group_id}') to see past scenarios.{feat_hint}"
         ),
     }
+    if results.get("as_of_date"):
+        output["as_of_date"] = results["as_of_date"]
     try:
         chart_html = flow_fan_chart(summary, horizon)
         if chart_html:
@@ -3174,6 +3176,8 @@ async def get_flow_results(
             "n_paths": results.get("n_paths"),
             "per_asset": per_asset,
         }
+        if results.get("as_of_date"):
+            output["as_of_date"] = results["as_of_date"]
         if results.get("price_history"):
             output["price_history"] = results["price_history"]
         if satisfaction_rate is not None:
