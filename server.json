@@ -4,7 +4,7 @@
   "display_name": "Sablier",
   "description": "Wall Street-grade portfolio analytics, stress-testing, and SEC filing intelligence for AI assistants. Factor models, Monte Carlo simulations, generative market paths, and GRAIN thematic analysis — in under 2 minutes.",
   "homepage": "https://sablier.ai/discover",
-  "repository": "https://github.com/sablier-it/sablier-mcp",
+  "repository": "https://github.com/sablier-ai/sablier-mcp",
   "license": "MIT",
   "is_official": true,
   "category": "finance",
