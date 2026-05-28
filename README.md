@@ -60,7 +60,7 @@ That's it. On first use, Claude opens a browser window — sign up or log in wit
 
 ```bash
 # Clone and install
-git clone https://github.com/sablier-it/sablier-mcp.git
+git clone https://github.com/sablier-ai/sablier-mcp.git
 cd sablier-mcp
 uv sync
 
@@ -341,7 +341,7 @@ Full privacy policy: [sablier-ai.com/privacy](https://sablier-ai.com/privacy) | 
 ## Support
 
 - **Email**: [team@sablier.it](mailto:team@sablier.it)
-- **Issues**: [github.com/sablier-it/sablier-mcp/issues](https://github.com/sablier-it/sablier-mcp/issues)
+- **Issues**: [github.com/sablier-ai/sablier-mcp/issues](https://github.com/sablier-ai/sablier-mcp/issues)
 
 ## Links
 
